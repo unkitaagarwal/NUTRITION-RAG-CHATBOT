@@ -1,11 +1,12 @@
-from langchain.embeddings import OpenAIEmbeddings
-from langchain.vectorstores import Chroma
-from langchain.document_loaders import TextLoader
+from langchain_openai import OpenAIEmbeddings
+from langchain_chroma import Chroma
+from langchain_community.document_loaders import TextLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 import os
+from dotenv import load_dotenv
 
 # Load and split documents
-def load_and_split_docs(data_path="data/"):
+def load_and_split_docs(data_path="data"):
     docs = []
     splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
     for fname in os.listdir(data_path):
@@ -15,12 +16,11 @@ def load_and_split_docs(data_path="data/"):
 
 # Store in Chroma
 def embed_to_chroma(docs):
-    db = Chroma(persist_directory="./vector_store", embedding_function=OpenAIEmbeddings())
+    db = Chroma(persist_directory="/app/vector_store", embedding_function=OpenAIEmbeddings())
     db.add_documents(docs)
-    db.persist()
 
 if __name__ == "__main__":
-    from dotenv import load_dotenv
     load_dotenv()
     documents = load_and_split_docs()
     embed_to_chroma(documents)
+    print(f"✅ {len(documents)} chunks embedded")

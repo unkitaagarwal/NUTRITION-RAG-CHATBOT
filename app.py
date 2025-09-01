@@ -3,7 +3,7 @@ from langchain_community.vectorstores import Chroma
 from langchain_openai import ChatOpenAI
 from langchain_openai import OpenAIEmbeddings
 from langchain.chains import RetrievalQA
-from firebase_utils import get_user_context
+from firebase_utils import get_user_context, get_user_chat_history, save_user_chat
 from dotenv import load_dotenv
 import os
 

@@ -4,9 +4,7 @@ from datetime import datetime
 
 def init_firestore():
     if not firebase_admin._apps:
-        cred = credentials.Certificate("/etc/secrets/firebase_service_account.json")
-
-        #cred = credentials.Certificate("firebase_service_account.json")
+        cred = credentials.Certificate("firebase_service_account.json")
         firebase_admin.initialize_app(cred)
     return firestore.client()
 

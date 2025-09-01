@@ -63,6 +63,9 @@ Please answer the user's question based on the meal data above. The meal data in
     
     rag_chain = RetrievalQA.from_chain_type(llm=llm, retriever=retriever)
     response = rag_chain.run(system_context + "\n\nUser question: " + user_question)
+
+    # Save chat interaction for future context
+    save_user_chat(email, user_question, response)
     return jsonify({"reply": response})
 
 if __name__ == "__main__":

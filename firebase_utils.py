@@ -76,16 +76,35 @@ def get_user_context(email, max_logs=10):
 
 def save_user_chat(email, question, answer):
     db = init_firestore()
-    chat_ref = db.collection("users").document(email).collection("chats")
-    chat_ref.add({
+    
+    # Ensure the user document exists first
+    user_ref = db.collection("users").document(email)
+    user_doc = user_ref.get()
+    
+    if not user_doc.exists:
+        # Create user document if it doesn't exist
+        user_ref.set({
+            "email": email,
+            "created_at": datetime.utcnow()
+        })
+        print(f"DEBUG: Created new user document for {email}")
+    
+    # Now add the chat to the chats subcollection
+    chat_ref = user_ref.collection("chats")
+    chat_doc = chat_ref.add({
         "question": question,
         "answer": answer,
         "timestamp": datetime.utcnow()
     })
+    
+    print(f"DEBUG: Successfully saved chat for {email} with ID: {chat_doc[1].id}")
 
-def get_user_chat_history(email, max_chats=5):
+def get_user_chat_history(email, max_chats=10):  # Increased from 5 to 10 for better context
     db = init_firestore()
+    print(f"DEBUG: Looking for chat history for email: {email}")
+    
     chat_ref = db.collection("users").document(email).collection("chats")
+    print(f"DEBUG: Chat reference path: users/{email}/chats")
     
     docs = chat_ref.order_by("timestamp", direction=firestore.Query.DESCENDING).limit(max_chats).stream()
     
@@ -95,6 +114,9 @@ def get_user_chat_history(email, max_chats=5):
         question = data.get("question", "")
         answer = data.get("answer", "")
         history.append((question, answer))
+        print(f"DEBUG: Found chat entry - Q: {question[:50]}..., A: {answer[:50]}...")
+    
+    print(f"DEBUG: Total chat history entries found: {len(history)}")
     
     # Reverse to maintain chronological order (oldest → newest)
     return history[::-1]

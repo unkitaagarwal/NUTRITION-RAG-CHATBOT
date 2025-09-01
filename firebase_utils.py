@@ -1,5 +1,6 @@
 import firebase_admin
 from firebase_admin import credentials, firestore
+from datetime import datetime
 
 def init_firestore():
     if not firebase_admin._apps:
@@ -72,3 +73,29 @@ def get_user_context(email, max_logs=10):
     }
     
     return goal, categorized_meals
+
+def save_user_chat(email, question, answer):
+    db = init_firestore()
+    chat_ref = db.collection("users").document(email).collection("chats")
+    chat_ref.add({
+        "question": question,
+        "answer": answer,
+        "timestamp": datetime.utcnow()
+    })
+
+def get_user_chat_history(email, max_chats=5):
+    db = init_firestore()
+    chat_ref = db.collection("users").document(email).collection("chats")
+    
+    docs = chat_ref.order_by("timestamp", direction=firestore.Query.DESCENDING).limit(max_chats).stream()
+    
+    history = []
+    for doc in docs:
+        data = doc.to_dict()
+        question = data.get("question", "")
+        answer = data.get("answer", "")
+        history.append((question, answer))
+    
+    # Reverse to maintain chronological order (oldest → newest)
+    return history[::-1]
+

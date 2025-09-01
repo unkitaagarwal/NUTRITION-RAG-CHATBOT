@@ -23,6 +23,10 @@ def chat():
 
     goal, categorized_meals = get_user_context(email)
 
+    # Get recent chat history
+    chat_history = get_user_chat_history(email)
+    formatted_history = "\n".join([f"User: {q}\nBot: {a}" for q, a in chat_history])
+
     # Handle empty goal data better
     if goal:
         goal_summary = f"User goal: {goal.get('goalType', 'not set')}, Current: {goal.get('currentWeight')}kg, Target: {goal.get('targetWeight')}kg by {goal.get('targetDate')}"

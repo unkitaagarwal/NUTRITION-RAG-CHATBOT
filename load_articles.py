@@ -16,7 +16,7 @@ def load_and_split_docs(data_path="data"):
 
 # Store in Chroma
 def embed_to_chroma(docs):
-    db = Chroma(persist_directory="/app/vector_store", embedding_function=OpenAIEmbeddings())
+    db = Chroma(persist_directory="./vector_store", embedding_function=OpenAIEmbeddings())
     db.add_documents(docs)
 
 if __name__ == "__main__":

@@ -19,8 +19,21 @@ app = Flask(__name__)
 
 # Initialize once
 vector_db = Chroma(persist_directory="./vector_store", embedding_function=OpenAIEmbeddings())
-retriever = vector_db.as_retriever(search_kwargs={"k": 5})
-llm = ChatOpenAI(model="gpt-3.5-turbo", temperature=0.7)  # Changed from  gpt-4o-mini to gpt-3.5-turbo
+retriever = vector_db.as_retriever(search_kwargs={"k": 3})  # Reduced from 5 to 3 for faster retrieval
+llm = ChatOpenAI(
+    model="gpt-3.5-turbo", 
+    temperature=0.3,  # Lower temperature for faster, more deterministic responses
+    max_tokens=2000  # Increased to ensure complete recipes for multiple meal recommendations (3-5 meals with full recipes need ~1500-2000 tokens)
+)
+
+# Initialize RAG chain once at startup (not on every request)
+# Note: system_context is included in the query string, not as a separate prompt variable
+
+# Create RAG chain without custom prompt (system_context is included in query)
+rag_chain = RetrievalQA.from_chain_type(
+    llm=llm, 
+    retriever=retriever
+)
 
 @app.route("/chat", methods=["POST"])
 def chat():
@@ -55,11 +68,13 @@ def chat():
 
     goal, categorized_meals, user_preferences = context_result.get("data", ({}, {'all': []}, {}))
 
-    # Get recent chat history
-    chat_history = history_result.get("data", [])
-    formatted_history = "\n".join([f"User: {q}\nBot: {a}" for q, a in chat_history])
-    
-    print(f"DEBUG: Formatted chat history: {formatted_history}")
+    # Get recent chat history (limit to last 2 for performance)
+    chat_history = history_result.get("data", [])[-2:]  # Only last 2 messages
+    # Truncate long bot responses to keep context manageable
+    formatted_history = "\n".join([
+        f"User: {q}\nBot: {a[:150] + '...' if len(a) > 150 else a}" 
+        for q, a in chat_history
+    ])
 
     # Build profile details from user preferences
     profile_parts = []
@@ -71,8 +86,8 @@ def chat():
         if user_preferences.get("height"):
             unit = user_preferences.get("height_unit", "cm")
             profile_parts.append(f"Height: {user_preferences.get('height')} {unit}")
-        if user_preferences.get("weight"):
-            profile_parts.append(f"Weight: {user_preferences.get('weight')} {user_preferences.get('weigh_unit', 'kg')}")
+        if user_preferences.get("target_weight"):
+            profile_parts.append(f"Target Weight: {user_preferences.get('target_weight')} {user_preferences.get('weigh_unit', 'kg')}")
         if user_preferences.get("weight_goal"):
             profile_parts.append(f"Weight Goal: {user_preferences.get('weight_goal')}")
         if user_preferences.get("lifestyle"):
@@ -102,34 +117,27 @@ def chat():
     print(f"DEBUG: Goal summary for {email}: {goal_summary}")
     print(f"DEBUG: User preferences dict: {user_preferences}")
     
-    # Get all meals for general context
-    all_meals = categorized_meals.get('all', [])
+    # Get recent meals (limit to last 2 for performance)
+    all_meals = categorized_meals.get('all', [])[:2]  # Only last 2 meals
     meals_summary = "\n".join(all_meals) if all_meals else "No recent meals found"
     
-    # Add categorized meal summaries for more accurate responses
-    snacks_summary = "\n".join(categorized_meals.get('snacks', [])) if categorized_meals.get('snacks') else "No snacks recorded"
-    breakfast_summary = "\n".join(categorized_meals.get('breakfast', [])) if categorized_meals.get('breakfast') else "No breakfast recorded"
-    lunch_summary = "\n".join(categorized_meals.get('lunch', [])) if categorized_meals.get('lunch') else "No lunch recorded"
-    dinner_summary = "\n".join(categorized_meals.get('dinner', [])) if categorized_meals.get('dinner') else "No dinner recorded"
+    # Truncate goal_summary if too long for faster processing
+    goal_summary_truncated = goal_summary[:300] if len(goal_summary) > 300 else goal_summary
 
-    system_context = f"""
-You are a helpful nutrition assistant chatbot. You have access to the user's meal data and complete conversation history.
-
-User Information:
-{goal_summary}
-
-COMPLETE CONVERSATION HISTORY:
-{formatted_history if formatted_history else "This is the start of our conversation"}
-
-Recent Meal History (All Meals):
-{meals_summary}
+    system_context = f"""You are a nutrition assistant. User: {goal_summary_truncated}. Recent: {formatted_history[:200] if formatted_history else 'New conversation'}. Meals: {meals_summary[:200] if meals_summary else 'None'}.
 
 
 CRITICAL INSTRUCTIONS:
 1. ALWAYS answer questions about the user's goals, weight goal, calorie goals, macro goals, preferences, etc. DIRECTLY from the "User Information" section above. DO NOT say the information is not available if it exists in the User Information section.
-2. If the user asks "what is my weight goal?" or "what is my goal?", look for "Weight Goal:" in the User Information section and provide that EXACT information. NEVER say the weight goal is not set if it appears in the User Information section.
-3. If the user asks about their calorie goal, protein goal, carbs goal, fat goal, age, lifestyle, preferred cuisines, etc., extract that information directly from the User Information section.
-4. FORMATTING REQUIREMENT: When providing meal recommendations, food suggestions, or lists of meals, ALWAYS format them as bullet points using "- " or "* " at the start of each line. Each meal recommendation MUST include:
+2. SYNONYM RECOGNITION: Recognize that different phrasings mean the same thing. For example:
+   - "weight target", "target weight", "weight goal", "goal weight" all refer to the same thing
+   - "calorie goal" and "calorie target" are the same
+   - "protein goal" and "protein target" are the same
+   - When the user asks about ANY variation of these terms, look for the relevant information in the User Information section using ALL possible field names (Weight Goal, Target Weight, etc.)
+3. WEIGHT GOAL/TARGET QUESTIONS: If the user asks about their weight goal, weight target, target weight, goal weight, or any variation, look for BOTH "Weight Goal:" AND "Target Weight:" in the User Information section. Use whichever is available. NEVER say the information is not available if either field exists. If both exist, use the most relevant one or combine them.
+4. If the user asks about their calorie goal, protein goal, carbs goal, fat goal, age, lifestyle, preferred cuisines, etc., extract that information directly from the User Information section. Recognize synonyms and variations of these terms as well.
+5. MEAL RECOMMENDATION REQUIREMENT: When the user asks for meal recommendations, food suggestions, or meal options, ALWAYS provide 3-5 meal recommendations (never fewer than 3). This gives the user variety and options to choose from.
+6. FORMATTING REQUIREMENT: When providing meal recommendations, food suggestions, or lists of meals, ALWAYS format them as bullet points using "- " or "* " at the start of each line. Each meal recommendation MUST include:
    - Meal name and brief description
    - Nutritional information (Calories, Protein, Carbs, Fat)
    - Complete recipe with ingredients and step-by-step cooking instructions
@@ -138,24 +146,28 @@ CRITICAL INSTRUCTIONS:
      Recipe: Ingredients: [list ingredients]. Instructions: [step-by-step cooking instructions]
    - Meal Name 2: Description (Calories: X, Protein: Yg, Carbs: Zg, Fat: Wg)
      Recipe: Ingredients: [list ingredients]. Instructions: [step-by-step cooking instructions]
+   - Meal Name 3: Description (Calories: X, Protein: Yg, Carbs: Zg, Fat: Wg)
+     Recipe: Ingredients: [list ingredients]. Instructions: [step-by-step cooking instructions]
    ALWAYS include a complete recipe for every meal you recommend, even if the recipe is not in the retrieved context. Use your knowledge to provide accurate recipes.
-5. ALWAYS maintain conversation context - remember everything the user has asked and your previous responses
-6. Use the complete conversation history to provide contextual and personalized responses
-7. When the user asks "what was my last question", refer to the question they asked BEFORE their current question (not the current one)
-8. Build upon previous conversations - if they ask follow-up questions, reference what you've already discussed
-9. Be conversational and remember what you've told them before
-10. When asked about specific meal types (breakfast, lunch, dinner, snacks), use only the data from that category
-11. The meal data includes detailed nutritional information (calories, carbs, protein, fat) for each meal
-12. If the user asks about trends or patterns, analyze their meal history across multiple entries
-13. Provide personalized insights based on their eating patterns and previous questions
-14. Maintain a helpful, friendly tone throughout the conversation.
-15. Use the "User Profile" section (age, lifestyle, calorie/macro goals, preferred cuisines, etc.) to tailor every recommendation. Respect their macros, calorie targets, and cuisine preferences when possible.
-16. RECIPE REQUIREMENT: ALWAYS provide a complete recipe (ingredients list and step-by-step cooking instructions) for EVERY meal you recommend. Never skip the recipe, even if you need to use your general knowledge. The recipe should be detailed enough for the user to actually cook the meal.
+7. ALWAYS maintain conversation context - remember everything the user has asked and your previous responses
+8. Use the complete conversation history to provide contextual and personalized responses
+9. When the user asks "what was my last question", refer to the question they asked BEFORE their current question (not the current one)
+10. Build upon previous conversations - if they ask follow-up questions, reference what you've already discussed
+11. Be conversational and remember what you've told them before
+12. When asked about specific meal types (breakfast, lunch, dinner, snacks), use only the data from that category
+13. The meal data includes detailed nutritional information (calories, carbs, protein, fat) for each meal
+14. If the user asks about trends or patterns, analyze their meal history across multiple entries
+15. Provide personalized insights based on their eating patterns and previous questions
+16. Maintain a helpful, friendly tone throughout the conversation.
+17. Use the "User Profile" section (age, lifestyle, calorie/macro goals, preferred cuisines, etc.) to tailor every recommendation. Respect their macros, calorie targets, and cuisine preferences when possible.
+18. RECIPE REQUIREMENT: ALWAYS provide a complete recipe (ingredients list and step-by-step cooking instructions) for EVERY meal you recommend. Never skip the recipe, even if you need to use your general knowledge. The recipe should be detailed enough for the user to actually cook the meal.
 """
 
-
-    rag_chain = RetrievalQA.from_chain_type(llm=llm, retriever=retriever)
-    response = rag_chain.run(system_context + "\n\nUser question: " + user_question)
+    # Use invoke() instead of run() for better performance
+    # Format the query with system context
+    query = f"{system_context}\n\nUser question: {user_question}"
+    result = rag_chain.invoke({"query": query})
+    response = result.get("result", str(result))
 
     # Save chat interaction for future context
     Thread(target=save_user_chat, args=(email, user_question, response)).start()
@@ -214,9 +226,13 @@ def listen():
 
     goal, categorized_meals, user_preferences = context_result.get("data", ({}, {'all': []}, {}))
 
-    # Get recent chat history
-    chat_history = history_result.get("data", [])
-    formatted_history = "\n".join([f"User: {q}\nBot: {a}" for q, a in chat_history])
+    # Get recent chat history (limit to last 2 for performance)
+    chat_history = history_result.get("data", [])[-2:]  # Only last 2 messages
+    # Truncate long bot responses to keep context manageable
+    formatted_history = "\n".join([
+        f"User: {q}\nBot: {a[:150] + '...' if len(a) > 150 else a}" 
+        for q, a in chat_history
+    ])
     
     print(f"DEBUG: Raw chat history: {chat_history}")
     print(f"DEBUG: Formatted chat history: {formatted_history}")
@@ -265,34 +281,27 @@ def listen():
     print(f"DEBUG: User preferences dict: {user_preferences}")
     print(f"DEBUG: Goal summary for {email}: {goal_summary}")
     
-    # Get all meals for general context
-    all_meals = categorized_meals.get('all', [])
+    # Get recent meals (limit to last 2 for performance)
+    all_meals = categorized_meals.get('all', [])[:2]  # Only last 2 meals
     meals_summary = "\n".join(all_meals) if all_meals else "No recent meals found"
     
-    # Add categorized meal summaries for more accurate responses
-    snacks_summary = "\n".join(categorized_meals.get('snacks', [])) if categorized_meals.get('snacks') else "No snacks recorded"
-    breakfast_summary = "\n".join(categorized_meals.get('breakfast', [])) if categorized_meals.get('breakfast') else "No breakfast recorded"
-    lunch_summary = "\n".join(categorized_meals.get('lunch', [])) if categorized_meals.get('lunch') else "No lunch recorded"
-    dinner_summary = "\n".join(categorized_meals.get('dinner', [])) if categorized_meals.get('dinner') else "No dinner recorded"
+    # Truncate goal_summary if too long for faster processing
+    goal_summary_truncated = goal_summary[:300] if len(goal_summary) > 300 else goal_summary
 
-    system_context = f"""
-You are a helpful nutrition assistant chatbot. You have access to the user's meal data and complete conversation history.
-
-User Information:
-{goal_summary}
-
-COMPLETE CONVERSATION HISTORY:
-{formatted_history if formatted_history else "This is the start of our conversation"}
-
-Recent Meal History (All Meals):
-{meals_summary}
+    system_context = f"""You are a nutrition assistant. User: {goal_summary_truncated}. Recent: {formatted_history[:200] if formatted_history else 'New conversation'}. Meals: {meals_summary[:200] if meals_summary else 'None'}.
 
 
 CRITICAL INSTRUCTIONS:
 1. ALWAYS answer questions about the user's goals, weight goal, calorie goals, macro goals, preferences, etc. DIRECTLY from the "User Information" section above. DO NOT say the information is not available if it exists in the User Information section.
-2. If the user asks "what is my weight goal?" or "what is my goal?", look for "Weight Goal:" in the User Information section and provide that EXACT information. NEVER say the weight goal is not set if it appears in the User Information section.
-3. If the user asks about their calorie goal, protein goal, carbs goal, fat goal, age, lifestyle, preferred cuisines, etc., extract that information directly from the User Information section.
-4. FORMATTING REQUIREMENT: When providing meal recommendations, food suggestions, or lists of meals, ALWAYS format them as bullet points using "- " or "* " at the start of each line. Each meal recommendation MUST include:
+2. SYNONYM RECOGNITION: Recognize that different phrasings mean the same thing. For example:
+   - "weight target", "target weight", "weight goal", "goal weight" all refer to the same thing
+   - "calorie goal" and "calorie target" are the same
+   - "protein goal" and "protein target" are the same
+   - When the user asks about ANY variation of these terms, look for the relevant information in the User Information section using ALL possible field names (Weight Goal, Target Weight, etc.)
+3. WEIGHT GOAL/TARGET QUESTIONS: If the user asks about their weight goal, weight target, target weight, goal weight, or any variation, look for BOTH "Weight Goal:" AND "Target Weight:" in the User Information section. Use whichever is available. NEVER say the information is not available if either field exists. If both exist, use the most relevant one or combine them.
+4. If the user asks about their calorie goal, protein goal, carbs goal, fat goal, age, lifestyle, preferred cuisines, etc., extract that information directly from the User Information section. Recognize synonyms and variations of these terms as well.
+5. MEAL RECOMMENDATION REQUIREMENT: When the user asks for meal recommendations, food suggestions, or meal options, ALWAYS provide 3-5 meal recommendations (never fewer than 3). This gives the user variety and options to choose from.
+6. FORMATTING REQUIREMENT: When providing meal recommendations, food suggestions, or lists of meals, ALWAYS format them as bullet points using "- " or "* " at the start of each line. Each meal recommendation MUST include:
    - Meal name and brief description
    - Nutritional information (Calories, Protein, Carbs, Fat)
    - Complete recipe with ingredients and step-by-step cooking instructions
@@ -301,25 +310,30 @@ CRITICAL INSTRUCTIONS:
      Recipe: Ingredients: [list ingredients]. Instructions: [step-by-step cooking instructions]
    - Meal Name 2: Description (Calories: X, Protein: Yg, Carbs: Zg, Fat: Wg)
      Recipe: Ingredients: [list ingredients]. Instructions: [step-by-step cooking instructions]
+   - Meal Name 3: Description (Calories: X, Protein: Yg, Carbs: Zg, Fat: Wg)
+     Recipe: Ingredients: [list ingredients]. Instructions: [step-by-step cooking instructions]
    ALWAYS include a complete recipe for every meal you recommend, even if the recipe is not in the retrieved context. Use your knowledge to provide accurate recipes.
-5. ALWAYS maintain conversation context - remember everything the user has asked and your previous responses
-6. Use the complete conversation history to provide contextual and personalized responses
-7. When the user asks "what was my last question", refer to the question they asked BEFORE their current question (not the current one)
-8. Build upon previous conversations - if they ask follow-up questions, reference what you've already discussed
-9. Be conversational and remember what you've told them before
-10. When asked about specific meal types (breakfast, lunch, dinner, snacks), use only the data from that category
-11. The meal data includes detailed nutritional information (calories, carbs, protein, fat) for each meal
-12. If the user asks about trends or patterns, analyze their meal history across multiple entries
-13. Provide personalized insights based on their eating patterns and previous questions
-14. Maintain a helpful, friendly tone throughout the conversation.
-15. Use the "User Profile" section (age, lifestyle, calorie/macro goals, preferred cuisines, etc.) to tailor every recommendation. Respect their macros, calorie targets, and cuisine preferences when possible.
-16. RECIPE REQUIREMENT: ALWAYS provide a complete recipe (ingredients list and step-by-step cooking instructions) for EVERY meal you recommend. Never skip the recipe, even if you need to use your general knowledge. The recipe should be detailed enough for the user to actually cook the meal.
+7. ALWAYS maintain conversation context - remember everything the user has asked and your previous responses
+8. Use the complete conversation history to provide contextual and personalized responses
+9. When the user asks "what was my last question", refer to the question they asked BEFORE their current question (not the current one)
+10. Build upon previous conversations - if they ask follow-up questions, reference what you've already discussed
+11. Be conversational and remember what you've told them before
+12. When asked about specific meal types (breakfast, lunch, dinner, snacks), use only the data from that category
+13. The meal data includes detailed nutritional information (calories, carbs, protein, fat) for each meal
+14. If the user asks about trends or patterns, analyze their meal history across multiple entries
+15. Provide personalized insights based on their eating patterns and previous questions
+16. Maintain a helpful, friendly tone throughout the conversation.
+17. Use the "User Profile" section (age, lifestyle, calorie/macro goals, preferred cuisines, etc.) to tailor every recommendation. Respect their macros, calorie targets, and cuisine preferences when possible.
+18. RECIPE REQUIREMENT: ALWAYS provide a complete recipe (ingredients list and step-by-step cooking instructions) for EVERY meal you recommend. Never skip the recipe, even if you need to use your general knowledge. The recipe should be detailed enough for the user to actually cook the meal.
 """
     
     print(f"DEBUG: System context being sent to AI: {system_context}")
 
-    rag_chain = RetrievalQA.from_chain_type(llm=llm, retriever=retriever)
-    response = rag_chain.run(system_context + "\n\nUser question: " + user_question)
+    # Use invoke() instead of run() for better performance
+    # Format the query with system context
+    query = f"{system_context}\n\nUser question: {user_question}"
+    result = rag_chain.invoke({"query": query})
+    response = result.get("result", str(result))
 
     # Save chat interaction for future context
     Thread(target=save_user_chat, args=(email, user_question, response)).start()

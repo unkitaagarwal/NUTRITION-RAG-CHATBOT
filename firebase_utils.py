@@ -156,7 +156,7 @@ def save_user_chat(email, question, answer):
     
     print(f"DEBUG: Successfully saved chat for {email} with ID: {chat_doc[1].id}")
 
-def get_user_chat_history(email, max_chats=3):  # Decreased from 10 to 3 for better context
+def get_user_chat_history(email, max_chats=2):  # Reduced from 3 to 2 for faster queries
     db = init_firestore()
     print(f"DEBUG: Looking for chat history for email: {email}")
     

@@ -1,14 +1,25 @@
 import firebase_admin
 from firebase_admin import credentials, firestore
 from datetime import datetime
+import threading
+
+_firestore_client = None
+_firestore_lock = threading.Lock()
 
 def init_firestore():
-    if not firebase_admin._apps:
-        cred = credentials.Certificate("firebase_service_account.json")
-        firebase_admin.initialize_app(cred)
-    return firestore.client()
+    global _firestore_client
+    if _firestore_client:
+        return _firestore_client
 
-def get_user_context(email, max_logs=10):
+    with _firestore_lock:
+        if not firebase_admin._apps:
+            cred = credentials.Certificate("firebase_service_account.json")
+            firebase_admin.initialize_app(cred)
+        if _firestore_client is None:
+            _firestore_client = firestore.client()
+    return _firestore_client
+
+def get_user_context(email, max_logs=5):
     db = init_firestore()
     
     # Load meal logs directly from log_entry collection using user_email
@@ -58,10 +69,56 @@ def get_user_context(email, max_logs=10):
     
     print(f"DEBUG: Final meal_history: {meal_history}")
     print(f"DEBUG: Snacks only: {snacks_only}")
+
+    # Fetch user preferences/goals (stored in subcollection user_preferences)
+    user_preferences = {}
+    try:
+        # Find the user document by email in nutrilensai-77be2 collection
+        user_doc_ref = None
+        user_query = (
+            db.collection("nutrilensai-77be2")
+            .where("email", "==", email)
+            .limit(1)
+            .stream()
+        )
+        for user_doc in user_query:
+            user_doc_ref = user_doc.reference
+            print(f"DEBUG: Found user document for {email} with ID: {user_doc_ref.id}")
+            break
+
+        if user_doc_ref:
+            # Access user_preferences subcollection under the user document
+            # Get the first document (assuming one document per user, or get any if multiple exist)
+            prefs_query = (
+                user_doc_ref.collection("user_preferences")
+                .limit(1)
+                .stream()
+            )
+            
+            pref_count = 0
+            for pref_doc in prefs_query:
+                user_preferences = pref_doc.to_dict() or {}
+                pref_count += 1
+                print(f"DEBUG: Found user_preferences document with ID: {pref_doc.id}")
+                print(f"DEBUG: User preferences keys: {list(user_preferences.keys())}")
+                break
+            
+            if pref_count == 0:
+                print(f"DEBUG: No user_preferences subcollection found under user document {user_doc_ref.id}")
+                # List all subcollections to help debug
+                print(f"DEBUG: Checking if user_preferences subcollection exists...")
+        else:
+            print(f"DEBUG: No user document found for email: {email} in nutrilensai-77be2 collection")
+
+        print(f"DEBUG: User preferences: {user_preferences}")
+    except Exception as e:
+        print(f"DEBUG: Error fetching user preferences for {email}: {e}")
+        import traceback
+        traceback.print_exc()
+        user_preferences = {}
     
-    # For now, return empty goal since we're focusing on meal data
-    # TODO: Implement user preferences/goals lookup when the structure is clear
-    goal = {}
+    # goal kept for backwards compatibility (now mirrors preferences)
+    goal = user_preferences.copy()
     
     # Return both all meals and categorized meals
     categorized_meals = {
@@ -72,7 +129,7 @@ def get_user_context(email, max_logs=10):
         'dinner': dinner_only
     }
     
-    return goal, categorized_meals
+    return goal, categorized_meals, user_preferences
 
 def save_user_chat(email, question, answer):
     db = init_firestore()
@@ -99,7 +156,7 @@ def save_user_chat(email, question, answer):
     
     print(f"DEBUG: Successfully saved chat for {email} with ID: {chat_doc[1].id}")
 
-def get_user_chat_history(email, max_chats=10):  # Increased from 5 to 10 for better context
+def get_user_chat_history(email, max_chats=3):  # Decreased from 10 to 3 for better context
     db = init_firestore()
     print(f"DEBUG: Looking for chat history for email: {email}")
     

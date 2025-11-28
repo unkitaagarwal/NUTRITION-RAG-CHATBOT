@@ -97,14 +97,17 @@ def chat():
         if user_preferences.get("meal_type_list"):
             cuisines = ", ".join(user_preferences.get("meal_type_list"))
             profile_parts.append(f"Preferred cuisines: {cuisines}")
-        if user_preferences.get("calorie_goal"):
+        if user_preferences.get("calorie_goal") is not None:
             profile_parts.append(f"Calorie goal: {user_preferences.get('calorie_goal')} kcal")
-        if user_preferences.get("protein_goal"):
+        if user_preferences.get("protein_goal") is not None:
             profile_parts.append(f"Protein goal: {user_preferences.get('protein_goal')} g")
-        if user_preferences.get("carbs_goal"):
+        if user_preferences.get("carbs_goal") is not None:
             profile_parts.append(f"Carbs goal: {user_preferences.get('carbs_goal')} g")
-        if user_preferences.get("fat_goal"):
+        # Check for fat_goal (handle both snake_case and camelCase variants)
+        if "fat_goal" in user_preferences:
             profile_parts.append(f"Fat goal: {user_preferences.get('fat_goal')} g")
+        elif "fatGoal" in user_preferences:
+            profile_parts.append(f"Fat goal: {user_preferences.get('fatGoal')} g")
 
     if profile_parts:
         goal_summary = "User Profile:\n" + "\n".join(profile_parts)
@@ -115,16 +118,17 @@ def chat():
     
     # Debug: Print goal_summary to verify it contains weight_goal
     print(f"DEBUG: Goal summary for {email}: {goal_summary}")
-    print(f"DEBUG: User preferences dict: {user_preferences}")
+    print(f"DEBUG: User preferences keys: {list(user_preferences.keys()) if user_preferences else 'None'}")
+    print(f"DEBUG: Fat goal value (fat_goal): {user_preferences.get('fat_goal')}")
+    print(f"DEBUG: Fat goal value (fatGoal): {user_preferences.get('fatGoal')}")
     
     # Get recent meals (limit to last 2 for performance)
     all_meals = categorized_meals.get('all', [])[:2]  # Only last 2 meals
     meals_summary = "\n".join(all_meals) if all_meals else "No recent meals found"
     
-    # Truncate goal_summary if too long for faster processing
-    goal_summary_truncated = goal_summary[:300] if len(goal_summary) > 300 else goal_summary
-
-    system_context = f"""You are a nutrition assistant. User: {goal_summary_truncated}. Recent: {formatted_history[:200] if formatted_history else 'New conversation'}. Meals: {meals_summary[:200] if meals_summary else 'None'}.
+    # Don't truncate goal_summary - user profile data is critical and must be complete
+    # The performance impact of a few hundred extra characters is negligible compared to LLM processing time
+    system_context = f"""You are a nutrition assistant. User: {goal_summary}. Recent: {formatted_history[:200] if formatted_history else 'New conversation'}. Meals: {meals_summary[:200] if meals_summary else 'None'}.
 
 
 CRITICAL INSTRUCTIONS:
@@ -259,14 +263,17 @@ def listen():
         if user_preferences.get("meal_type_list"):
             cuisines = ", ".join(user_preferences.get("meal_type_list"))
             profile_parts.append(f"Preferred cuisines: {cuisines}")
-        if user_preferences.get("calorie_goal"):
+        if user_preferences.get("calorie_goal") is not None:
             profile_parts.append(f"Calorie goal: {user_preferences.get('calorie_goal')} kcal")
-        if user_preferences.get("protein_goal"):
+        if user_preferences.get("protein_goal") is not None:
             profile_parts.append(f"Protein goal: {user_preferences.get('protein_goal')} g")
-        if user_preferences.get("carbs_goal"):
+        if user_preferences.get("carbs_goal") is not None:
             profile_parts.append(f"Carbs goal: {user_preferences.get('carbs_goal')} g")
-        if user_preferences.get("fat_goal"):
+        # Check for fat_goal (handle both snake_case and camelCase variants)
+        if "fat_goal" in user_preferences:
             profile_parts.append(f"Fat goal: {user_preferences.get('fat_goal')} g")
+        elif "fatGoal" in user_preferences:
+            profile_parts.append(f"Fat goal: {user_preferences.get('fatGoal')} g")
 
 
     if profile_parts:
@@ -280,15 +287,15 @@ def listen():
     print(f"DEBUG: Goal: {goal}")
     print(f"DEBUG: User preferences dict: {user_preferences}")
     print(f"DEBUG: Goal summary for {email}: {goal_summary}")
+    print(f"DEBUG: Fat goal value: {user_preferences.get('fat_goal')} or {user_preferences.get('fatGoal')}")
     
     # Get recent meals (limit to last 2 for performance)
     all_meals = categorized_meals.get('all', [])[:2]  # Only last 2 meals
     meals_summary = "\n".join(all_meals) if all_meals else "No recent meals found"
     
-    # Truncate goal_summary if too long for faster processing
-    goal_summary_truncated = goal_summary[:300] if len(goal_summary) > 300 else goal_summary
-
-    system_context = f"""You are a nutrition assistant. User: {goal_summary_truncated}. Recent: {formatted_history[:200] if formatted_history else 'New conversation'}. Meals: {meals_summary[:200] if meals_summary else 'None'}.
+    # Don't truncate goal_summary - user profile data is critical and must be complete
+    # The performance impact of a few hundred extra characters is negligible compared to LLM processing time
+    system_context = f"""You are a nutrition assistant. User: {goal_summary}. Recent: {formatted_history[:200] if formatted_history else 'New conversation'}. Meals: {meals_summary[:200] if meals_summary else 'None'}.
 
 
 CRITICAL INSTRUCTIONS:

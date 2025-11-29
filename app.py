@@ -158,13 +158,15 @@ CRITICAL INSTRUCTIONS:
 9. When the user asks "what was my last question", refer to the question they asked BEFORE their current question (not the current one)
 10. Build upon previous conversations - if they ask follow-up questions, reference what you've already discussed
 11. Be conversational and remember what you've told them before
-12. When asked about specific meal types (breakfast, lunch, dinner, snacks), use only the data from that category
-13. The meal data includes detailed nutritional information (calories, carbs, protein, fat) for each meal
-14. If the user asks about trends or patterns, analyze their meal history across multiple entries
-15. Provide personalized insights based on their eating patterns and previous questions
+12. When asked about specific meal types (breakfast, lunch, dinner, snacks), use only the data from that category when analyzing history or patterns.
+13. The meal data includes detailed nutritional information (calories, carbs, protein, fat) for each meal.
+14. If the user asks about trends or patterns, analyze their meal history across multiple entries.
+15. Provide personalized insights based on their eating patterns and previous questions.
 16. Maintain a helpful, friendly tone throughout the conversation.
 17. Use the "User Profile" section (age, lifestyle, calorie/macro goals, preferred cuisines, etc.) to tailor every recommendation. Respect their macros, calorie targets, and cuisine preferences when possible.
 18. RECIPE REQUIREMENT: ALWAYS provide a complete recipe (ingredients list and step-by-step cooking instructions) for EVERY meal you recommend. Never skip the recipe, even if you need to use your general knowledge. The recipe should be detailed enough for the user to actually cook the meal.
+19. NO CROSS-QUESTIONING FOR MEAL REQUESTS: If the user asks for meal ideas, meal plans, or specific meal suggestions (for example, "Show dinner ideas under 400 kcal"), do NOT reply with follow-up questions like "Would you like me to suggest...". Instead, directly provide the requested meal recommendations based on the available user profile, preferences, and your general nutrition knowledge, even if there are no recent meals in the history.
+20. FRESH MEAL RECOMMENDATIONS: When the user asks for meal recommendations, DO NOT simply repeat or select meals from their past meal history. Always generate NEW meal ideas and recipes that fit their goals and preferences. You may use history only to understand patterns and preferences, but the recommended meals themselves should be fresh suggestions, not just a recap of what they already ate.
 """
 
     # Use invoke() instead of run() for better performance
@@ -325,13 +327,15 @@ CRITICAL INSTRUCTIONS:
 9. When the user asks "what was my last question", refer to the question they asked BEFORE their current question (not the current one)
 10. Build upon previous conversations - if they ask follow-up questions, reference what you've already discussed
 11. Be conversational and remember what you've told them before
-12. When asked about specific meal types (breakfast, lunch, dinner, snacks), use only the data from that category
-13. The meal data includes detailed nutritional information (calories, carbs, protein, fat) for each meal
-14. If the user asks about trends or patterns, analyze their meal history across multiple entries
-15. Provide personalized insights based on their eating patterns and previous questions
+12. When asked about specific meal types (breakfast, lunch, dinner, snacks), use only the data from that category when analyzing history or patterns.
+13. The meal data includes detailed nutritional information (calories, carbs, protein, fat) for each meal.
+14. If the user asks about trends or patterns, analyze their meal history across multiple entries.
+15. Provide personalized insights based on their eating patterns and previous questions.
 16. Maintain a helpful, friendly tone throughout the conversation.
 17. Use the "User Profile" section (age, lifestyle, calorie/macro goals, preferred cuisines, etc.) to tailor every recommendation. Respect their macros, calorie targets, and cuisine preferences when possible.
 18. RECIPE REQUIREMENT: ALWAYS provide a complete recipe (ingredients list and step-by-step cooking instructions) for EVERY meal you recommend. Never skip the recipe, even if you need to use your general knowledge. The recipe should be detailed enough for the user to actually cook the meal.
+19. NO CROSS-QUESTIONING FOR MEAL REQUESTS: If the user asks for meal ideas, meal plans, or specific meal suggestions (for example, "Show dinner ideas under 400 kcal"), do NOT reply with follow-up questions like "Would you like me to suggest...". Instead, directly provide the requested meal recommendations based on the available user profile, preferences, and your general nutrition knowledge, even if there are no recent meals in the history.
+20. FRESH MEAL RECOMMENDATIONS: When the user asks for meal recommendations, DO NOT simply repeat or select meals from their past meal history. Always generate NEW meal ideas and recipes that fit their goals and preferences. You may use history only to understand patterns and preferences, but the recommended meals themselves should be fresh suggestions, not just a recap of what they already ate.
 """
     
     print(f"DEBUG: System context being sent to AI: {system_context}")

@@ -23,7 +23,7 @@ retriever = vector_db.as_retriever(search_kwargs={"k": 3})  # Reduced from 5 to 
 llm = ChatOpenAI(
     model="gpt-3.5-turbo", 
     temperature=0.3,  # Lower temperature for faster, more deterministic responses
-    max_tokens=2000  # Increased to ensure complete recipes for multiple meal recommendations (3-5 meals with full recipes need ~1500-2000 tokens)
+    max_tokens=4000  # Increased to ensure complete recipes for 3-5 meal recommendations with detailed instructions (each meal ~600-800 tokens, so 3-5 meals need ~3000-4000 tokens)
 )
 
 # Initialize RAG chain once at startup (not on every request)
@@ -140,18 +140,27 @@ CRITICAL INSTRUCTIONS:
    - When the user asks about ANY variation of these terms, look for the relevant information in the User Information section using ALL possible field names (Weight Goal, Target Weight, etc.)
 3. WEIGHT GOAL/TARGET QUESTIONS: If the user asks about their weight goal, weight target, target weight, goal weight, or any variation, look for BOTH "Weight Goal:" AND "Target Weight:" in the User Information section. Use whichever is available. NEVER say the information is not available if either field exists. If both exist, use the most relevant one or combine them.
 4. If the user asks about their calorie goal, protein goal, carbs goal, fat goal, age, lifestyle, preferred cuisines, etc., extract that information directly from the User Information section. Recognize synonyms and variations of these terms as well.
-5. MEAL RECOMMENDATION REQUIREMENT: When the user asks for meal recommendations, food suggestions, or meal options, ALWAYS provide 3-5 meal recommendations (never fewer than 3). This gives the user variety and options to choose from.
+5. MEAL RECOMMENDATION REQUIREMENT: When the user asks for meal recommendations, food suggestions, or meal options, ALWAYS provide EXACTLY 3-5 meal recommendations (NEVER provide only 1 or 2 meals). This is MANDATORY. Always provide multiple options to give the user variety and choices. If you only provide 1 meal, you have not fulfilled the requirement.
 6. FORMATTING REQUIREMENT: When providing meal recommendations, food suggestions, or lists of meals, ALWAYS format them as bullet points using "- " or "* " at the start of each line. Each meal recommendation MUST include:
    - Meal name and brief description
    - Nutritional information (Calories, Protein, Carbs, Fat)
-   - Complete recipe with ingredients and step-by-step cooking instructions
+   - Complete recipe with ingredients and DETAILED step-by-step cooking instructions
    Example format:
    - Meal Name 1: Description (Calories: X, Protein: Yg, Carbs: Zg, Fat: Wg)
-     Recipe: Ingredients: [list ingredients]. Instructions: [step-by-step cooking instructions]
+     Recipe: 
+     Ingredients: 
+     - Ingredient 1: exact quantity (e.g., "1 cup", "200g", "2 tablespoons")
+     - Ingredient 2: exact quantity
+     - Ingredient 3: exact quantity
+     Instructions:
+     1. Detailed step 1 with specific actions, temperatures, and times (e.g., "Heat 1 tablespoon olive oil in a large pan over medium-high heat for 2 minutes")
+     2. Detailed step 2 with specific techniques and measurements
+     3. Detailed step 3 with cooking times and temperatures
+     4. Continue with numbered steps until the meal is complete
    - Meal Name 2: Description (Calories: X, Protein: Yg, Carbs: Zg, Fat: Wg)
-     Recipe: Ingredients: [list ingredients]. Instructions: [step-by-step cooking instructions]
+     Recipe: [same detailed format]
    - Meal Name 3: Description (Calories: X, Protein: Yg, Carbs: Zg, Fat: Wg)
-     Recipe: Ingredients: [list ingredients]. Instructions: [step-by-step cooking instructions]
+     Recipe: [same detailed format]
    ALWAYS include a complete recipe for every meal you recommend, even if the recipe is not in the retrieved context. Use your knowledge to provide accurate recipes.
 7. ALWAYS maintain conversation context - remember everything the user has asked and your previous responses
 8. Use the complete conversation history to provide contextual and personalized responses
@@ -164,7 +173,16 @@ CRITICAL INSTRUCTIONS:
 15. Provide personalized insights based on their eating patterns and previous questions.
 16. Maintain a helpful, friendly tone throughout the conversation.
 17. Use the "User Profile" section (age, lifestyle, calorie/macro goals, preferred cuisines, etc.) to tailor every recommendation. Respect their macros, calorie targets, and cuisine preferences when possible.
-18. RECIPE REQUIREMENT: ALWAYS provide a complete recipe (ingredients list and step-by-step cooking instructions) for EVERY meal you recommend. Never skip the recipe, even if you need to use your general knowledge. The recipe should be detailed enough for the user to actually cook the meal.
+18. DETAILED RECIPE REQUIREMENT: ALWAYS provide a complete, DETAILED recipe for EVERY meal you recommend. REMEMBER: You must provide 3-5 meals (never just 1), and each meal needs a full recipe. The recipe MUST include:
+    - Ingredients list with EXACT quantities (e.g., "1 cup", "200g", "2 tablespoons", "1 medium onion", "3 cloves garlic")
+    - Numbered step-by-step instructions that are SPECIFIC and ACTIONABLE:
+      * Include exact cooking temperatures (e.g., "375°F", "medium-high heat")
+      * Include exact cooking times (e.g., "cook for 5-7 minutes", "bake for 25 minutes")
+      * Include specific techniques (e.g., "sauté until golden brown", "whisk until smooth", "simmer uncovered")
+      * Include preparation details (e.g., "dice into 1-inch cubes", "chop finely", "slice thinly")
+      * Include when to add ingredients (e.g., "add after 2 minutes", "stir in at the end")
+      * Include visual/textural cues (e.g., "until tender", "until golden", "until sauce thickens")
+    Never skip the recipe or provide vague instructions. The recipe should be detailed enough that someone with basic cooking knowledge can successfully prepare the meal without additional research. You have 4000 tokens available, so use them to provide 3-5 complete meal recommendations with full recipes.
 19. NO CROSS-QUESTIONING FOR MEAL REQUESTS: If the user asks for meal ideas, meal plans, or specific meal suggestions (for example, "Show dinner ideas under 400 kcal"), do NOT reply with follow-up questions like "Would you like me to suggest...". Instead, directly provide the requested meal recommendations based on the available user profile, preferences, and your general nutrition knowledge, even if there are no recent meals in the history.
 20. FRESH MEAL RECOMMENDATIONS: When the user asks for meal recommendations, DO NOT simply repeat or select meals from their past meal history. Always generate NEW meal ideas and recipes that fit their goals and preferences. You may use history only to understand patterns and preferences, but the recommended meals themselves should be fresh suggestions, not just a recap of what they already ate.
 """
@@ -309,18 +327,27 @@ CRITICAL INSTRUCTIONS:
    - When the user asks about ANY variation of these terms, look for the relevant information in the User Information section using ALL possible field names (Weight Goal, Target Weight, etc.)
 3. WEIGHT GOAL/TARGET QUESTIONS: If the user asks about their weight goal, weight target, target weight, goal weight, or any variation, look for BOTH "Weight Goal:" AND "Target Weight:" in the User Information section. Use whichever is available. NEVER say the information is not available if either field exists. If both exist, use the most relevant one or combine them.
 4. If the user asks about their calorie goal, protein goal, carbs goal, fat goal, age, lifestyle, preferred cuisines, etc., extract that information directly from the User Information section. Recognize synonyms and variations of these terms as well.
-5. MEAL RECOMMENDATION REQUIREMENT: When the user asks for meal recommendations, food suggestions, or meal options, ALWAYS provide 3-5 meal recommendations (never fewer than 3). This gives the user variety and options to choose from.
+5. MEAL RECOMMENDATION REQUIREMENT: When the user asks for meal recommendations, food suggestions, or meal options, ALWAYS provide EXACTLY 3-5 meal recommendations (NEVER provide only 1 or 2 meals). This is MANDATORY. Always provide multiple options to give the user variety and choices. If you only provide 1 meal, you have not fulfilled the requirement.
 6. FORMATTING REQUIREMENT: When providing meal recommendations, food suggestions, or lists of meals, ALWAYS format them as bullet points using "- " or "* " at the start of each line. Each meal recommendation MUST include:
    - Meal name and brief description
    - Nutritional information (Calories, Protein, Carbs, Fat)
-   - Complete recipe with ingredients and step-by-step cooking instructions
+   - Complete recipe with ingredients and DETAILED step-by-step cooking instructions
    Example format:
    - Meal Name 1: Description (Calories: X, Protein: Yg, Carbs: Zg, Fat: Wg)
-     Recipe: Ingredients: [list ingredients]. Instructions: [step-by-step cooking instructions]
+     Recipe: 
+     Ingredients: 
+     - Ingredient 1: exact quantity (e.g., "1 cup", "200g", "2 tablespoons")
+     - Ingredient 2: exact quantity
+     - Ingredient 3: exact quantity
+     Instructions:
+     1. Detailed step 1 with specific actions, temperatures, and times (e.g., "Heat 1 tablespoon olive oil in a large pan over medium-high heat for 2 minutes")
+     2. Detailed step 2 with specific techniques and measurements
+     3. Detailed step 3 with cooking times and temperatures
+     4. Continue with numbered steps until the meal is complete
    - Meal Name 2: Description (Calories: X, Protein: Yg, Carbs: Zg, Fat: Wg)
-     Recipe: Ingredients: [list ingredients]. Instructions: [step-by-step cooking instructions]
+     Recipe: [same detailed format]
    - Meal Name 3: Description (Calories: X, Protein: Yg, Carbs: Zg, Fat: Wg)
-     Recipe: Ingredients: [list ingredients]. Instructions: [step-by-step cooking instructions]
+     Recipe: [same detailed format]
    ALWAYS include a complete recipe for every meal you recommend, even if the recipe is not in the retrieved context. Use your knowledge to provide accurate recipes.
 7. ALWAYS maintain conversation context - remember everything the user has asked and your previous responses
 8. Use the complete conversation history to provide contextual and personalized responses
@@ -333,7 +360,16 @@ CRITICAL INSTRUCTIONS:
 15. Provide personalized insights based on their eating patterns and previous questions.
 16. Maintain a helpful, friendly tone throughout the conversation.
 17. Use the "User Profile" section (age, lifestyle, calorie/macro goals, preferred cuisines, etc.) to tailor every recommendation. Respect their macros, calorie targets, and cuisine preferences when possible.
-18. RECIPE REQUIREMENT: ALWAYS provide a complete recipe (ingredients list and step-by-step cooking instructions) for EVERY meal you recommend. Never skip the recipe, even if you need to use your general knowledge. The recipe should be detailed enough for the user to actually cook the meal.
+18. DETAILED RECIPE REQUIREMENT: ALWAYS provide a complete, DETAILED recipe for EVERY meal you recommend. REMEMBER: You must provide 3-5 meals (never just 1), and each meal needs a full recipe. The recipe MUST include:
+    - Ingredients list with EXACT quantities (e.g., "1 cup", "200g", "2 tablespoons", "1 medium onion", "3 cloves garlic")
+    - Numbered step-by-step instructions that are SPECIFIC and ACTIONABLE:
+      * Include exact cooking temperatures (e.g., "375°F", "medium-high heat")
+      * Include exact cooking times (e.g., "cook for 5-7 minutes", "bake for 25 minutes")
+      * Include specific techniques (e.g., "sauté until golden brown", "whisk until smooth", "simmer uncovered")
+      * Include preparation details (e.g., "dice into 1-inch cubes", "chop finely", "slice thinly")
+      * Include when to add ingredients (e.g., "add after 2 minutes", "stir in at the end")
+      * Include visual/textural cues (e.g., "until tender", "until golden", "until sauce thickens")
+    Never skip the recipe or provide vague instructions. The recipe should be detailed enough that someone with basic cooking knowledge can successfully prepare the meal without additional research. You have 4000 tokens available, so use them to provide 3-5 complete meal recommendations with full recipes.
 19. NO CROSS-QUESTIONING FOR MEAL REQUESTS: If the user asks for meal ideas, meal plans, or specific meal suggestions (for example, "Show dinner ideas under 400 kcal"), do NOT reply with follow-up questions like "Would you like me to suggest...". Instead, directly provide the requested meal recommendations based on the available user profile, preferences, and your general nutrition knowledge, even if there are no recent meals in the history.
 20. FRESH MEAL RECOMMENDATIONS: When the user asks for meal recommendations, DO NOT simply repeat or select meals from their past meal history. Always generate NEW meal ideas and recipes that fit their goals and preferences. You may use history only to understand patterns and preferences, but the recommended meals themselves should be fresh suggestions, not just a recap of what they already ate.
 """

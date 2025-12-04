@@ -228,6 +228,7 @@ def generate_meals():
     diet = data.get("diet", "")
     macro_targets = data.get("macroTargets", {})
     meal_count = data.get("mealCount", 3)
+    include_images = data.get("includeImages", True)  # Generate meal images by default
     
     # Validate ingredients list is not empty
     if not ingredients or len(ingredients) == 0:
@@ -383,9 +384,55 @@ Rules: Use required ingredients. Detailed step-by-step instructions.{macro_summa
                 "ingredients": meal.get("ingredients", []),
                 "instructions": meal.get("instructions", []),
                 "cookingTime": meal.get("cookingTime", default_values["cookingTime"]),
-                "servings": meal.get("servings", default_values["servings"])
+                "servings": meal.get("servings", default_values["servings"]),
+                "imageUrl": None  # Will be populated if include_images is True
             }
             validated_meals.append(validated_meal)
+        
+        # Generate images for meals if requested
+        if include_images:
+            def generate_meal_image(meal_data, index):
+                """Generate image for a single meal using DALL-E"""
+                try:
+                    meal_name = meal_data["name"]
+                    meal_desc = meal_data["description"]
+                    # Create a descriptive prompt for the image
+                    image_prompt = f"Professional food photography of {meal_name}. {meal_desc}. High quality, appetizing, well-lit, restaurant style, on a plate, food photography"
+                    
+                    # Generate image using DALL-E (using 1024x1024 for good quality)
+                    image_response = client.images.generate(
+                        model="dall-e-3",
+                        prompt=image_prompt,
+                        size="1024x1024",
+                        quality="standard",
+                        n=1,
+                    )
+                    
+                    return image_response.data[0].url
+                except Exception as e:
+                    print(f"Error generating image for {meal_data['name']}: {str(e)}")
+                    return None
+            
+            # Generate images in parallel using threads for faster processing
+            image_results = {}
+            threads = []
+            
+            def generate_with_index(meal_idx, meal_data):
+                url = generate_meal_image(meal_data, meal_idx)
+                image_results[meal_idx] = url
+            
+            for idx, meal in enumerate(validated_meals):
+                thread = Thread(target=generate_with_index, args=(idx, meal))
+                threads.append(thread)
+                thread.start()
+            
+            # Wait for all image generation threads to complete (max 60 seconds timeout)
+            for thread in threads:
+                thread.join(timeout=60)
+            
+            # Assign image URLs to meals
+            for idx, meal in enumerate(validated_meals):
+                meal["imageUrl"] = image_results.get(idx)
         
         # Compute totals
         totals = {

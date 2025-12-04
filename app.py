@@ -7,6 +7,8 @@ from firebase_utils import get_user_context, get_user_chat_history, save_user_ch
 from dotenv import load_dotenv
 import os
 import io
+import json
+import re
 from openai import OpenAI
 from threading import Thread
 
@@ -214,6 +216,198 @@ CRITICAL INSTRUCTIONS:
     # Save chat interaction for future context
     Thread(target=save_user_chat, args=(email, user_question, response)).start()
     return jsonify({"reply": response})
+
+@app.route("/generate-meals", methods=["POST"])
+def generate_meals():
+    data = request.get_json()
+    
+    # Extract parameters
+    ingredients = data.get("ingredients", [])
+    cuisine = data.get("cuisine", "")
+    cooking_time = data.get("cookingTime", "")
+    diet = data.get("diet", "")
+    macro_targets = data.get("macroTargets", {})
+    meal_count = data.get("mealCount", 3)
+    
+    # Validate ingredients list is not empty
+    if not ingredients or len(ingredients) == 0:
+        return jsonify({"error": "Ingredients list cannot be empty"}), 400
+    
+    # Compute macro-per-meal values if macroTargets exist
+    calories_per_meal = None
+    protein_per_meal = None
+    carbs_per_meal = None
+    fats_per_meal = None
+    
+    if macro_targets:
+        total_calories = macro_targets.get("calories", 0)
+        total_protein = macro_targets.get("protein", 0)
+        total_carbs = macro_targets.get("carbs", 0)
+        total_fats = macro_targets.get("fats", 0)
+        
+        if meal_count > 0:
+            calories_per_meal = total_calories / meal_count if total_calories > 0 else None
+            protein_per_meal = total_protein / meal_count if total_protein > 0 else None
+            carbs_per_meal = total_carbs / meal_count if total_carbs > 0 else None
+            fats_per_meal = total_fats / meal_count if total_fats > 0 else None
+    
+    # Build the GPT prompt
+    prompt_parts = []
+    prompt_parts.append(f"Generate exactly {meal_count} meal recommendations.")
+    prompt_parts.append(f"\nRequired ingredients: {', '.join(ingredients)}")
+    
+    if cuisine:
+        prompt_parts.append(f"Cuisine preference: {cuisine}")
+    if cooking_time:
+        prompt_parts.append(f"Cooking time preference: {cooking_time}")
+    if diet:
+        prompt_parts.append(f"Diet preference: {diet}")
+    
+    if macro_targets and (calories_per_meal or protein_per_meal or carbs_per_meal or fats_per_meal):
+        prompt_parts.append("\nMacro target requirements per meal:")
+        if calories_per_meal:
+            prompt_parts.append(f"- Calories: approximately {calories_per_meal:.0f} kcal")
+        if protein_per_meal:
+            prompt_parts.append(f"- Protein: approximately {protein_per_meal:.1f}g")
+        if carbs_per_meal:
+            prompt_parts.append(f"- Carbs: approximately {carbs_per_meal:.1f}g")
+        if fats_per_meal:
+            prompt_parts.append(f"- Fats: approximately {fats_per_meal:.1f}g")
+    
+    # JSON schema for meal object (optimized - more concise)
+    macro_summary = ""
+    if macro_targets:
+        totals = []
+        if macro_targets.get('calories'):
+            totals.append(f"{macro_targets.get('calories', 0):.0f} kcal")
+        if macro_targets.get('protein'):
+            totals.append(f"{macro_targets.get('protein', 0):.1f}g protein")
+        if macro_targets.get('carbs'):
+            totals.append(f"{macro_targets.get('carbs', 0):.1f}g carbs")
+        if macro_targets.get('fats'):
+            totals.append(f"{macro_targets.get('fats', 0):.1f}g fats")
+        if totals:
+            macro_summary = f" Total targets: {', '.join(totals)}."
+    
+    prompt_parts.append(f"""
+Return JSON array with {meal_count} meal objects. Schema:
+{{"name":"string", "description":"string", "calories":number, "protein":number, "carbs":number, "fats":number, "ingredients":["string with quantity"], "instructions":["step 1", "step 2"], "cookingTime":"string", "servings":number}}
+Rules: Use required ingredients. Detailed step-by-step instructions.{macro_summary} Valid JSON only, no markdown, no trailing commas.
+""")
+    
+    user_prompt = "\n".join(prompt_parts)
+    
+    # System message (optimized for speed - shorter and more direct)
+    system_message = """Nutrition expert. Generate meal recommendations as JSON array. Return raw JSON only, no markdown. No trailing commas. Accurate nutrition values."""
+    
+    # Calculate optimal max_tokens based on meal count (each meal ~600-800 tokens)
+    # Add buffer for JSON structure
+    estimated_tokens = meal_count * 700 + 200
+    max_tokens = min(max(estimated_tokens, 1500), 4000)  # Between 1500-4000 tokens
+    
+    # Call OpenAI Chat Completion API (optimized for speed)
+    response_text = None
+    try:
+        response = client.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": system_message},
+                {"role": "user", "content": user_prompt}
+            ],
+            temperature=0.3,  # Lower temperature for faster, more deterministic responses
+            max_tokens=max_tokens
+        )
+        
+        response_text = response.choices[0].message.content.strip()
+        
+        # Remove markdown code blocks if present
+        response_text = re.sub(r'```json\s*', '', response_text)
+        response_text = re.sub(r'```\s*', '', response_text)
+        response_text = response_text.strip()
+        
+        # Clean trailing commas from JSON (common GPT issue)
+        # Remove trailing commas before closing brackets/braces (handle nested structures)
+        # This regex handles whitespace and newlines before closing brackets/braces
+        response_text = re.sub(r',(\s*})', r'\1', response_text)  # Remove trailing comma before }
+        response_text = re.sub(r',(\s*])', r'\1', response_text)  # Remove trailing comma before ]
+        # Also handle cases with newlines
+        response_text = re.sub(r',\s*\n\s*}', '\n}', response_text)
+        response_text = re.sub(r',\s*\n\s*]', '\n]', response_text)
+        
+        # Parse JSON with retry logic for trailing commas
+        meals = None
+        parse_attempts = 0
+        while parse_attempts < 3:
+            try:
+                meals = json.loads(response_text)
+                break
+            except json.JSONDecodeError as parse_error:
+                parse_attempts += 1
+                if parse_attempts >= 3:
+                    raise  # Re-raise if all attempts failed
+                # Try more aggressive cleaning
+                # Remove trailing commas more aggressively line by line
+                lines = response_text.split('\n')
+                cleaned_lines = []
+                for i, line in enumerate(lines):
+                    # Remove trailing comma if next non-empty line starts with } or ]
+                    if i < len(lines) - 1:
+                        next_line = lines[i + 1].strip()
+                        if next_line in ['}', ']'] and line.rstrip().endswith(','):
+                            cleaned_lines.append(line.rstrip().rstrip(','))
+                        else:
+                            cleaned_lines.append(line)
+                    else:
+                        cleaned_lines.append(line)
+                response_text = '\n'.join(cleaned_lines)
+                # Try one more cleanup pass
+                response_text = re.sub(r',(\s*})', r'\1', response_text)
+                response_text = re.sub(r',(\s*])', r'\1', response_text)
+        
+        # Validate and fill missing fields with defaults
+        default_values = {
+            "cookingTime": "30 minutes",
+            "servings": 1
+        }
+        
+        validated_meals = []
+        for meal in meals:
+            # Ensure all required fields exist
+            validated_meal = {
+                "name": meal.get("name", "Unnamed Meal"),
+                "description": meal.get("description", ""),
+                "calories": meal.get("calories", 0),
+                "protein": meal.get("protein", 0),
+                "carbs": meal.get("carbs", 0),
+                "fats": meal.get("fats", 0),
+                "ingredients": meal.get("ingredients", []),
+                "instructions": meal.get("instructions", []),
+                "cookingTime": meal.get("cookingTime", default_values["cookingTime"]),
+                "servings": meal.get("servings", default_values["servings"])
+            }
+            validated_meals.append(validated_meal)
+        
+        # Compute totals
+        totals = {
+            "calories": sum(meal["calories"] for meal in validated_meals),
+            "protein": sum(meal["protein"] for meal in validated_meals),
+            "carbs": sum(meal["carbs"] for meal in validated_meals),
+            "fats": sum(meal["fats"] for meal in validated_meals)
+        }
+        
+        return jsonify({
+            "meals": validated_meals,
+            "totals": totals,
+            "mealCount": len(validated_meals)
+        })
+        
+    except json.JSONDecodeError as e:
+        error_msg = f"Failed to parse JSON response: {str(e)}"
+        if response_text:
+            error_msg += f"\nRaw response: {response_text[:500]}"
+        return jsonify({"error": error_msg}), 500
+    except Exception as e:
+        return jsonify({"error": f"Error generating meals: {str(e)}"}), 500
 
 @app.route("/speak", methods=["POST"])
 def speak():

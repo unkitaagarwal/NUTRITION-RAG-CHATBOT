@@ -604,6 +604,135 @@ def speak():
     audio_stream = io.BytesIO(response.read())
     return send_file(audio_stream, mimetype="audio/mpeg")
 
+
+# ---------------------------
+# Helper: Transcribe Audio
+# ---------------------------
+def transcribe_audio_file(audio_bytes: bytes, file_name: str) -> str:
+    try:
+        # Create file-like object
+        audio_file = io.BytesIO(audio_bytes)
+        audio_file.name = file_name
+
+        transcription = client.audio.transcriptions.create(
+            model="gpt-4o-transcribe",  # or whisper-1 if enabled
+            file=audio_file,
+            response_format="text",
+        )
+
+        transcript_text = (
+            transcription if isinstance(transcription, str) else str(transcription)
+        ).strip()
+
+        if not transcript_text:
+            raise ValueError("Transcription returned empty text")
+
+        return transcript_text
+
+    except Exception as e:
+        raise Exception(f"Transcription failed: {e}")
+
+
+# ---------------------------
+# Helper: Extract Ingredients
+# ---------------------------
+def extract_ingredients(transcript: str):
+    try:
+        system_prompt = (
+            "You are a food ingredient extraction assistant.\n"
+            "Given a sentence, extract ONLY the food ingredients listed.\n"
+            "Return them as a comma-separated list with NO extra explanations.\n"
+            "Example:\n"
+            "Input: 'I have chicken breast, broccoli and garlic.'\n"
+            "Output: 'chicken breast, broccoli, garlic'\n"
+        )
+
+        user_prompt = f"Extract ingredients from: \"{transcript}\""
+
+        completion = client.chat.completions.create(
+            model="gpt-4o-mini",  # small + fast + cheap
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.2,
+        )
+
+        content = completion.choices[0].message.content.strip()
+
+        # Comma-split + cleanup
+        raw_items = content.replace("\n", ",").split(",")
+        ingredients = [
+            item.strip()
+            for item in raw_items
+            if item.strip()
+            and ":" not in item.lower()
+            and "sorry" not in item.lower()
+        ]
+
+        # Remove duplicates while keeping order
+        seen = set()
+        unique = []
+        for ing in ingredients:
+            low = ing.lower()
+            if low not in seen:
+                seen.add(low)
+                unique.append(ing)
+
+        return unique
+
+    except Exception as e:
+        raise Exception(f"Ingredient extraction failed: {e}")
+
+
+# ---------------------------
+# MAIN ENDPOINT (File Upload Only)
+# ---------------------------
+@app.route("/voice-ingredients", methods=["POST"])
+def voice_ingredients():
+    """
+    Accepts audio file only.
+    Returns list of ingredients + transcript.
+    """
+    try:
+        # Check if audio file is in request
+        if 'audio' not in request.files:
+            return jsonify({"error": "Audio file is required"}), 400
+        
+        audio_file = request.files['audio']
+        if not audio_file.filename:
+            return jsonify({"error": "Uploaded audio file is empty"}), 400
+
+        # Read audio file
+        audio_bytes = audio_file.read()
+        if not audio_bytes:
+            return jsonify({"error": "Uploaded audio file is empty"}), 400
+
+        print(f"Received audio file: {audio_file.filename}")
+
+        # 1. Transcribe voice → text
+        transcript = transcribe_audio_file(audio_bytes, audio_file.filename)
+
+        # 2. Extract ingredients from transcript
+        ingredients = extract_ingredients(transcript)
+
+        response = {
+            "ingredients": ingredients,
+            "transcript": transcript,
+            "message": f"Found {len(ingredients)} ingredient(s).",
+        }
+
+        return jsonify(response)
+
+    except Exception as e:
+        print(f"Error in voice_ingredients: {str(e)}")
+        return jsonify({
+            "error": "Unexpected server error",
+            "details": str(e)
+        }), 500
+
+
+
 @app.route("/listen", methods=["POST"])
 def listen():
     audio_file = request.files["file"]

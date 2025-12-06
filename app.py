@@ -9,6 +9,7 @@ import os
 import io
 import json
 import re
+import base64
 from openai import OpenAI
 from threading import Thread
 
@@ -216,6 +217,142 @@ CRITICAL INSTRUCTIONS:
     # Save chat interaction for future context
     Thread(target=save_user_chat, args=(email, user_question, response)).start()
     return jsonify({"reply": response})
+
+
+@app.route("/detect-ingredients", methods=["POST"])
+def detect_ingredients():
+    try:
+        image_url_for_vision = None
+        
+        # Priority: file upload > base64 JSON
+        # Check for file upload (multipart/form-data)
+        if 'image' in request.files:
+            uploaded_file = request.files['image']
+            if uploaded_file.filename:
+                print("🔍 Received image file upload:", uploaded_file.filename)
+                
+                # Read image bytes
+                image_bytes = uploaded_file.read()
+                
+                # Determine content type from file extension
+                filename = uploaded_file.filename.lower()
+                if filename.endswith(('.jpg', '.jpeg')):
+                    content_type = "image/jpeg"
+                elif filename.endswith('.png'):
+                    content_type = "image/png"
+                elif filename.endswith('.gif'):
+                    content_type = "image/gif"
+                elif filename.endswith('.webp'):
+                    content_type = "image/webp"
+                else:
+                    content_type = "image/jpeg"  # Default
+                
+                # Convert to base64
+                image_base64 = base64.b64encode(image_bytes).decode("utf-8")
+                image_url_for_vision = f"data:{content_type};base64,{image_base64}"
+                print("✅ Image file converted to base64")
+        
+        # Check for base64 in JSON (application/json)
+        elif request.is_json:
+            data = request.get_json()
+            image_base64 = data.get("imageBase64")
+            image_format = data.get("imageFormat", "jpg")
+            
+            if image_base64:
+                print("🔍 Received base64 image")
+                # Remove data URL prefix if present (e.g., "data:image/jpeg;base64,")
+                if "," in image_base64:
+                    image_base64 = image_base64.split(",")[-1]
+                
+                # Determine content type from format
+                format_to_mime = {
+                    "jpg": "image/jpeg",
+                    "jpeg": "image/jpeg",
+                    "png": "image/png",
+                    "gif": "image/gif",
+                    "webp": "image/webp"
+                }
+                content_type = format_to_mime.get(image_format.lower(), "image/jpeg")
+                
+                # Create data URL for GPT-Vision
+                image_url_for_vision = f"data:{content_type};base64,{image_base64}"
+                print("✅ Using base64 image directly")
+        
+        # If no image was provided through any method
+        if not image_url_for_vision:
+            return jsonify({
+                "error": "Image is required",
+                "details": "Provide image in one of these formats: 1) File upload (multipart/form-data with 'image' field), or 2) Base64 JSON (imageBase64 + imageFormat)"
+            }), 400
+
+        print("🤖 Calling GPT Vision API...")
+
+        # 2. Call GPT-Vision API using OpenAI client
+        try:
+            vision_response = client.chat.completions.create(
+                model="gpt-4o",  # or "gpt-4-vision-preview" for older models
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": (
+                                    "Look at this image and identify all the visible food ingredients. "
+                                    "Return a comma-separated list only. Do not include any explanations or additional text."
+                                ),
+                            },
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": image_url_for_vision
+                                },
+                            },
+                        ],
+                    }
+                ],
+                max_tokens=300,
+                temperature=0.3
+            )
+
+            # 3. Extract content
+            content = vision_response.choices[0].message.content
+            print("📝 Raw AI content:", content)
+
+            # 4. Parse comma-separated ingredients
+            ingredients = [
+                item.strip().lower()
+                for item in content.replace("\n", ",").split(",")
+                if item.strip() and ":" not in item.lower() and "sorry" not in item.lower()
+            ][:15]
+
+            print("🥬 Final ingredients:", ingredients)
+
+            if not ingredients:
+                return jsonify({
+                    "ingredients": [],
+                    "message": "No ingredients detected in this image",
+                })
+
+            return jsonify({
+                "ingredients": ingredients,
+                "message": f"Found {len(ingredients)} ingredients",
+            })
+
+        except Exception as vision_error:
+            print("💥 GPT Vision error:", str(vision_error))
+            return jsonify({
+                "error": "Failed to analyze image with GPT Vision",
+                "details": str(vision_error)
+            }), 500
+
+    except Exception as e:
+        print("💥 Critical error:", str(e))
+        return jsonify({
+            "error": "Something went wrong analyzing the image",
+            "details": str(e),
+        }), 500
+
 
 @app.route("/generate-meals", methods=["POST"])
 def generate_meals():

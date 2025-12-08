@@ -290,17 +290,14 @@ def detect_ingredients():
         # 2. Call GPT-Vision API using OpenAI client
         try:
             vision_response = client.chat.completions.create(
-                model="gpt-4o",  # or "gpt-4-vision-preview" for older models
+                model="gpt-4o-mini",  # Cost-effective: ~10x cheaper than gpt-4o, still supports vision
                 messages=[
                     {
                         "role": "user",
                         "content": [
                             {
                                 "type": "text",
-                                "text": (
-                                    "Look at this image and identify all the visible food ingredients. "
-                                    "Return a comma-separated list only. Do not include any explanations or additional text."
-                                ),
+                                "text": "List visible food ingredients. Comma-separated only, no explanations.",
                             },
                             {
                                 "type": "image_url",
@@ -311,8 +308,8 @@ def detect_ingredients():
                         ],
                     }
                 ],
-                max_tokens=300,
-                temperature=0.3
+                max_tokens=200,  # Reduced from 300 - ingredients list doesn't need that many tokens
+                temperature=0.2  # Lower temperature for more deterministic, cheaper responses
             )
 
             # 3. Extract content
@@ -365,7 +362,7 @@ def generate_meals():
     diet = data.get("diet", "")
     macro_targets = data.get("macroTargets", {})
     meal_count = data.get("mealCount", 3)
-    include_images = data.get("includeImages", True)  # Generate meal images by default
+    include_images = data.get("includeImages", True)
     
     # Validate ingredients list is not empty
     if not ingredients or len(ingredients) == 0:
@@ -428,20 +425,19 @@ def generate_meals():
             macro_summary = f" Total targets: {', '.join(totals)}."
     
     prompt_parts.append(f"""
-Return JSON array with {meal_count} meal objects. Schema:
-{{"name":"string", "description":"string", "calories":number, "protein":number, "carbs":number, "fats":number, "ingredients":["string with quantity"], "instructions":["step 1", "step 2"], "cookingTime":"string", "servings":number}}
-Rules: Use required ingredients. Detailed step-by-step instructions.{macro_summary} Valid JSON only, no markdown, no trailing commas.
+JSON array with {meal_count} meals. Schema: {{"name":"string","description":"string","calories":number,"protein":number,"carbs":number,"fats":number,"ingredients":["string"],"instructions":["step"],"cookingTime":"string","servings":number}}
+Rules: Use required ingredients. Step-by-step instructions.{macro_summary} Valid JSON only, no markdown, no trailing commas.
 """)
     
     user_prompt = "\n".join(prompt_parts)
     
-    # System message (optimized for speed - shorter and more direct)
-    system_message = """Nutrition expert. Generate meal recommendations as JSON array. Return raw JSON only, no markdown. No trailing commas. Accurate nutrition values."""
+    # System message (cost-optimized - minimal tokens)
+    system_message = """Nutrition expert. Return JSON array only. No markdown. No trailing commas. Accurate nutrition."""
     
-    # Calculate optimal max_tokens based on meal count (each meal ~600-800 tokens)
-    # Add buffer for JSON structure
-    estimated_tokens = meal_count * 700 + 200
-    max_tokens = min(max(estimated_tokens, 1500), 4000)  # Between 1500-4000 tokens
+    # Calculate optimal max_tokens based on meal count (cost-optimized)
+    # Reduced estimate: each meal ~500-600 tokens (optimized prompts)
+    estimated_tokens = meal_count * 550 + 150
+    max_tokens = min(max(estimated_tokens, 1200), 3500)  # Reduced range: 1200-3500 tokens
     
     # Call OpenAI Chat Completion API (optimized for speed)
     response_text = None
@@ -536,18 +532,28 @@ Rules: Use required ingredients. Detailed step-by-step instructions.{macro_summa
                     # Create a descriptive prompt for the image
                     image_prompt = f"Professional food photography of {meal_name}. {meal_desc}. High quality, appetizing, well-lit, restaurant style, on a plate, food photography"
                     
-                    # Generate image using DALL-E (using 1024x1024 for good quality)
+                    # Generate image using DALL-E 2 (most cost-effective option)
+                    # Pricing: DALL-E 2 is cheaper than DALL-E 3
+                    # Size pricing: 256x256 < 512x512 < 1024x1024 (smaller = cheaper)
+                    # Using DALL-E 2 with 256x256 for maximum cost savings
                     image_response = client.images.generate(
-                        model="dall-e-3",
+                        model="dall-e-2",  # Most inexpensive model
                         prompt=image_prompt,
-                        size="1024x1024",
-                        quality="standard",
+                        size="512x512", 
                         n=1,
                     )
                     
                     return image_response.data[0].url
                 except Exception as e:
-                    print(f"Error generating image for {meal_data['name']}: {str(e)}")
+                    error_msg = str(e)
+                    print(f"❌ Error generating image for {meal_data['name']}: {error_msg}")
+                    # Log more details if it's an OpenAI API error
+                    if hasattr(e, 'response'):
+                        try:
+                            error_data = e.response.json() if hasattr(e.response, 'json') else {}
+                            print(f"   API Error details: {error_data}")
+                        except:
+                            pass
                     return None
             
             # Generate images in parallel using threads for faster processing
@@ -591,7 +597,86 @@ Rules: Use required ingredients. Detailed step-by-step instructions.{macro_summa
             error_msg += f"\nRaw response: {response_text[:500]}"
         return jsonify({"error": error_msg}), 500
     except Exception as e:
-        return jsonify({"error": f"Error generating meals: {str(e)}"}), 500
+        # Handle OpenAI API errors specifically
+        error_str = str(e)
+        error_dict = {}
+        
+        # Try to extract OpenAI error details from the exception
+        # OpenAI errors often contain nested error information
+        try:
+            # Check if error has response attribute (OpenAI SDK errors)
+            if hasattr(e, 'response') and hasattr(e.response, 'json'):
+                error_data = e.response.json()
+                if 'error' in error_data:
+                    openai_error = error_data['error']
+                    error_code = openai_error.get('code', '')
+                    error_type = openai_error.get('type', '')
+                    error_message = openai_error.get('message', str(e))
+                    
+                    if error_code == 'insufficient_quota' or error_type == 'insufficient_quota' or '429' in error_str:
+                        error_dict = {
+                            "error": "OpenAI API quota exceeded",
+                            "message": error_message,
+                            "type": "quota_exceeded",
+                            "status_code": 429,
+                            "details": "Please check your OpenAI plan and billing details at https://platform.openai.com/account/billing"
+                        }
+                        return jsonify(error_dict), 429
+                    elif error_code == 'invalid_api_key' or '401' in error_str:
+                        error_dict = {
+                            "error": "OpenAI API authentication failed",
+                            "message": error_message,
+                            "type": "authentication_error",
+                            "status_code": 401
+                        }
+                        return jsonify(error_dict), 401
+                    elif 'rate_limit' in error_code.lower() or 'rate_limit' in error_type.lower():
+                        error_dict = {
+                            "error": "OpenAI API rate limit exceeded",
+                            "message": error_message,
+                            "type": "rate_limit_exceeded",
+                            "status_code": 429
+                        }
+                        return jsonify(error_dict), 429
+        except:
+            pass  # Fall through to string-based detection
+        
+        # String-based error detection (fallback)
+        if "429" in error_str or "quota" in error_str.lower() or "insufficient_quota" in error_str.lower():
+            error_dict = {
+                "error": "OpenAI API quota exceeded",
+                "message": "You have exceeded your OpenAI API quota. Please check your plan and billing details.",
+                "type": "quota_exceeded",
+                "status_code": 429,
+                "details": "For more information, visit: https://platform.openai.com/docs/guides/error-codes/api-errors"
+            }
+            return jsonify(error_dict), 429
+        elif "401" in error_str or "unauthorized" in error_str.lower():
+            error_dict = {
+                "error": "OpenAI API authentication failed",
+                "message": "Invalid API key or authentication error",
+                "type": "authentication_error",
+                "status_code": 401
+            }
+            return jsonify(error_dict), 401
+        elif "rate_limit" in error_str.lower() or "rate limit" in error_str.lower():
+            error_dict = {
+                "error": "OpenAI API rate limit exceeded",
+                "message": "Too many requests. Please try again later.",
+                "type": "rate_limit_exceeded",
+                "status_code": 429
+            }
+            return jsonify(error_dict), 429
+        else:
+            # Generic error
+            error_dict = {
+                "error": "Error generating meals",
+                "message": str(e),
+                "type": "unknown_error",
+                "status_code": 500
+            }
+            print(f"Error generating meals: {error_str}")
+            return jsonify(error_dict), 500
 
 @app.route("/speak", methods=["POST"])
 def speak():
@@ -615,7 +700,7 @@ def transcribe_audio_file(audio_bytes: bytes, file_name: str) -> str:
         audio_file.name = file_name
 
         transcription = client.audio.transcriptions.create(
-            model="gpt-4o-transcribe",  # or whisper-1 if enabled
+            model="whisper-1",  # Cost-effective: Much cheaper than gpt-4o-transcribe, same quality
             file=audio_file,
             response_format="text",
         )

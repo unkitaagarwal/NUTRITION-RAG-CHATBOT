@@ -10,8 +10,18 @@ import io
 import json
 import re
 import base64
+import tempfile
 from openai import OpenAI
 from threading import Thread
+import yt_dlp
+import shutil
+import time
+import socket
+import ipaddress
+from urllib.parse import urlparse
+import requests
+from bs4 import BeautifulSoup
+
 
 # Load environment variables first
 load_dotenv()
@@ -21,6 +31,14 @@ client = OpenAI()
 app = Flask(__name__)
 
 # Initialize once
+# ---------- Config ----------
+MAX_VIDEO_SECONDS = int(os.getenv("MAX_VIDEO_SECONDS", "900"))  # 15 min default
+# Cookies can be provided as: 1) file path, or 2) base64-encoded content in YTDLP_COOKIES_B64 env var
+YTDLP_COOKIES_FILE = os.path.expanduser(os.path.expandvars(os.getenv("YTDLP_COOKIES_FILE", ""))) or None  # optional, helps IG/TikTok
+YTDLP_COOKIES_B64 = os.getenv("YTDLP_COOKIES_B64")  # alternative: base64-encoded cookies content (for Render/cloud)
+LLM_MODEL = os.getenv("RECIPE_LLM_MODEL", "gpt-4o-mini")  # change if needed
+RECIPE_LLM_MODEL = os.getenv("RECIPE_LLM_MODEL", "gpt-4o-mini")
+
 vector_db = Chroma(persist_directory="./vector_store", embedding_function=OpenAIEmbeddings())
 retriever = vector_db.as_retriever(search_kwargs={"k": 3})  # Reduced from 5 to 3 for faster retrieval
 llm = ChatOpenAI(
@@ -29,9 +47,11 @@ llm = ChatOpenAI(
     max_tokens=4000  # Increased to ensure complete recipes for 3-5 meal recommendations with detailed instructions (each meal ~600-800 tokens, so 3-5 meals need ~3000-4000 tokens)
 )
 
+# Note: OpenAI client is initialized once above and reused for all endpoints
+# The client.chat.completions.create() calls are just API requests, not re-initializations
+
 # Initialize RAG chain once at startup (not on every request)
 # Note: system_context is included in the query string, not as a separate prompt variable
-
 # Create RAG chain without custom prompt (system_context is included in query)
 rag_chain = RetrievalQA.from_chain_type(
     llm=llm, 
@@ -287,7 +307,8 @@ def detect_ingredients():
 
         print("🤖 Calling GPT Vision API...")
 
-        # 2. Call GPT-Vision API using OpenAI client
+        # 2. Call GPT-Vision API using pre-initialized OpenAI client
+        # Note: 'client' is initialized once at startup (line 20), so this is just an API call, not a re-initialization
         try:
             vision_response = client.chat.completions.create(
                 model="gpt-4o-mini",  # Cost-effective: ~10x cheaper than gpt-4o, still supports vision
@@ -689,6 +710,7 @@ def speak():
     audio_stream = io.BytesIO(response.read())
     return send_file(audio_stream, mimetype="audio/mpeg")
 
+#####video only code starts here#####
 
 # ---------------------------
 # Helper: Transcribe Audio
@@ -816,6 +838,360 @@ def voice_ingredients():
             "details": str(e)
         }), 500
 
+# ---------- Security: SSRF protection ----------
+def _is_private_host(hostname: str) -> bool:
+    """
+    Resolve hostname and block private / local / link-local ranges.
+    Prevents SSRF attacks like http://127.0.0.1:... or cloud metadata IPs.
+    """
+    if not hostname:
+        return True
+
+    # Block obvious localhost names
+    lowered = hostname.lower()
+    if lowered in {"localhost", "localhost.localdomain"}:
+        return True
+
+    try:
+        infos = socket.getaddrinfo(hostname, None)
+    except socket.gaierror:
+        return True
+
+    for family, _, _, _, sockaddr in infos:
+        ip_str = sockaddr[0]
+        ip = ipaddress.ip_address(ip_str)
+
+        if (
+            ip.is_private
+            or ip.is_loopback
+            or ip.is_link_local
+            or ip.is_multicast
+            or ip.is_reserved
+            or ip.is_unspecified
+        ):
+            return True
+
+        # Block AWS/GCP/Azure metadata IP (most important)
+        if ip_str == "169.254.169.254":
+            return True
+
+    return False
+
+
+def validate_video_url(video_url: str):
+    if not video_url or not isinstance(video_url, str):
+        return False, "videoUrl is required"
+
+    parsed = urlparse(video_url)
+    if parsed.scheme not in {"http", "https"}:
+        return False, "Only http/https URLs are allowed"
+
+    if not parsed.netloc:
+        return False, "Invalid URL"
+
+    hostname = parsed.hostname
+    if _is_private_host(hostname):
+        return False, "URL host is not allowed"
+
+    return True, ""
+
+
+# ---------- yt-dlp helpers ----------
+def ytdlp_base_opts(temp_dir: str):
+    opts = {
+        # Try best audio-only, otherwise fallback to best (includes video), then extract audio via ffmpeg
+        "format": "ba/bestaudio/best",
+        "outtmpl": os.path.join(temp_dir, "%(id)s.%(ext)s"),
+        "restrictfilenames": True,
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+        "socket_timeout": 20,
+        "retries": 2,
+        "fragment_retries": 2,
+        "extractor_args": {"youtube": {"player_client": ["android"]}},
+        "postprocessors": [{
+            "key": "FFmpegExtractAudio",
+            "preferredcodec": "mp3",
+            "preferredquality": "192",
+        }],
+    }
+
+    # Cookies greatly improve TikTok/Instagram reliability (and some YouTube cases)
+    if YTDLP_COOKIES_FILE and os.path.exists(YTDLP_COOKIES_FILE):
+        opts["cookiefile"] = YTDLP_COOKIES_FILE
+
+    return opts
+
+
+def get_video_metadata(video_url: str):
+    """
+    Uses yt-dlp to fetch metadata without downloading.
+    """
+    with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True, "noplaylist": True}) as ydl:
+        info = ydl.extract_info(video_url, download=False)
+    return info
+
+
+def download_audio_mp3(video_url: str):
+    """
+    Downloads video audio and returns mp3 bytes + basic metadata.
+    """
+    temp_dir = tempfile.mkdtemp()
+    try:
+        # Pre-check duration before downloading (best effort)
+        info = get_video_metadata(video_url)
+        duration = info.get("duration")  # seconds
+        title = info.get("title") or ""
+        extractor = info.get("extractor_key") or info.get("extractor") or ""
+
+        if duration and duration > MAX_VIDEO_SECONDS:
+            raise ValueError(f"Video too long ({duration}s). Max allowed is {MAX_VIDEO_SECONDS}s")
+
+        opts = ytdlp_base_opts(temp_dir)
+
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            ydl.download([video_url])
+
+        mp3s = [f for f in os.listdir(temp_dir) if f.endswith(".mp3")]
+        if not mp3s:
+            raise RuntimeError("Audio extraction failed: no .mp3 produced (is ffmpeg installed?)")
+
+        mp3_path = os.path.join(temp_dir, mp3s[0])
+        with open(mp3_path, "rb") as f:
+            audio_bytes = f.read()
+
+        if not audio_bytes:
+            raise RuntimeError("Extracted audio file is empty")
+
+        return audio_bytes, {"duration": duration, "title": title, "source": extractor}
+
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+# ---------- LLM helpers ----------
+def _force_json_or_raise(text: str):
+    """
+    Attempts to parse JSON; tries mild cleanup if model wrapped it.
+    """
+    if not text:
+        raise ValueError("Empty LLM response")
+
+    # Strip code fences if any
+    cleaned = re.sub(r"```json\s*|```", "", text).strip()
+
+    # If model put extra text, attempt to extract the first JSON object block
+    # (simple heuristic: find first '{' and last '}' )
+    if "{" in cleaned and "}" in cleaned:
+        start = cleaned.find("{")
+        end = cleaned.rfind("}")
+        cleaned = cleaned[start:end+1]
+
+    return json.loads(cleaned)
+
+
+def extract_recipe_from_transcript_chunk(transcript_chunk: str):
+    system_prompt = """You extract recipe data from cooking transcripts.
+Return ONLY valid JSON matching this schema:
+{
+  "ingredients": [{"name": "...", "quantity": "..."}],
+  "instructions": ["Step 1: ...", "Step 2: ..."]
+}
+Rules:
+- Do NOT add explanations or markdown.
+- If quantity is unknown, use "".
+- Keep instructions in chronological order.
+"""
+
+    user_prompt = f"Transcript:\n{transcript_chunk}\n\nReturn the JSON now."
+
+    # Try once with strict JSON if supported, else fallback
+    try:
+        completion = client.chat.completions.create(
+            model=LLM_MODEL,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.2,
+            max_tokens=1200,
+            response_format={"type": "json_object"},
+        )
+    except Exception:
+        completion = client.chat.completions.create(
+            model=LLM_MODEL,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.2,
+            max_tokens=1200,
+        )
+
+    text = completion.choices[0].message.content.strip()
+    return _force_json_or_raise(text)
+
+
+def merge_recipe_parts(parts):
+    """
+    Merge multiple partial extractions into a single clean recipe.
+    Dedup ingredients, re-number and clean steps with a final LLM pass.
+    """
+    merge_system = """You merge multiple partial recipe JSONs into ONE final recipe JSON.
+Return ONLY valid JSON with schema:
+{
+  "ingredients": [{"name": "...", "quantity": "..."}],
+  "instructions": ["Step 1: ...", "Step 2: ..."]
+}
+Rules:
+- Deduplicate ingredients (case-insensitive).
+- If the same ingredient appears with different quantities, keep the most specific quantity.
+- Combine instructions, remove duplicates, ensure chronological order, and ensure steps are detailed and actionable.
+- Output ONLY JSON.
+"""
+
+    merge_user = json.dumps({"parts": parts}, ensure_ascii=False)
+
+    try:
+        completion = client.chat.completions.create(
+            model=LLM_MODEL,
+            messages=[
+                {"role": "system", "content": merge_system},
+                {"role": "user", "content": merge_user},
+            ],
+            temperature=0.1,
+            max_tokens=1800,
+            response_format={"type": "json_object"},
+        )
+    except Exception:
+        completion = client.chat.completions.create(
+            model=LLM_MODEL,
+            messages=[
+                {"role": "system", "content": merge_system},
+                {"role": "user", "content": merge_user},
+            ],
+            temperature=0.1,
+            max_tokens=1800,
+        )
+
+    text = completion.choices[0].message.content.strip()
+    return _force_json_or_raise(text)
+
+
+def chunk_text(text: str, max_chars: int = 6000):
+    text = text.strip()
+    if len(text) <= max_chars:
+        return [text]
+
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = min(start + max_chars, len(text))
+        # try to break on sentence boundary
+        cut = text.rfind(".", start, end)
+        if cut == -1 or cut < start + int(max_chars * 0.6):
+            cut = end
+        chunks.append(text[start:cut].strip())
+        start = cut
+    return [c for c in chunks if c]
+
+# ---------- The endpoint ----------
+@app.route("/extract-recipe-from-video", methods=["POST"])
+def extract_recipe_from_video():
+    """
+    Accepts: {"videoUrl":"..."}
+    Returns: {"ingredients":[...], "instructions":[...], "transcript":"...", "meta": {...}}
+    """
+    try:
+        data = request.get_json(silent=True) or {}
+        video_url = data.get("videoUrl")
+
+        ok, err = validate_video_url(video_url)
+        if not ok:
+            return jsonify({"error": err}), 400
+
+        print(f"🎥 Processing video URL: {video_url}")
+
+        # 1) Download + extract audio
+        t0 = time.time()
+        try:
+            audio_bytes, meta = download_audio_mp3(video_url)
+        except ValueError as ve:
+            return jsonify({"error": str(ve)}), 413
+        except yt_dlp.utils.DownloadError as de:
+            # very common for IG/TikTok without cookies
+            return jsonify({
+                "error": "Failed to download/extract audio from video URL",
+                "details": str(de),
+                "hint": "TikTok/Instagram often require cookies/login. Set YTDLP_COOKIES_FILE on the server."
+            }), 400
+        except Exception as e:
+            return jsonify({"error": "Audio extraction failed", "details": str(e)}), 500
+
+        print(f"✅ Audio extracted: {len(audio_bytes)} bytes in {time.time()-t0:.2f}s")
+
+        # 2) Whisper transcription
+        print("🎤 Transcribing audio...")
+        audio_file_obj = io.BytesIO(audio_bytes)
+        audio_file_obj.name = "audio.mp3"
+
+        transcript = client.audio.transcriptions.create(
+            model="whisper-1",
+            file=audio_file_obj,
+            response_format="text",
+        )
+        transcript_text = transcript.strip() if isinstance(transcript, str) else str(transcript).strip()
+
+        if not transcript_text:
+            return jsonify({
+                "error": "Failed to transcribe video",
+                "message": "No transcript generated from video audio"
+            }), 500
+
+        print(f"✅ Transcript generated: {len(transcript_text)} characters")
+
+        # 3) LLM extraction with chunking + merge
+        print("🍳 Extracting recipe information...")
+        chunks = chunk_text(transcript_text, max_chars=6000)
+
+        parts = []
+        for idx, ch in enumerate(chunks, start=1):
+            try:
+                part = extract_recipe_from_transcript_chunk(ch)
+                parts.append(part)
+            except Exception as e:
+                return jsonify({
+                    "error": "Failed to extract recipe from transcript chunk",
+                    "chunk": idx,
+                    "details": str(e),
+                    "transcript": transcript_text
+                }), 500
+
+        final_recipe = merge_recipe_parts(parts) if len(parts) > 1 else parts[0]
+
+        ingredients = final_recipe.get("ingredients", []) or []
+        instructions = final_recipe.get("instructions", []) or []
+
+        # Normalize types
+        if ingredients and isinstance(ingredients[0], str):
+            ingredients = [{"name": ing, "quantity": ""} for ing in ingredients]
+        if not isinstance(instructions, list):
+            instructions = [str(instructions)]
+
+        return jsonify({
+            "ingredients": ingredients,
+            "instructions": instructions,
+            "transcript": transcript_text,
+            "meta": meta,
+            "message": f"Successfully extracted recipe with {len(ingredients)} ingredients and {len(instructions)} instructions"
+        })
+
+    except Exception as e:
+        print(f"💥 Critical error in extract_recipe_from_video: {str(e)}")
+        return jsonify({"error": "Unexpected server error", "details": str(e)}), 500
+
+#####video only code ends here#####
 
 
 @app.route("/listen", methods=["POST"])
@@ -1017,6 +1393,694 @@ CRITICAL INSTRUCTIONS:
         "transcript": user_question,
         "reply": response
     })
+
+    ## video and webpage code starts here#####
+
+    
+
+VIDEO_DOMAINS = {"youtube.com", "www.youtube.com", "youtu.be", "tiktok.com", "www.tiktok.com", "instagram.com", "www.instagram.com"}
+
+def is_video_url(url: str) -> bool:
+    host = (urlparse(url).hostname or "").lower()
+    return any(host == d or host.endswith("." + d) for d in VIDEO_DOMAINS)
+
+def fetch_html(url: str) -> str:
+    headers = {
+        "User-Agent": "Mozilla/5.0 (RecipeBot/1.0)"
+    }
+    r = requests.get(url, headers=headers, timeout=20)
+    r.raise_for_status()
+    return r.text
+
+def extract_og_image(soup: BeautifulSoup) -> str | None:
+    og = soup.find("meta", property="og:image")
+    if og and og.get("content"):
+        return og["content"].strip()
+    tw = soup.find("meta", attrs={"name": "twitter:image"})
+    if tw and tw.get("content"):
+        return tw["content"].strip()
+    return None
+
+def extract_jsonld_recipes(html: str):
+    soup = BeautifulSoup(html, "lxml")
+    scripts = soup.find_all("script", type="application/ld+json")
+    recipes = []
+
+    for s in scripts:
+        try:
+            data = json.loads(s.string or "")
+        except Exception:
+            continue
+
+        # JSON-LD can be dict, list, or nested graph
+        candidates = []
+        if isinstance(data, list):
+            candidates = data
+        elif isinstance(data, dict):
+            if "@graph" in data and isinstance(data["@graph"], list):
+                candidates = data["@graph"]
+            else:
+                candidates = [data]
+
+        for item in candidates:
+            if not isinstance(item, dict):
+                continue
+            t = item.get("@type")
+            if isinstance(t, list):
+                is_recipe = any(x.lower() == "recipe" for x in t if isinstance(x, str))
+            else:
+                is_recipe = isinstance(t, str) and t.lower() == "recipe"
+            if is_recipe:
+                recipes.append(item)
+
+    return recipes, soup
+
+def _flatten_instructions(recipe_instructions):
+    """
+    Handles JSON-LD recipeInstructions that may be:
+    - string
+    - list of strings
+    - list of HowToStep dicts
+    - list of HowToSection dicts with itemListElement (steps)
+    """
+    steps = []
+
+    def add_step(text: str):
+        text = (text or "").strip()
+        if text:
+            steps.append(text)
+
+    def handle_node(node):
+        if node is None:
+            return
+
+        # Plain string
+        if isinstance(node, str):
+            add_step(node)
+            return
+
+        # List of nodes
+        if isinstance(node, list):
+            for item in node:
+                handle_node(item)
+            return
+
+        # Dict node (HowToStep / HowToSection / etc.)
+        if isinstance(node, dict):
+            node_type = node.get("@type") or node.get("type")
+
+            # HowToSection: keep section heading + recurse into itemListElement
+            if isinstance(node_type, str) and node_type.lower() == "howtosection":
+                heading = node.get("name") or node.get("headline") or ""
+                if heading:
+                    add_step(f"{heading.strip()}")
+                handle_node(node.get("itemListElement") or node.get("steps"))
+                return
+
+            # HowToStep: take text
+            if isinstance(node_type, str) and node_type.lower() == "howtostep":
+                add_step(node.get("text") or node.get("name"))
+                return
+
+            # Generic fallback: try common keys
+            add_step(node.get("text") or node.get("name"))
+            # and recurse if there is nested list
+            handle_node(node.get("itemListElement") or node.get("steps"))
+            return
+
+    handle_node(recipe_instructions)
+
+    # Deduplicate while preserving order
+    seen = set()
+    out = []
+    for s in steps:
+        key = re.sub(r"\s+", " ", s.strip()).lower()
+        if key and key not in seen:
+            seen.add(key)
+            out.append(s)
+    return out
+
+
+def normalize_duration(duration_str: str) -> str:
+    """
+    Converts ISO 8601 duration format (PT30M, PT1H30M, PT578M) to human-readable format.
+    Examples:
+        PT30M -> "30 mins"
+        PT1H30M -> "1 hr 30 mins"
+        PT578M -> "9 hrs 38 mins"
+        PT2H -> "2 hrs"
+    """
+    if not duration_str or not isinstance(duration_str, str):
+        return ""
+    
+    duration_str = duration_str.strip().upper()
+    
+    # If already human-readable (contains "hr", "min", "mins", etc.), return as-is
+    if any(word in duration_str.lower() for word in ["hr", "hour", "min", "minute", "sec", "second"]):
+        return duration_str
+    
+    # Parse ISO 8601 duration format (PT30M, PT1H30M, etc.)
+    if not duration_str.startswith("PT"):
+        return duration_str  # Not ISO 8601 format, return as-is
+    
+    # Extract hours, minutes, seconds
+    hours = 0
+    minutes = 0
+    seconds = 0
+    
+    # Match hours (H)
+    hour_match = re.search(r'(\d+)H', duration_str)
+    if hour_match:
+        hours = int(hour_match.group(1))
+    
+    # Match minutes (M)
+    minute_match = re.search(r'(\d+)M', duration_str)
+    if minute_match:
+        minutes = int(minute_match.group(1))
+    
+    # Match seconds (S)
+    second_match = re.search(r'(\d+)S', duration_str)
+    if second_match:
+        seconds = int(second_match.group(1))
+        # Convert seconds to minutes if >= 60
+        if seconds >= 60:
+            minutes += seconds // 60
+            seconds = seconds % 60
+    
+    # Build human-readable string
+    parts = []
+    if hours > 0:
+        parts.append(f"{hours} hr{'s' if hours > 1 else ''}")
+    if minutes > 0:
+        parts.append(f"{minutes} min{'s' if minutes > 1 else ''}")
+    if seconds > 0 and hours == 0 and minutes == 0:  # Only show seconds if no hours/minutes
+        parts.append(f"{seconds} sec{'s' if seconds > 1 else ''}")
+    
+    return " ".join(parts) if parts else ""
+
+
+def normalize_recipe_from_jsonld(recipe_obj: dict, soup: BeautifulSoup):
+    name = recipe_obj.get("name") or ""
+    image = recipe_obj.get("image")
+    if isinstance(image, list) and image:
+        image = image[0]
+    if isinstance(image, dict):
+        image = image.get("url")
+
+    if not image:
+        image = extract_og_image(soup)
+
+    ingredients = recipe_obj.get("recipeIngredient") or []
+    norm_ingredients = []
+    for ing in ingredients:
+        if isinstance(ing, str):
+            norm_ingredients.append({"name": ing, "quantity": ""})
+
+    # instructions can be list of strings or HowToStep objects
+    # --- ✅ instructions (FIXED) ---
+    instructions_raw = recipe_obj.get("recipeInstructions") or []
+    norm_steps = _flatten_instructions(instructions_raw)
+
+    # Normalize servings (can be string, number, or array)
+    servings_raw = recipe_obj.get("recipeYield") or ""
+    if isinstance(servings_raw, list):
+        # If array, take the most descriptive one (usually the last)
+        servings = str(servings_raw[-1]) if servings_raw else ""
+    elif isinstance(servings_raw, (int, float)):
+        servings = str(servings_raw)
+    else:
+        servings = str(servings_raw) if servings_raw else ""
+    
+    # Normalize time durations from ISO 8601 format to human-readable
+    prep_raw = recipe_obj.get("prepTime") or ""
+    prep = normalize_duration(prep_raw) if prep_raw else ""
+    
+    cook_raw = recipe_obj.get("cookTime") or ""
+    cook = normalize_duration(cook_raw) if cook_raw else ""
+    
+    total_raw = recipe_obj.get("totalTime") or ""
+    total = normalize_duration(total_raw) if total_raw else ""
+
+    nutrition = recipe_obj.get("nutrition") or {}
+    norm_nutrition = {}
+    if isinstance(nutrition, dict):
+        for k, v in nutrition.items():
+            if isinstance(v, (str, int, float)):
+                norm_nutrition[k] = str(v)
+
+    return {
+        "name": name,
+        "ingredients": norm_ingredients,
+        "instructions": norm_steps,
+        "servings": servings,
+        "prep_time": prep,
+        "cook_time": cook,
+        "total_time": total,
+        "nutrition": norm_nutrition
+    }, image
+def clean_page_text(html: str) -> str:
+    soup = BeautifulSoup(html, "lxml")
+    for tag in soup(["script", "style", "noscript"]):
+        tag.decompose()
+    text = soup.get_text("\n")
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()[:40000]  # cap to avoid huge prompts
+
+def extract_recipe_from_webpage_llm(page_text: str):
+    system = """Extract recipe data from webpage text.
+Return ONLY valid JSON:
+{
+  "name": "",
+  "ingredients": [{"name":"", "quantity":""}],
+  "instructions": ["Step 1 ...", "..."],
+  "servings": "",
+  "prep_time": "",
+  "cook_time": "",
+  "total_time": "",
+  "notes": []
+}
+Rules:
+- Don't hallucinate. If unknown, use "" or [].
+- Return JSON only."""
+    user = f"Webpage text:\n{page_text}"
+
+    completion = client.chat.completions.create(
+        model=os.getenv("RECIPE_LLM_MODEL", "gpt-4o-mini"),
+        messages=[{"role":"system","content":system},{"role":"user","content":user}],
+        temperature=0.2,
+        max_tokens=1800,
+        response_format={"type":"json_object"},
+    )
+    return json.loads(completion.choices[0].message.content)
+@app.route("/extract-recipe", methods=["POST"])
+def extract_recipe():
+    data = request.get_json(silent=True) or {}
+    url = data.get("url") or data.get("videoUrl") or data.get("recipeUrl")
+    mode = (data.get("mode") or "auto").lower()
+
+    if not url:
+        return jsonify({"error": "url is required"}), 400
+
+    # Use your existing SSRF validation here too
+    ok, err = validate_video_url(url)  # rename this to validate_url (works for all)
+    if not ok:
+        return jsonify({"error": err}), 400
+
+    # Decide type
+    url_is_video = is_video_url(url)
+    if mode == "video":
+        url_is_video = True
+    elif mode == "webpage":
+        url_is_video = False
+
+    if url_is_video:
+        # Call your existing video pipeline
+        # (audio -> whisper -> chunk+merge LLM)
+        return extract_recipe_from_video_internal(url)
+
+    # Webpage pipeline
+    try:
+        html = fetch_html(url)
+        recipes, soup = extract_jsonld_recipes(html)
+
+        image = None
+        recipe = None
+        method = None
+
+        if recipes:
+            recipe, image = normalize_recipe_from_jsonld(recipes[0], soup)
+            method = "jsonld"
+        else:
+            # fallback to LLM on cleaned page text
+            page_text = clean_page_text(html)
+            recipe = extract_recipe_from_webpage_llm(page_text)
+            image = extract_og_image(soup)
+            method = "html_llm"
+
+        source = {
+            "type": "webpage",
+            "url": url,
+            "provider": (urlparse(url).hostname or ""),
+            "title": recipe.get("name", "") or (soup.title.string.strip() if soup.title and soup.title.string else ""),
+            "image": image
+        }
+
+        return jsonify({
+            "source": source,
+            "recipe": recipe,
+            "transcript": None,
+            "extraction": {"method": method, "confidence": 0.7 if method == "jsonld" else 0.5}
+        })
+
+    except Exception as e:
+        return jsonify({"error": "Failed to extract recipe from webpage", "details": str(e)}), 500
+
+
+
+
+def _chunk_text(text: str, max_chars: int = 6000):
+    text = (text or "").strip()
+    if len(text) <= max_chars:
+        return [text] if text else []
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = min(start + max_chars, len(text))
+        cut = text.rfind(".", start, end)
+        if cut == -1 or cut < start + int(max_chars * 0.6):
+            cut = end
+        chunks.append(text[start:cut].strip())
+        start = cut
+    return [c for c in chunks if c]
+
+
+def _force_json(text: str) -> dict:
+    if not text:
+        raise ValueError("Empty LLM response")
+    cleaned = re.sub(r"```json\s*|```", "", text).strip()
+    # Heuristic: pull first JSON object if extra text exists
+    if "{" in cleaned and "}" in cleaned:
+        cleaned = cleaned[cleaned.find("{"): cleaned.rfind("}") + 1]
+    return json.loads(cleaned)
+
+
+def _extract_recipe_chunk(transcript_chunk: str) -> dict:
+    system_prompt = """You extract recipe data from cooking transcripts.
+Return ONLY valid JSON matching:
+{
+  "name": "",
+  "ingredients": [{"name": "...", "quantity": "..."}],
+  "instructions": ["Step 1: ...", "Step 2: ..."],
+  "servings": "",
+  "prep_time": "",
+  "cook_time": "",
+  "total_time": "",
+  "notes": []
+}
+Rules:
+- Don't hallucinate. If unknown, use "" or [].
+- Ingredients must include quantities when stated; else quantity "".
+- Instructions must be actionable, chronological, and detailed.
+- Output JSON only (no markdown, no commentary)."""
+
+    user_prompt = f"Transcript:\n{transcript_chunk}\n\nReturn the JSON now."
+
+    # Prefer strict JSON if supported
+    try:
+        completion = client.chat.completions.create(
+            model=RECIPE_LLM_MODEL,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.2,
+            max_tokens=1400,
+            response_format={"type": "json_object"},
+        )
+    except Exception:
+        completion = client.chat.completions.create(
+            model=RECIPE_LLM_MODEL,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.2,
+            max_tokens=1400,
+        )
+
+    return _force_json(completion.choices[0].message.content.strip())
+
+
+def _merge_recipe_parts(parts: list[dict]) -> dict:
+    system_prompt = """Merge multiple partial recipe JSONs into ONE final recipe JSON.
+Return ONLY valid JSON matching:
+{
+  "name": "",
+  "ingredients": [{"name": "...", "quantity": "..."}],
+  "instructions": ["Step 1: ...", "Step 2: ..."],
+  "servings": "",
+  "prep_time": "",
+  "cook_time": "",
+  "total_time": "",
+  "notes": []
+}
+Rules:
+- Deduplicate ingredients case-insensitively; keep most specific quantity.
+- Remove duplicate steps, ensure correct chronological order.
+- Ensure steps are detailed and actionable.
+- Output JSON only."""
+
+    user_prompt = json.dumps({"parts": parts}, ensure_ascii=False)
+
+    try:
+        completion = client.chat.completions.create(
+            model=RECIPE_LLM_MODEL,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.1,
+            max_tokens=1800,
+            response_format={"type": "json_object"},
+        )
+    except Exception:
+        completion = client.chat.completions.create(
+            model=RECIPE_LLM_MODEL,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.1,
+            max_tokens=1800,
+        )
+
+    return _force_json(completion.choices[0].message.content.strip())
+
+
+def _yt_meta(video_url: str) -> dict:
+    """Extract metadata without downloading. Uses cookies if available."""
+    opts = {"quiet": True, "no_warnings": True, "noplaylist": True}
+    
+    # Add cookies if available (needed for Instagram/TikTok)
+    if YTDLP_COOKIES_FILE and os.path.exists(YTDLP_COOKIES_FILE):
+        opts["cookiefile"] = YTDLP_COOKIES_FILE
+        print(f"🍪 Using cookies file for metadata: {YTDLP_COOKIES_FILE}")
+    
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(video_url, download=False)
+    return info or {}
+
+
+def _download_audio_mp3(video_url: str):
+    """
+    Returns: (audio_bytes, meta_dict)
+    """
+    temp_dir = tempfile.mkdtemp()
+    try:
+        info = _yt_meta(video_url)
+        duration = info.get("duration")
+        title = info.get("title") or ""
+        extractor = info.get("extractor_key") or info.get("extractor") or ""
+        webpage_url = info.get("webpage_url") or video_url
+        thumbnail = info.get("thumbnail")  # often present for YouTube/IG/TikTok
+
+        if duration and duration > MAX_VIDEO_SECONDS:
+            raise ValueError(f"Video too long ({duration}s). Max allowed is {MAX_VIDEO_SECONDS}s")
+
+        ydl_opts = {
+            # IMPORTANT: robust selector with fallbacks (handles many edge cases)
+            "format": "bestaudio/best/best",
+            "outtmpl": os.path.join(temp_dir, "%(id)s.%(ext)s"),
+            "restrictfilenames": True,
+            "noplaylist": True,
+            "quiet": True,
+            "no_warnings": True,
+
+            # Helps for YouTube signature issues & format availability
+            "extractor_args": {
+                "youtube": {"player_client": ["android", "web"]}
+            },
+
+            # Convert to mp3
+            "postprocessors": [{
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "mp3",
+                "preferredquality": "192",
+            }],
+        }
+
+        # Cookies (very helpful for TikTok/IG + some YouTube)
+        cookies_used = False
+        if YTDLP_COOKIES_FILE and os.path.exists(YTDLP_COOKIES_FILE):
+            ydl_opts["cookiefile"] = YTDLP_COOKIES_FILE
+            cookies_used = True
+            print(f"🍪 Using cookies file: {YTDLP_COOKIES_FILE}")
+        elif YTDLP_COOKIES_B64:
+            # Create temp cookies file from base64
+            temp_cookies_path = os.path.join(temp_dir, 'cookies.txt')
+            try:
+                cookies_content = base64.b64decode(YTDLP_COOKIES_B64).decode('utf-8')
+                with open(temp_cookies_path, 'w') as f:
+                    f.write(cookies_content)
+                ydl_opts["cookiefile"] = temp_cookies_path
+                cookies_used = True
+                print("🍪 Using cookies from environment variable (base64)")
+            except Exception as e:
+                print(f"⚠️ Failed to decode cookies from YTDLP_COOKIES_B64: {str(e)}")
+        
+        # For Instagram, add additional extractor args if cookies are available
+        if "instagram.com" in video_url.lower() and cookies_used:
+            ydl_opts.setdefault("extractor_args", {})["instagram"] = {
+                "webpage_display": ["Desktop"]
+            }
+
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([video_url])
+
+        mp3s = [f for f in os.listdir(temp_dir) if f.endswith(".mp3")]
+        if not mp3s:
+            raise RuntimeError("No .mp3 produced. Check ffmpeg installation and yt-dlp extraction.")
+
+        mp3_path = os.path.join(temp_dir, mp3s[0])
+        with open(mp3_path, "rb") as f:
+            audio_bytes = f.read()
+
+        if not audio_bytes:
+            raise RuntimeError("Extracted audio is empty")
+
+        meta = {
+            "duration": duration,
+            "title": title,
+            "provider": (urlparse(video_url).hostname or ""),
+            "extractor": extractor,
+            "webpage_url": webpage_url,
+            "thumbnail": thumbnail,
+        }
+        return audio_bytes, meta
+
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def extract_recipe_from_video_internal(video_url: str):
+    """
+    Internal helper used by unified /extract-recipe endpoint.
+    Returns a Flask response: jsonify({...}), status_code
+    """
+    # If you have a generalized validate_url, use that.
+    # ok, err = validate_url(video_url)
+    ok, err = validate_video_url(video_url)  # reuse your existing SSRF-safe validator if it supports all URLs
+    if not ok:
+        return jsonify({"error": err}), 400
+
+    try:
+        print(f"🎥 Processing video URL: {video_url}")
+
+        # 1) Download + extract audio
+        t0 = time.time()
+        try:
+            audio_bytes, meta = _download_audio_mp3(video_url)
+        except ValueError as ve:
+            return jsonify({"error": str(ve)}), 413
+        except yt_dlp.utils.DownloadError as de:
+            error_str = str(de)
+            is_instagram = "instagram.com" in video_url.lower()
+            cookies_configured = (YTDLP_COOKIES_FILE and os.path.exists(YTDLP_COOKIES_FILE)) or YTDLP_COOKIES_B64
+            
+            # Provide more specific error messages
+            if is_instagram:
+                if not cookies_configured:
+                    hint = "Instagram requires authentication. Please set YTDLP_COOKIES_FILE or YTDLP_COOKIES_B64 environment variable with your Instagram cookies."
+                elif "empty media response" in error_str.lower() or "unavailable" in error_str.lower():
+                    hint = "Instagram post may be private, restricted, or cookies may be expired. Try refreshing your cookies file."
+                else:
+                    hint = "Instagram extraction failed. The post may be private, restricted, or require fresh cookies."
+            else:
+                hint = "For TikTok/Instagram (and some YouTube), export cookies and set YTDLP_COOKIES_FILE."
+            
+            return jsonify({
+                "error": "Failed to download/extract audio from video URL",
+                "details": error_str,
+                "hint": hint,
+                "cookies_configured": cookies_configured,
+            }), 400
+        except Exception as e:
+            return jsonify({"error": "Audio extraction failed", "details": str(e)}), 500
+
+        print(f"✅ Audio extracted: {len(audio_bytes)} bytes in {time.time() - t0:.2f}s")
+
+        # 2) Whisper transcription
+        print("🎤 Transcribing audio...")
+        audio_file_obj = io.BytesIO(audio_bytes)
+        audio_file_obj.name = "audio.mp3"
+
+        transcript = client.audio.transcriptions.create(
+            model="whisper-1",
+            file=audio_file_obj,
+            response_format="text",
+        )
+        transcript_text = transcript.strip() if isinstance(transcript, str) else str(transcript).strip()
+
+        if not transcript_text:
+            return jsonify({
+                "error": "Failed to transcribe video",
+                "message": "No transcript generated from video audio"
+            }), 500
+
+        # 3) LLM extraction with chunking + merge
+        print("🍳 Extracting recipe information...")
+        chunks = _chunk_text(transcript_text, max_chars=6000)
+        if not chunks:
+            return jsonify({"error": "Transcript is empty after cleanup"}), 500
+
+        parts = []
+        for idx, chunk in enumerate(chunks, start=1):
+            try:
+                parts.append(_extract_recipe_chunk(chunk))
+            except Exception as e:
+                return jsonify({
+                    "error": "Failed to extract recipe from transcript chunk",
+                    "chunk": idx,
+                    "details": str(e),
+                    "transcript": transcript_text
+                }), 500
+
+        recipe = _merge_recipe_parts(parts) if len(parts) > 1 else parts[0]
+
+        # Normalize output fields
+        ingredients = recipe.get("ingredients") or []
+        instructions = recipe.get("instructions") or []
+        if ingredients and isinstance(ingredients[0], str):
+            ingredients = [{"name": ing, "quantity": ""} for ing in ingredients]
+        if not isinstance(instructions, list):
+            instructions = [str(instructions)]
+
+        recipe["ingredients"] = ingredients
+        recipe["instructions"] = instructions
+
+        source = {
+            "type": "video",
+            "url": video_url,
+            "provider": meta.get("provider", ""),
+            "title": meta.get("title", "") or recipe.get("name", ""),
+            "image": meta.get("thumbnail"),  # best-effort; often works for YouTube
+        }
+
+        return jsonify({
+            "source": source,
+            "recipe": recipe,
+            "transcript": transcript_text,
+            "extraction": {"method": "transcript_llm", "confidence": 0.55},
+            "meta": meta,
+        }), 200
+
+    except Exception as e:
+        print(f"💥 Critical error in extract_recipe_from_video_internal: {str(e)}")
+        return jsonify({"error": "Unexpected server error", "details": str(e)}), 500
+
+
+
+    ## video and webpage code ends here#####
    
 
 if __name__ == "__main__":

@@ -1404,6 +1404,147 @@ def is_video_url(url: str) -> bool:
     host = (urlparse(url).hostname or "").lower()
     return any(host == d or host.endswith("." + d) for d in VIDEO_DOMAINS)
 
+
+def determine_source_type(url: str) -> str:
+    """
+    Determines the source type based on URL.
+    Returns: "TikTok", "YouTube", "Instagram", "Photos", or "Manual"
+    """
+    if not url:
+        return "Manual"
+    
+    host = (urlparse(url).hostname or "").lower()
+    
+    if "tiktok.com" in host or "tiktok" in host:
+        return "TikTok"
+    elif "youtube.com" in host or "youtu.be" in host:
+        return "YouTube"
+    elif "instagram.com" in host or "instagram" in host:
+        return "Instagram"
+    elif any(ext in url.lower() for ext in [".jpg", ".jpeg", ".png", ".gif", ".webp"]):
+        return "Photos"
+    else:
+        return "Manual"
+
+
+def extract_recipe_tags(recipe: dict) -> list[str]:
+    """
+    Extracts tags from recipe data.
+    Returns list of tags: ["High Protein", "Vegetarian", "Vegan", "Quick", "Easy", "Medium", "Hard"]
+    """
+    tags = []
+    
+    if not recipe:
+        return tags
+    
+    # Get recipe data
+    ingredients = recipe.get("ingredients", [])
+    prep_time = recipe.get("prep_time", "")
+    cook_time = recipe.get("cook_time", "")
+    total_time = recipe.get("total_time", "")
+    nutrition = recipe.get("nutrition", {})
+    
+    # Extract ingredient names for analysis
+    ingredient_names = []
+    for ing in ingredients:
+        if isinstance(ing, dict):
+            ingredient_names.append(ing.get("name", "").lower())
+        elif isinstance(ing, str):
+            ingredient_names.append(ing.lower())
+    
+    ingredient_text = " ".join(ingredient_names)
+    
+    # Check for Vegetarian (no meat, fish, poultry)
+    meat_keywords = ["chicken", "beef", "pork", "lamb", "turkey", "duck", "fish", "salmon", "tuna", "shrimp", "crab", "lobster", "meat", "bacon", "sausage", "ham", "steak"]
+    has_meat = any(keyword in ingredient_text for keyword in meat_keywords)
+    if not has_meat and ingredient_text:
+        tags.append("Vegetarian")
+    
+    # Check for Vegan (no animal products)
+    animal_keywords = meat_keywords + ["milk", "cheese", "butter", "cream", "yogurt", "egg", "honey", "gelatin", "whey", "casein"]
+    has_animal_products = any(keyword in ingredient_text for keyword in animal_keywords)
+    if not has_animal_products and ingredient_text:
+        tags.append("Vegan")
+    
+    # Check for High Protein (from nutrition data or ingredient analysis)
+    protein_value = None
+    if isinstance(nutrition, dict):
+        # Try different possible keys
+        protein_value = nutrition.get("protein") or nutrition.get("proteinContent") or nutrition.get("protein_g")
+        if isinstance(protein_value, str):
+            # Extract number from string like "25g" or "25 g"
+            match = re.search(r'(\d+\.?\d*)', protein_value)
+            if match:
+                protein_value = float(match.group(1))
+    
+    # High protein threshold: >20g per serving (rough estimate)
+    high_protein_ingredients = ["chicken", "beef", "turkey", "fish", "salmon", "tuna", "eggs", "tofu", "tempeh", "lentils", "beans", "chickpeas", "quinoa", "greek yogurt", "cottage cheese", "protein powder"]
+    has_high_protein_ingredients = any(ing in ingredient_text for ing in high_protein_ingredients)
+    
+    if protein_value and protein_value > 20:
+        tags.append("High Protein")
+    elif has_high_protein_ingredients and len(ingredients) > 0:
+        tags.append("High Protein")
+    
+    # Determine difficulty based on total time and instruction complexity
+    def parse_time_to_minutes(time_str: str) -> int:
+        """Convert time string to minutes. Handles formats like '30 mins', '1 hr 30 mins', 'PT30M'"""
+        if not time_str:
+            return 0
+        
+        time_str = time_str.lower()
+        total_minutes = 0
+        
+        # Parse hours
+        hour_match = re.search(r'(\d+)\s*hr', time_str)
+        if hour_match:
+            total_minutes += int(hour_match.group(1)) * 60
+        
+        # Parse minutes
+        minute_match = re.search(r'(\d+)\s*min', time_str)
+        if minute_match:
+            total_minutes += int(minute_match.group(1))
+        
+        # Parse ISO 8601 format (PT30M, PT1H30M)
+        if time_str.startswith("pt"):
+            h_match = re.search(r'(\d+)h', time_str)
+            m_match = re.search(r'(\d+)m', time_str)
+            if h_match:
+                total_minutes += int(h_match.group(1)) * 60
+            if m_match:
+                total_minutes += int(m_match.group(1))
+        
+        return total_minutes
+    
+    # Use total_time if available, otherwise sum prep + cook
+    time_minutes = 0
+    if total_time:
+        time_minutes = parse_time_to_minutes(total_time)
+    else:
+        prep_min = parse_time_to_minutes(prep_time) if prep_time else 0
+        cook_min = parse_time_to_minutes(cook_time) if cook_time else 0
+        time_minutes = prep_min + cook_min
+    
+    instructions = recipe.get("instructions", [])
+    num_steps = len(instructions) if isinstance(instructions, list) else 0
+    
+    # Difficulty classification
+    if time_minutes == 0 and num_steps == 0:
+        pass  # Can't determine
+    elif time_minutes <= 30 and num_steps <= 5:
+        tags.append("Quick")
+        tags.append("Easy")
+    elif time_minutes <= 60 and num_steps <= 8:
+        tags.append("Easy")
+    elif time_minutes <= 90 and num_steps <= 12:
+        tags.append("Medium")
+    elif time_minutes > 90 or num_steps > 12:
+        tags.append("Hard")
+    else:
+        tags.append("Medium")  # Default
+    
+    return tags
+
 def fetch_html(url: str) -> str:
     headers = {
         "User-Agent": "Mozilla/5.0 (RecipeBot/1.0)"
@@ -1717,17 +1858,23 @@ def extract_recipe():
             image = extract_og_image(soup)
             method = "html_llm"
 
+        # Determine source type and extract tags
+        source_type = determine_source_type(url)
+        tags = extract_recipe_tags(recipe)
+        
         source = {
             "type": "webpage",
             "url": url,
             "provider": (urlparse(url).hostname or ""),
             "title": recipe.get("name", "") or (soup.title.string.strip() if soup.title and soup.title.string else ""),
-            "image": image
+            "image": image,
+            "source_type": source_type  # Add source type: TikTok, YouTube, Instagram, Photos, Manual
         }
 
         return jsonify({
             "source": source,
             "recipe": recipe,
+            "tags": tags,  # Add tags: High Protein, Vegetarian, Vegan, Quick, Easy, Medium, Hard
             "transcript": None,
             "extraction": {"method": method, "confidence": 0.7 if method == "jsonld" else 0.5}
         })
@@ -2058,17 +2205,23 @@ def extract_recipe_from_video_internal(video_url: str):
         recipe["ingredients"] = ingredients
         recipe["instructions"] = instructions
 
+        # Determine source type and extract tags
+        source_type = determine_source_type(video_url)
+        tags = extract_recipe_tags(recipe)
+        
         source = {
             "type": "video",
             "url": video_url,
             "provider": meta.get("provider", ""),
             "title": meta.get("title", "") or recipe.get("name", ""),
             "image": meta.get("thumbnail"),  # best-effort; often works for YouTube
+            "source_type": source_type  # Add source type: TikTok, YouTube, Instagram, Photos, Manual
         }
 
         return jsonify({
             "source": source,
             "recipe": recipe,
+            "tags": tags,  # Add tags: High Protein, Vegetarian, Vegan, Quick, Easy, Medium, Hard
             "transcript": transcript_text,
             "extraction": {"method": "transcript_llm", "confidence": 0.55},
             "meta": meta,

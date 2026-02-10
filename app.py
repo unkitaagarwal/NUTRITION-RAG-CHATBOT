@@ -39,6 +39,31 @@ YTDLP_COOKIES_B64 = os.getenv("YTDLP_COOKIES_B64")  # alternative: base64-encode
 LLM_MODEL = os.getenv("RECIPE_LLM_MODEL", "gpt-4o-mini")  # change if needed
 RECIPE_LLM_MODEL = os.getenv("RECIPE_LLM_MODEL", "gpt-4o-mini")
 
+YT_PROXY = os.getenv("YT_PROXY")
+
+ydl_opts = {
+    "cookiefile": "/tmp/yt/cookies.txt",
+
+    "quiet": True,
+    "no_warnings": True,
+    "noplaylist": True,
+
+    "retries": 5,
+    "fragment_retries": 5,
+
+    "sleep_interval": 1,
+    "max_sleep_interval": 3,
+
+    "extractor_args": {
+        "youtube": {
+            "player_client": ["web"]
+        }
+    },
+}
+
+if YT_PROXY:
+    ydl_opts["proxy"] = YT_PROXY
+
 vector_db = Chroma(persist_directory="./vector_store", embedding_function=OpenAIEmbeddings())
 retriever = vector_db.as_retriever(search_kwargs={"k": 3})  # Reduced from 5 to 3 for faster retrieval
 llm = ChatOpenAI(
@@ -898,9 +923,13 @@ def validate_video_url(video_url: str):
 
 # ---------- yt-dlp helpers ----------
 def ytdlp_base_opts(temp_dir: str):
+    """
+    Base yt-dlp options for audio extraction.
+    Returns a dictionary of options that can be further customized.
+    """
     opts = {
-        # Try best audio-only, otherwise fallback to best (includes video), then extract audio via ffmpeg
-        "format": "ba/bestaudio/best",
+        # IMPORTANT: robust selector with fallbacks (handles many edge cases)
+        "format": "bestaudio/best/best",
         "outtmpl": os.path.join(temp_dir, "%(id)s.%(ext)s"),
         "restrictfilenames": True,
         "noplaylist": True,
@@ -909,7 +938,11 @@ def ytdlp_base_opts(temp_dir: str):
         "socket_timeout": 20,
         "retries": 2,
         "fragment_retries": 2,
-        "extractor_args": {"youtube": {"player_client": ["android"]}},
+        # Helps for YouTube signature issues & format availability
+        "extractor_args": {
+            "youtube": {"player_client": ["android", "web"]}
+        },
+        # Convert to mp3
         "postprocessors": [{
             "key": "FFmpegExtractAudio",
             "preferredcodec": "mp3",
@@ -2063,7 +2096,7 @@ def _download_audio_mp3(video_url: str):
             cookies_used = True
             print(f"🍪 Using cookies file: {YTDLP_COOKIES_FILE}")
         elif YTDLP_COOKIES_B64:
-            # Create temp cookies file from base64
+            # Create temp cookies file from base64 (for Render/cloud deployment)
             temp_cookies_path = os.path.join(temp_dir, 'cookies.txt')
             try:
                 cookies_content = base64.b64decode(YTDLP_COOKIES_B64).decode('utf-8')

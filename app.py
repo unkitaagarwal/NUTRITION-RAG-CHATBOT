@@ -953,6 +953,11 @@ def ytdlp_base_opts(temp_dir: str):
     # Cookies greatly improve TikTok/Instagram reliability (and some YouTube cases)
     if YTDLP_COOKIES_FILE and os.path.exists(YTDLP_COOKIES_FILE):
         opts["cookiefile"] = YTDLP_COOKIES_FILE
+    
+    # Add proxy if configured (for residential proxy support)
+    if YT_PROXY:
+        opts["proxy"] = YT_PROXY
+        print(f"🌐 Using proxy: {YT_PROXY}")
 
     return opts
 
@@ -961,7 +966,10 @@ def get_video_metadata(video_url: str):
     """
     Uses yt-dlp to fetch metadata without downloading.
     """
-    with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True, "noplaylist": True}) as ydl:
+    opts = {"quiet": True, "no_warnings": True, "noplaylist": True}
+    if YT_PROXY:
+        opts["proxy"] = YT_PROXY
+    with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(video_url, download=False)
     return info
 
@@ -2046,6 +2054,10 @@ def _yt_meta(video_url: str) -> dict:
         opts["cookiefile"] = YTDLP_COOKIES_FILE
         print(f"🍪 Using cookies file for metadata: {YTDLP_COOKIES_FILE}")
     
+    # Add proxy if configured (for residential proxy support)
+    if YT_PROXY:
+        opts["proxy"] = YT_PROXY
+    
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(video_url, download=False)
     return info or {}
@@ -2113,6 +2125,11 @@ def _download_audio_mp3(video_url: str):
             ydl_opts.setdefault("extractor_args", {})["instagram"] = {
                 "webpage_display": ["Desktop"]
             }
+        
+        # Add proxy if configured (for residential proxy support)
+        if YT_PROXY:
+            ydl_opts["proxy"] = YT_PROXY
+            print(f"🌐 Using proxy: {YT_PROXY}")
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([video_url])

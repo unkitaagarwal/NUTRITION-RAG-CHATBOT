@@ -41,28 +41,9 @@ RECIPE_LLM_MODEL = os.getenv("RECIPE_LLM_MODEL", "gpt-4o-mini")
 
 YT_PROXY = os.getenv("YT_PROXY")
 
-ydl_opts = {
-    "cookiefile": "/tmp/yt/cookies.txt",
-
-    "quiet": True,
-    "no_warnings": True,
-    "noplaylist": True,
-
-    "retries": 5,
-    "fragment_retries": 5,
-
-    "sleep_interval": 1,
-    "max_sleep_interval": 3,
-
-    "extractor_args": {
-        "youtube": {
-            "player_client": ["web"]
-        }
-    },
-}
-
-if YT_PROXY:
-    ydl_opts["proxy"] = YT_PROXY
+# Note: Global ydl_opts is not used - proxy is conditionally applied in individual functions
+# Proxy is ONLY used for YouTube URLs, not for TikTok/Instagram/webpages
+# See ytdlp_base_opts(), _yt_meta(), get_video_metadata(), and _download_audio_mp3() functions
 
 vector_db = Chroma(persist_directory="./vector_store", embedding_function=OpenAIEmbeddings())
 retriever = vector_db.as_retriever(search_kwargs={"k": 3})  # Reduced from 5 to 3 for faster retrieval
@@ -922,10 +903,14 @@ def validate_video_url(video_url: str):
 
 
 # ---------- yt-dlp helpers ----------
-def ytdlp_base_opts(temp_dir: str):
+def ytdlp_base_opts(temp_dir: str, video_url: str = None):
     """
     Base yt-dlp options for audio extraction.
     Returns a dictionary of options that can be further customized.
+    
+    Args:
+        temp_dir: Temporary directory for output files
+        video_url: Optional video URL to determine if proxy should be used (YouTube only)
     """
     opts = {
         # IMPORTANT: robust selector with fallbacks (handles many edge cases)
@@ -954,10 +939,10 @@ def ytdlp_base_opts(temp_dir: str):
     if YTDLP_COOKIES_FILE and os.path.exists(YTDLP_COOKIES_FILE):
         opts["cookiefile"] = YTDLP_COOKIES_FILE
     
-    # Add proxy if configured (for residential proxy support)
-    if YT_PROXY:
+    # Add proxy ONLY for YouTube URLs (not for TikTok/Instagram/webpages)
+    if YT_PROXY and video_url and is_youtube_url(video_url):
         opts["proxy"] = YT_PROXY
-        print(f"🌐 Using proxy: {YT_PROXY}")
+        print(f"🌐 Using proxy for YouTube: {YT_PROXY}")
 
     return opts
 
@@ -967,8 +952,10 @@ def get_video_metadata(video_url: str):
     Uses yt-dlp to fetch metadata without downloading.
     """
     opts = {"quiet": True, "no_warnings": True, "noplaylist": True}
-    if YT_PROXY:
+    # Add proxy ONLY for YouTube URLs
+    if YT_PROXY and is_youtube_url(video_url):
         opts["proxy"] = YT_PROXY
+        print(f"🌐 Using proxy for YouTube metadata: {YT_PROXY}")
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(video_url, download=False)
     return info
@@ -989,7 +976,7 @@ def download_audio_mp3(video_url: str):
         if duration and duration > MAX_VIDEO_SECONDS:
             raise ValueError(f"Video too long ({duration}s). Max allowed is {MAX_VIDEO_SECONDS}s")
 
-        opts = ytdlp_base_opts(temp_dir)
+        opts = ytdlp_base_opts(temp_dir, video_url)
 
         with yt_dlp.YoutubeDL(opts) as ydl:
             ydl.download([video_url])
@@ -1444,6 +1431,13 @@ VIDEO_DOMAINS = {"youtube.com", "www.youtube.com", "youtu.be", "tiktok.com", "ww
 def is_video_url(url: str) -> bool:
     host = (urlparse(url).hostname or "").lower()
     return any(host == d or host.endswith("." + d) for d in VIDEO_DOMAINS)
+
+def is_youtube_url(url: str) -> bool:
+    """Check if URL is a YouTube video/shorts URL."""
+    if not url:
+        return False
+    host = (urlparse(url).hostname or "").lower()
+    return any(host == d or host.endswith("." + d) for d in {"youtube.com", "www.youtube.com", "youtu.be"})
 
 
 def determine_source_type(url: str) -> str:
@@ -2054,9 +2048,10 @@ def _yt_meta(video_url: str) -> dict:
         opts["cookiefile"] = YTDLP_COOKIES_FILE
         print(f"🍪 Using cookies file for metadata: {YTDLP_COOKIES_FILE}")
     
-    # Add proxy if configured (for residential proxy support)
-    if YT_PROXY:
+    # Add proxy ONLY for YouTube URLs (not for TikTok/Instagram)
+    if YT_PROXY and is_youtube_url(video_url):
         opts["proxy"] = YT_PROXY
+        print(f"🌐 Using proxy for YouTube metadata: {YT_PROXY}")
     
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(video_url, download=False)
@@ -2126,10 +2121,10 @@ def _download_audio_mp3(video_url: str):
                 "webpage_display": ["Desktop"]
             }
         
-        # Add proxy if configured (for residential proxy support)
-        if YT_PROXY:
+        # Add proxy ONLY for YouTube URLs (not for TikTok/Instagram/webpages)
+        if YT_PROXY and is_youtube_url(video_url):
             ydl_opts["proxy"] = YT_PROXY
-            print(f"🌐 Using proxy: {YT_PROXY}")
+            print(f"🌐 Using proxy for YouTube: {YT_PROXY}")
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([video_url])

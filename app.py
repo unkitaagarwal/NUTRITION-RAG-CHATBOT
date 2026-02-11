@@ -1848,14 +1848,160 @@ Rules:
         response_format={"type":"json_object"},
     )
     return json.loads(completion.choices[0].message.content)
+
+
+# Max images per request for recipe extraction (avoids token/rate limits)
+MAX_EXTRACT_RECIPE_IMAGES = int(os.getenv("MAX_EXTRACT_RECIPE_IMAGES", "10"))
+
+def _get_image_data_urls_from_extract_request():
+    """Get one or more images as data URLs. Multipart: field 'image' (single or multiple files). JSON: imageBase64/image or images[]. Returns (list of data_urls, None) or (None, error_response_tuple)."""
+    format_to_mime = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png", "gif": "image/gif", "webp": "image/webp"}
+
+    def mime_for_filename(filename):
+        f = (filename or "").lower()
+        if f.endswith((".jpg", ".jpeg")): return "image/jpeg"
+        if f.endswith(".png"): return "image/png"
+        if f.endswith(".gif"): return "image/gif"
+        if f.endswith(".webp"): return "image/webp"
+        return "image/jpeg"
+
+    # Multipart: multiple files under 'image' (e.g. <input name="image" multiple> or multiple fields)
+    if "image" in request.files:
+        urls = []
+        for uploaded_file in request.files.getlist("image"):
+            if not uploaded_file or not uploaded_file.filename:
+                continue
+            image_bytes = uploaded_file.read()
+            if not image_bytes:
+                continue
+            content_type = mime_for_filename(uploaded_file.filename)
+            b64 = base64.b64encode(image_bytes).decode("utf-8")
+            urls.append(f"data:{content_type};base64,{b64}")
+        if urls:
+            if len(urls) > MAX_EXTRACT_RECIPE_IMAGES:
+                return None, (jsonify({"error": f"Too many images; max {MAX_EXTRACT_RECIPE_IMAGES}"}), 400)
+            return urls, None
+        # single file (legacy): some clients send one file without getlist
+        single = request.files["image"]
+        if single and single.filename:
+            single.seek(0)
+            image_bytes = single.read()
+            if image_bytes:
+                content_type = mime_for_filename(single.filename)
+                b64 = base64.b64encode(image_bytes).decode("utf-8")
+                return [f"data:{content_type};base64,{b64}"], None
+        return None, (jsonify({"error": "Uploaded image file is empty"}), 400)
+
+    # JSON: images array or single imageBase64/image
+    if request.is_json:
+        data = request.get_json(silent=True) or {}
+        images_list = data.get("images")
+        if isinstance(images_list, list) and images_list:
+            urls = []
+            for i, item in enumerate(images_list):
+                if i >= MAX_EXTRACT_RECIPE_IMAGES:
+                    break
+                if isinstance(item, dict):
+                    b64 = item.get("imageBase64") or item.get("image")
+                    fmt = (item.get("imageFormat") or "jpg").lower()
+                elif isinstance(item, str):
+                    b64, fmt = item, "jpg"
+                else:
+                    continue
+                if not b64:
+                    continue
+                if "," in str(b64):
+                    b64 = str(b64).split(",")[-1]
+                content_type = format_to_mime.get(fmt, "image/jpeg")
+                urls.append(f"data:{content_type};base64,{b64}")
+            if urls:
+                return urls, None
+        # Single image (legacy)
+        image_base64 = data.get("imageBase64") or data.get("image")
+        image_format = (data.get("imageFormat") or "jpg").lower()
+        if image_base64:
+            if "," in str(image_base64):
+                image_base64 = str(image_base64).split(",")[-1]
+            content_type = format_to_mime.get(image_format, "image/jpeg")
+            return [f"data:{content_type};base64,{image_base64}"], None
+    return None, None
+
+
+def extract_recipe_from_image_llm(image_data_url: str):
+    """Extract recipe from a single image. Returns same structure as extract_recipe_from_webpage_llm."""
+    return extract_recipe_from_images_llm([image_data_url])
+
+
+def extract_recipe_from_images_llm(image_data_urls: list):
+    """Extract one combined recipe from one or more images (e.g. multi-page recipe). Uses vision LLM."""
+    if not image_data_urls:
+        raise ValueError("At least one image is required")
+    system = """Extract recipe data from the image(s). If multiple images are provided (e.g. multiple pages), combine them into ONE recipe.
+Return ONLY valid JSON:
+{
+  "name": "",
+  "ingredients": [{"name":"", "quantity":""}],
+  "instructions": ["Step 1 ...", "..."],
+  "servings": "",
+  "prep_time": "",
+  "cook_time": "",
+  "total_time": "",
+  "notes": []
+}
+Rules:
+- Don't hallucinate. If unknown, use "" or [].
+- Return JSON only. Read all text visible across the images. Merge ingredients and instructions from all pages into one recipe."""
+    content = [{"type": "text", "text": "Extract the recipe from these image(s) and return the JSON. If there are multiple images, treat them as one multi-page recipe and merge into a single recipe."}]
+    for url in image_data_urls:
+        content.append({"type": "image_url", "image_url": {"url": url}})
+    completion = client.chat.completions.create(
+        model=os.getenv("RECIPE_LLM_MODEL", "gpt-4o-mini"),
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": content},
+        ],
+        temperature=0.2,
+        max_tokens=1800,
+        response_format={"type": "json_object"},
+    )
+    return json.loads(completion.choices[0].message.content)
+
+
 @app.route("/extract-recipe", methods=["POST"])
 def extract_recipe():
+    # Image input: multipart (field 'image', single or multiple files) or JSON (imageBase64/images array)
+    image_data_urls, image_error = _get_image_data_urls_from_extract_request()
+    if image_error:
+        return image_error[0], image_error[1]
+
+    if image_data_urls:
+        try:
+            recipe = extract_recipe_from_images_llm(image_data_urls)
+            tags = extract_recipe_tags(recipe)
+            source = {
+                "type": "image",
+                "url": None,
+                "provider": None,
+                "title": recipe.get("name", "") or "Recipe from image",
+                "image": None,
+                "source_type": "Photos",
+            }
+            return jsonify({
+                "source": source,
+                "recipe": recipe,
+                "tags": tags,
+                "transcript": None,
+                "extraction": {"method": "image_vision", "confidence": 0.6},
+            })
+        except Exception as e:
+            return jsonify({"error": "Failed to extract recipe from image", "details": str(e)}), 500
+
     data = request.get_json(silent=True) or {}
     url = data.get("url") or data.get("videoUrl") or data.get("recipeUrl")
     mode = (data.get("mode") or "auto").lower()
 
     if not url:
-        return jsonify({"error": "url is required"}), 400
+        return jsonify({"error": "url or image is required"}), 400
 
     # Use your existing SSRF validation here too
     ok, err = validate_video_url(url)  # rename this to validate_url (works for all)

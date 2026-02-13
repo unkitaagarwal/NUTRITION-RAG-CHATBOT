@@ -21,6 +21,8 @@ import ipaddress
 from urllib.parse import urlparse
 import requests
 from bs4 import BeautifulSoup
+import subprocess
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 # Load environment variables first
@@ -1846,6 +1848,7 @@ Rules:
         temperature=0.2,
         max_tokens=1800,
         response_format={"type":"json_object"},
+        timeout=RECIPE_LLM_TIMEOUT,
     )
     return json.loads(completion.choices[0].message.content)
 
@@ -1963,6 +1966,7 @@ Rules:
         temperature=0.2,
         max_tokens=1800,
         response_format={"type": "json_object"},
+        timeout=RECIPE_LLM_TIMEOUT,
     )
     return json.loads(completion.choices[0].message.content)
 
@@ -2124,6 +2128,7 @@ Rules:
             temperature=0.2,
             max_tokens=1400,
             response_format={"type": "json_object"},
+            timeout=RECIPE_LLM_TIMEOUT,
         )
     except Exception:
         completion = client.chat.completions.create(
@@ -2134,6 +2139,7 @@ Rules:
             ],
             temperature=0.2,
             max_tokens=1400,
+            timeout=RECIPE_LLM_TIMEOUT,
         )
 
     return _force_json(completion.choices[0].message.content.strip())
@@ -2170,6 +2176,7 @@ Rules:
             temperature=0.1,
             max_tokens=1800,
             response_format={"type": "json_object"},
+            timeout=RECIPE_LLM_TIMEOUT,
         )
     except Exception:
         completion = client.chat.completions.create(
@@ -2180,6 +2187,7 @@ Rules:
             ],
             temperature=0.1,
             max_tokens=1800,
+            timeout=RECIPE_LLM_TIMEOUT,
         )
 
     return _force_json(completion.choices[0].message.content.strip())
@@ -2300,58 +2308,317 @@ def _download_audio_mp3(video_url: str):
         shutil.rmtree(temp_dir, ignore_errors=True)
 
 
+# When transcript is shorter than this (chars), treat as no speech and use frame+vision fallback
+MIN_TRANSCRIPT_LENGTH_FOR_VIDEO = int(os.getenv("MIN_TRANSCRIPT_LENGTH_VIDEO", "80"))
+# Fewer frames = faster (set NUM_VIDEO_FRAMES_RECIPE=8 for more accuracy)
+NUM_VIDEO_FRAMES_FOR_RECIPE = min(int(os.getenv("NUM_VIDEO_FRAMES_RECIPE", "5")), MAX_EXTRACT_RECIPE_IMAGES)
+# Timeout for OpenAI recipe/vision calls (seconds)
+RECIPE_LLM_TIMEOUT = int(os.getenv("RECIPE_LLM_TIMEOUT", "120"))
+
+
+def _download_video_to_file(video_url: str):
+    """
+    Download video (not just audio) to a temp file for frame extraction.
+    Returns: (temp_dir, video_path, meta_dict). Caller must shutil.rmtree(temp_dir) when done.
+    """
+    temp_dir = tempfile.mkdtemp()
+    try:
+        info = _yt_meta(video_url)
+        duration = info.get("duration")
+        title = info.get("title") or ""
+        extractor = info.get("extractor_key") or info.get("extractor") or ""
+        webpage_url = info.get("webpage_url") or video_url
+        thumbnail = info.get("thumbnail")
+        if duration and duration > MAX_VIDEO_SECONDS:
+            raise ValueError(f"Video too long ({duration}s). Max allowed is {MAX_VIDEO_SECONDS}s")
+
+        ydl_opts = {
+            "format": "best[height<=720]/best",
+            "outtmpl": os.path.join(temp_dir, "%(id)s.%(ext)s"),
+            "restrictfilenames": True,
+            "noplaylist": True,
+            "quiet": True,
+            "no_warnings": True,
+            "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
+        }
+        if YTDLP_COOKIES_FILE and os.path.exists(YTDLP_COOKIES_FILE):
+            ydl_opts["cookiefile"] = YTDLP_COOKIES_FILE
+        elif YTDLP_COOKIES_B64:
+            temp_cookies_path = os.path.join(temp_dir, "cookies.txt")
+            try:
+                cookies_content = base64.b64decode(YTDLP_COOKIES_B64).decode("utf-8")
+                with open(temp_cookies_path, "w") as f:
+                    f.write(cookies_content)
+                ydl_opts["cookiefile"] = temp_cookies_path
+            except Exception:
+                pass
+        if "instagram.com" in video_url.lower() and ydl_opts.get("cookiefile"):
+            ydl_opts.setdefault("extractor_args", {})["instagram"] = {"webpage_display": ["Desktop"]}
+        if YT_PROXY and is_youtube_url(video_url):
+            ydl_opts["proxy"] = YT_PROXY
+
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([video_url])
+
+        candidates = [f for f in os.listdir(temp_dir) if f.endswith((".mp4", ".webm", ".mkv", ".mov"))]
+        if not candidates:
+            raise RuntimeError("No video file produced by yt-dlp")
+        video_path = os.path.join(temp_dir, candidates[0])
+        meta = {
+            "duration": duration,
+            "title": title,
+            "provider": (urlparse(video_url).hostname or ""),
+            "extractor": extractor,
+            "webpage_url": webpage_url,
+            "thumbnail": thumbnail,
+        }
+        return temp_dir, video_path, meta
+    except Exception:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        raise
+
+
+def _extract_one_frame(video_path: str, timestamp: float, out_path: str) -> str | None:
+    """Extract a single frame at timestamp; return data URL or None. Used for parallel extraction."""
+    try:
+        result = subprocess.run(
+            [
+                "ffmpeg", "-y", "-ss", str(timestamp), "-i", video_path,
+                "-vframes", "1", "-q:v", "2", out_path,
+            ],
+            capture_output=True,
+            timeout=30,
+        )
+        if result.returncode != 0 or not os.path.exists(out_path):
+            return None
+        with open(out_path, "rb") as f:
+            b64 = base64.b64encode(f.read()).decode("utf-8")
+        return f"data:image/jpeg;base64,{b64}"
+    except Exception:
+        return None
+
+
+def _extract_frame_data_urls_from_video(video_path: str, duration_sec: float | None, num_frames: int = 8) -> list:
+    """
+    Extract evenly spaced frames from video as JPEG data URLs (parallel ffmpeg for speed).
+    """
+    num_frames = min(max(1, num_frames), MAX_EXTRACT_RECIPE_IMAGES)
+    out_dir = tempfile.mkdtemp()
+    try:
+        if duration_sec and duration_sec > 0:
+            interval = duration_sec / (num_frames + 1)
+            timestamps = [interval * (i + 1) for i in range(num_frames)]
+        else:
+            timestamps = [float(i * 10) for i in range(num_frames)]
+
+        # Extract frames in parallel for faster response
+        results = [None] * len(timestamps)
+        max_workers = min(4, len(timestamps))  # cap parallelism
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(
+                    _extract_one_frame,
+                    video_path,
+                    t,
+                    os.path.join(out_dir, f"frame_{i:02d}.jpg"),
+                ): i
+                for i, t in enumerate(timestamps)
+            }
+            for future in as_completed(futures):
+                idx = futures[future]
+                try:
+                    data_url = future.result()
+                    if data_url:
+                        results[idx] = data_url
+                except Exception:
+                    pass
+        return [r for r in results if r is not None]
+    finally:
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+
+def _is_likely_non_speech(transcript: str) -> bool:
+    """True if transcript looks like music/no recipe speech (e.g. '[Music]', '[Applause]', or very short)."""
+    t = (transcript or "").strip()
+    if len(t) < MIN_TRANSCRIPT_LENGTH_FOR_VIDEO:
+        return True
+    cleaned = re.sub(r"\[[\w\s]+\]", "", t, flags=re.IGNORECASE).strip()
+    return len(cleaned) < MIN_TRANSCRIPT_LENGTH_FOR_VIDEO
+
+
+def _extract_audio_from_video_file(video_path: str) -> bytes | None:
+    """Extract audio from an already-downloaded video file using ffmpeg. Returns mp3 bytes or None on failure."""
+    out_dir = tempfile.mkdtemp()
+    try:
+        out_path = os.path.join(out_dir, "audio.mp3")
+        result = subprocess.run(
+            [
+                "ffmpeg", "-y", "-i", video_path,
+                "-vn", "-acodec", "libmp3lame", "-q:a", "2", out_path,
+            ],
+            capture_output=True,
+            timeout=120,
+        )
+        if result.returncode != 0 or not os.path.exists(out_path):
+            return None
+        with open(out_path, "rb") as f:
+            return f.read()
+    except Exception:
+        return None
+    finally:
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+
+def _run_frame_vision_fallback(video_url: str, meta: dict) -> tuple[dict | None, dict | None, str | None]:
+    """
+    Fallback when audio transcript doesn't yield a recipe: download video, extract frames, run vision.
+    Returns (recipe_dict, source_dict, extraction_method) or (None, None, None) on failure.
+    meta can be from _download_audio_mp3 (we have duration/title/etc.) or from _download_video_to_file.
+    """
+    temp_dir = None
+    try:
+        temp_dir, video_path, video_meta = _download_video_to_file(video_url)
+        duration = video_meta.get("duration") or 0
+        frame_urls = _extract_frame_data_urls_from_video(
+            video_path, duration, num_frames=NUM_VIDEO_FRAMES_FOR_RECIPE
+        )
+        if not frame_urls:
+            return None, None, None
+        recipe = extract_recipe_from_images_llm(frame_urls)
+        if not recipe:
+            return None, None, None
+        ingredients = recipe.get("ingredients") or []
+        instructions = recipe.get("instructions") or []
+        if ingredients and isinstance(ingredients[0], str):
+            ingredients = [{"name": ing, "quantity": ""} for ing in ingredients]
+        if not isinstance(instructions, list):
+            instructions = [str(instructions)]
+        recipe["ingredients"] = ingredients
+        recipe["instructions"] = instructions
+        source = {
+            "type": "video",
+            "url": video_url,
+            "provider": video_meta.get("provider", ""),
+            "title": video_meta.get("title", "") or recipe.get("name", ""),
+            "image": video_meta.get("thumbnail"),
+            "source_type": determine_source_type(video_url),
+        }
+        return recipe, source, "video_frames_vision"
+    except Exception as e:
+        print(f"⚠️ Frame+vision fallback failed: {e}")
+        return None, None, None
+    finally:
+        if temp_dir:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def _run_frame_vision_fallback_from_path(
+    video_path: str, video_url: str, meta: dict
+) -> tuple[dict | None, dict | None, str | None]:
+    """
+    Frame+vision fallback using an already-downloaded video file (no extra download).
+    Returns (recipe_dict, source_dict, extraction_method) or (None, None, None) on failure.
+    """
+    try:
+        duration = meta.get("duration") or 0
+        frame_urls = _extract_frame_data_urls_from_video(
+            video_path, duration, num_frames=NUM_VIDEO_FRAMES_FOR_RECIPE
+        )
+        if not frame_urls:
+            return None, None, None
+        recipe = extract_recipe_from_images_llm(frame_urls)
+        if not recipe:
+            return None, None, None
+        ingredients = recipe.get("ingredients") or []
+        instructions = recipe.get("instructions") or []
+        if ingredients and isinstance(ingredients[0], str):
+            ingredients = [{"name": ing, "quantity": ""} for ing in ingredients]
+        if not isinstance(instructions, list):
+            instructions = [str(instructions)]
+        recipe["ingredients"] = ingredients
+        recipe["instructions"] = instructions
+        source = {
+            "type": "video",
+            "url": video_url,
+            "provider": meta.get("provider", ""),
+            "title": meta.get("title", "") or recipe.get("name", ""),
+            "image": meta.get("thumbnail"),
+            "source_type": determine_source_type(video_url),
+        }
+        return recipe, source, "video_frames_vision"
+    except Exception as e:
+        print(f"⚠️ Frame+vision fallback (from path) failed: {e}")
+        return None, None, None
+
+
 def extract_recipe_from_video_internal(video_url: str):
     """
     Internal helper used by unified /extract-recipe endpoint.
+    Downloads video once; extracts audio for Whisper and reuses same file for frame+vision fallback.
     Returns a Flask response: jsonify({...}), status_code
     """
-    # If you have a generalized validate_url, use that.
-    # ok, err = validate_url(video_url)
-    ok, err = validate_video_url(video_url)  # reuse your existing SSRF-safe validator if it supports all URLs
+    ok, err = validate_video_url(video_url)
     if not ok:
         return jsonify({"error": err}), 400
 
+    temp_dir = None
     try:
         print(f"🎥 Processing video URL: {video_url}")
 
-        # 1) Download + extract audio
+        # 1) Download video once (reused for audio extraction and for frame+vision fallback)
         t0 = time.time()
         try:
-            audio_bytes, meta = _download_audio_mp3(video_url)
+            temp_dir, video_path, meta = _download_video_to_file(video_url)
         except ValueError as ve:
             return jsonify({"error": str(ve)}), 413
         except yt_dlp.utils.DownloadError as de:
             error_str = str(de)
             is_instagram = "instagram.com" in video_url.lower()
             cookies_configured = (YTDLP_COOKIES_FILE and os.path.exists(YTDLP_COOKIES_FILE)) or YTDLP_COOKIES_B64
-            
-            # Provide more specific error messages
             if is_instagram:
                 if not cookies_configured:
-                    hint = "Instagram requires authentication. Please set YTDLP_COOKIES_FILE or YTDLP_COOKIES_B64 environment variable with your Instagram cookies."
+                    hint = "Instagram requires authentication. Please set YTDLP_COOKIES_FILE or YTDLP_COOKIES_B64."
                 elif "empty media response" in error_str.lower() or "unavailable" in error_str.lower():
-                    hint = "Instagram post may be private, restricted, or cookies may be expired. Try refreshing your cookies file."
+                    hint = "Instagram post may be private or cookies may be expired."
                 else:
-                    hint = "Instagram extraction failed. The post may be private, restricted, or require fresh cookies."
+                    hint = "Instagram extraction failed. The post may be private or require fresh cookies."
             else:
-                hint = "For TikTok/Instagram (and some YouTube), export cookies and set YTDLP_COOKIES_FILE."
-            
+                hint = "For TikTok/Instagram (and some YouTube), set YTDLP_COOKIES_FILE."
             return jsonify({
-                "error": "Failed to download/extract audio from video URL",
+                "error": "Failed to download video",
                 "details": error_str,
                 "hint": hint,
                 "cookies_configured": cookies_configured,
             }), 400
         except Exception as e:
-            return jsonify({"error": "Audio extraction failed", "details": str(e)}), 500
+            return jsonify({"error": "Video download failed", "details": str(e)}), 500
 
-        print(f"✅ Audio extracted: {len(audio_bytes)} bytes in {time.time() - t0:.2f}s")
+        print(f"✅ Video downloaded in {time.time() - t0:.2f}s")
 
-        # 2) Whisper transcription
+        # 2) Extract audio from the downloaded video (no second download)
+        audio_bytes = _extract_audio_from_video_file(video_path)
+        if not audio_bytes:
+            print("⚠️ Could not extract audio from video; using frame+vision fallback...")
+            recipe, source, extraction_method = _run_frame_vision_fallback_from_path(video_path, video_url, meta)
+            if recipe and source:
+                tags = extract_recipe_tags(recipe)
+                return jsonify({
+                    "source": source,
+                    "recipe": recipe,
+                    "tags": tags,
+                    "transcript": None,
+                    "extraction": {"method": extraction_method, "confidence": 0.5},
+                    "meta": meta,
+                }), 200
+            return jsonify({
+                "error": "Failed to extract recipe from video",
+                "message": "Could not extract audio and frame+vision fallback failed. Ensure ffmpeg is installed.",
+            }), 500
+
+        # 3) Whisper transcription
         print("🎤 Transcribing audio...")
         audio_file_obj = io.BytesIO(audio_bytes)
         audio_file_obj.name = "audio.mp3"
-
         transcript = client.audio.transcriptions.create(
             model="whisper-1",
             file=audio_file_obj,
@@ -2359,60 +2626,138 @@ def extract_recipe_from_video_internal(video_url: str):
         )
         transcript_text = transcript.strip() if isinstance(transcript, str) else str(transcript).strip()
 
-        if not transcript_text:
+        # If no usable transcript (empty or just music/noise), use frame+vision fallback (reuse same video)
+        if not transcript_text or _is_likely_non_speech(transcript_text):
+            print("🎬 No usable recipe instructions from audio; using frame+vision fallback (reusing video)...")
+            recipe, source, extraction_method = _run_frame_vision_fallback_from_path(video_path, video_url, meta)
+            if recipe and source:
+                tags = extract_recipe_tags(recipe)
+                return jsonify({
+                    "source": source,
+                    "recipe": recipe,
+                    "tags": tags,
+                    "transcript": None,
+                    "extraction": {"method": extraction_method, "confidence": 0.5},
+                    "meta": meta,
+                }), 200
             return jsonify({
-                "error": "Failed to transcribe video",
-                "message": "No transcript generated from video audio"
+                "error": "Failed to extract recipe from video",
+                "message": "No transcript from audio and frame+vision fallback failed. Ensure ffmpeg is installed.",
             }), 500
 
-        # 3) LLM extraction with chunking + merge
-        print("🍳 Extracting recipe information...")
+        # 4) LLM extraction from transcript (chunking + merge)
+        print("🍳 Extracting recipe information from transcript...")
         chunks = _chunk_text(transcript_text, max_chars=6000)
         if not chunks:
+            print("🎬 No chunks from transcript; using frame+vision fallback (reusing video)...")
+            recipe, source, extraction_method = _run_frame_vision_fallback_from_path(video_path, video_url, meta)
+            if recipe and source:
+                tags = extract_recipe_tags(recipe)
+                return jsonify({
+                    "source": source,
+                    "recipe": recipe,
+                    "tags": tags,
+                    "transcript": None,
+                    "extraction": {"method": extraction_method, "confidence": 0.5},
+                    "meta": meta,
+                }), 200
             return jsonify({"error": "Transcript is empty after cleanup"}), 500
 
-        parts = []
-        for idx, chunk in enumerate(chunks, start=1):
-            try:
-                parts.append(_extract_recipe_chunk(chunk))
-            except Exception as e:
+        # Extract recipe from transcript chunks in parallel for faster response
+        parts = [None] * len(chunks)
+        chunk_failed = {"idx": None, "error": None}
+        max_workers = min(4, len(chunks))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(_extract_recipe_chunk, ch): i for i, ch in enumerate(chunks)}
+            for future in as_completed(futures):
+                idx = futures[future]
+                try:
+                    parts[idx] = future.result()
+                except Exception as e:
+                    chunk_failed["idx"] = idx + 1
+                    chunk_failed["error"] = e
+                    break
+        if chunk_failed["idx"] is not None:
+            print(f"⚠️ Transcript chunk extraction failed (chunk {chunk_failed['idx']}); using frame+vision fallback (reusing video)...")
+            recipe, source, extraction_method = _run_frame_vision_fallback_from_path(video_path, video_url, meta)
+            if recipe and source:
+                tags = extract_recipe_tags(recipe)
                 return jsonify({
-                    "error": "Failed to extract recipe from transcript chunk",
-                    "chunk": idx,
-                    "details": str(e),
-                    "transcript": transcript_text
-                }), 500
+                    "source": source,
+                    "recipe": recipe,
+                    "tags": tags,
+                    "transcript": None,
+                    "extraction": {"method": extraction_method, "confidence": 0.5},
+                    "meta": meta,
+                }), 200
+            return jsonify({
+                "error": "Failed to extract recipe from transcript chunk",
+                "chunk": chunk_failed["idx"],
+                "details": str(chunk_failed["error"]),
+                "transcript": transcript_text
+            }), 500
+        parts = [p for p in parts if p is not None]
+        if not parts:
+            return jsonify({"error": "No recipe parts extracted from transcript"}), 500
 
         recipe = _merge_recipe_parts(parts) if len(parts) > 1 else parts[0]
-
-        # Normalize output fields
         ingredients = recipe.get("ingredients") or []
         instructions = recipe.get("instructions") or []
         if ingredients and isinstance(ingredients[0], str):
             ingredients = [{"name": ing, "quantity": ""} for ing in ingredients]
         if not isinstance(instructions, list):
             instructions = [str(instructions)]
-
         recipe["ingredients"] = ingredients
         recipe["instructions"] = instructions
 
-        # Determine source type and extract tags
+        # If transcript yielded empty instructions, use frame+vision fallback (reuse same video)
+        if not instructions:
+            print("🎬 Instructions empty from transcript; using frame+vision fallback (reusing video)...")
+            fallback_recipe, fallback_source, extraction_method = _run_frame_vision_fallback_from_path(
+                video_path, video_url, meta
+            )
+            if fallback_recipe and fallback_source and (
+                fallback_recipe.get("instructions") or fallback_recipe.get("ingredients")
+            ):
+                tags = extract_recipe_tags(fallback_recipe)
+                return jsonify({
+                    "source": fallback_source,
+                    "recipe": fallback_recipe,
+                    "tags": tags,
+                    "transcript": None,
+                    "extraction": {"method": extraction_method, "confidence": 0.5},
+                    "meta": meta,
+                }), 200
+        elif not ingredients:
+            print("🎬 Ingredients empty from transcript; using frame+vision fallback (reusing video)...")
+            fallback_recipe, fallback_source, extraction_method = _run_frame_vision_fallback_from_path(
+                video_path, video_url, meta
+            )
+            if fallback_recipe and fallback_source:
+                tags = extract_recipe_tags(fallback_recipe)
+                return jsonify({
+                    "source": fallback_source,
+                    "recipe": fallback_recipe,
+                    "tags": tags,
+                    "transcript": None,
+                    "extraction": {"method": extraction_method, "confidence": 0.5},
+                    "meta": meta,
+                }), 200
+
         source_type = determine_source_type(video_url)
         tags = extract_recipe_tags(recipe)
-        
         source = {
             "type": "video",
             "url": video_url,
             "provider": meta.get("provider", ""),
             "title": meta.get("title", "") or recipe.get("name", ""),
-            "image": meta.get("thumbnail"),  # best-effort; often works for YouTube
-            "source_type": source_type  # Add source type: TikTok, YouTube, Instagram, Photos, Manual
+            "image": meta.get("thumbnail"),
+            "source_type": source_type,
         }
-
         return jsonify({
             "source": source,
             "recipe": recipe,
-            "tags": tags,  # Add tags: High Protein, Vegetarian, Vegan, Quick, Easy, Medium, Hard
+            "tags": tags,
             "transcript": transcript_text,
             "extraction": {"method": "transcript_llm", "confidence": 0.55},
             "meta": meta,
@@ -2421,6 +2766,9 @@ def extract_recipe_from_video_internal(video_url: str):
     except Exception as e:
         print(f"💥 Critical error in extract_recipe_from_video_internal: {str(e)}")
         return jsonify({"error": "Unexpected server error", "details": str(e)}), 500
+    finally:
+        if temp_dir:
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 

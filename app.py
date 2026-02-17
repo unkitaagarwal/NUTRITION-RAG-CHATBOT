@@ -1835,10 +1835,17 @@ Return ONLY valid JSON:
   "prep_time": "",
   "cook_time": "",
   "total_time": "",
-  "notes": []
+  "notes": [],
+  "nutrition": {
+    "calories": "",
+    "protein_g": "",
+    "carbs_g": "",
+    "fat_g": ""
+  }
 }
 Rules:
-- Don't hallucinate. If unknown, use "" or [].
+- Don't hallucinate for the structure. If fields like servings or times are unknown, use "" or [].
+- You MUST provide a best-effort numeric estimate (as strings) for nutrition macros PER SERVING: calories, protein_g, carbs_g, fat_g. Use your nutrition knowledge of typical ingredients/quantities to approximate. Only leave a macro field \"\" if there is literally no information about ingredients.
 - Return JSON only."""
     user = f"Webpage text:\n{page_text}"
 
@@ -1949,10 +1956,17 @@ Return ONLY valid JSON:
   "prep_time": "",
   "cook_time": "",
   "total_time": "",
-  "notes": []
+  "notes": [],
+  "nutrition": {
+    "calories": "",
+    "protein_g": "",
+    "carbs_g": "",
+    "fat_g": ""
+  }
 }
 Rules:
 - Don't hallucinate. If unknown, use "" or [].
+- You MUST provide a best-effort numeric estimate (as strings) for nutrition macros PER SERVING: calories, protein_g, carbs_g, fat_g. Use your nutrition knowledge of typical ingredients/quantities to approximate from what you see. Only leave a macro field \"\" if there is literally no information about ingredients.
 - Return JSON only. Read all text visible across the images. Merge ingredients and instructions from all pages into one recipe."""
     content = [{"type": "text", "text": "Extract the recipe from these image(s) and return the JSON. If there are multiple images, treat them as one multi-page recipe and merge into a single recipe."}]
     for url in image_data_urls:
@@ -2107,12 +2121,19 @@ Return ONLY valid JSON matching:
   "prep_time": "",
   "cook_time": "",
   "total_time": "",
-  "notes": []
+  "notes": [],
+  "nutrition": {
+    "calories": "",
+    "protein_g": "",
+    "carbs_g": "",
+    "fat_g": ""
+  }
 }
 Rules:
-- Don't hallucinate. If unknown, use "" or [].
+- Don't hallucinate for the structure. If fields like servings or times are unknown, use "" or [].
 - Ingredients must include quantities when stated; else quantity "".
 - Instructions must be actionable, chronological, and detailed.
+- You MUST provide a best-effort numeric estimate (as strings) for nutrition macros PER SERVING: calories, protein_g, carbs_g, fat_g. Use your nutrition knowledge of typical ingredients/quantities and transcript context to approximate. Only leave a macro field \"\" if there is literally no information about ingredients.
 - Output JSON only (no markdown, no commentary)."""
 
     user_prompt = f"Transcript:\n{transcript_chunk}\n\nReturn the JSON now."
@@ -2156,12 +2177,19 @@ Return ONLY valid JSON matching:
   "prep_time": "",
   "cook_time": "",
   "total_time": "",
-  "notes": []
+  "notes": [],
+  "nutrition": {
+    "calories": "",
+    "protein_g": "",
+    "carbs_g": "",
+    "fat_g": ""
+  }
 }
 Rules:
 - Deduplicate ingredients case-insensitively; keep most specific quantity.
 - Remove duplicate steps, ensure correct chronological order.
 - Ensure steps are detailed and actionable.
+- Merge/average any provided nutrition macros (calories, protein_g, carbs_g, fat_g) into a single best-effort estimate PER SERVING. If some parts omit macros, use available information from other parts. Only leave a macro field \"\" if ALL parts lack enough information.
 - Output JSON only."""
 
     user_prompt = json.dumps({"parts": parts}, ensure_ascii=False)

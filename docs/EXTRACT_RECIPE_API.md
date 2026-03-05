@@ -30,7 +30,7 @@
   - **URL:** JSON `url` or `videoUrl` or `recipeUrl` (+ optional `mode`: `"auto"` | `"video"` | `"webpage"`).
 - **Output (success):** JSON with:
   - `source` — `type`, `url`, `provider`, `title`, `image`, `source_type`
-  - `recipe` — `name`, `ingredients[]`, `instructions[]`, `servings`, `prep_time`, `cook_time`, `total_time`, `notes[]`
+  - `recipe` — `name`, `ingredients[]`, `instructions[]`, `servings`, `prep_time`, `cook_time`, `total_time`, `notes[]`, `cuisine`
   - `tags` — e.g. High Protein, Vegetarian, Vegan, Quick, Easy
   - `transcript` — only for video when transcript path is used; else `null`
   - `extraction` — `method`, `confidence`

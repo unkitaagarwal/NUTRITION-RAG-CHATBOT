@@ -58,6 +58,40 @@ llm = ChatOpenAI(
 # Note: OpenAI client is initialized once above and reused for all endpoints
 # The client.chat.completions.create() calls are just API requests, not re-initializations
 
+# User-friendly message for any 500 (client can show this when status is 500)
+DEFAULT_500_USER_MESSAGE = "We ran into a problem. Please try again in a moment."
+
+
+@app.errorhandler(500)
+def handle_500(err):
+    """Ensure unhandled exceptions return a consistent JSON body with user_message."""
+    return jsonify({
+        "error": "Internal Server Error",
+        "user_message": DEFAULT_500_USER_MESSAGE,
+        "details": str(err) if app.debug else None,
+    }), 500
+
+
+@app.after_request
+def ensure_500_user_message(response):
+    """Ensure every 500 response includes user_message so clients can show a message."""
+    if response.status_code != 500:
+        return response
+    if not response.is_json:
+        return response
+    try:
+        data = response.get_json()
+        if data is None:
+            return response
+        if "user_message" not in data or not data["user_message"]:
+            data = dict(data) if data else {}
+            data["user_message"] = data.get("user_message") or DEFAULT_500_USER_MESSAGE
+            response.set_data(json.dumps(data))
+    except Exception:
+        pass
+    return response
+
+
 # Initialize RAG chain once at startup (not on every request)
 # Note: system_context is included in the query string, not as a separate prompt variable
 # Create RAG chain without custom prompt (system_context is included in query)
@@ -369,13 +403,15 @@ def detect_ingredients():
             print("💥 GPT Vision error:", str(vision_error))
             return jsonify({
                 "error": "Failed to analyze image with GPT Vision",
-                "details": str(vision_error)
+                "user_message": "We couldn't read ingredients from this image. Please try another photo or type them in.",
+                "details": str(vision_error),
             }), 500
 
     except Exception as e:
         print("💥 Critical error:", str(e))
         return jsonify({
             "error": "Something went wrong analyzing the image",
+            "user_message": "We couldn't analyze this image. Please try again or type your ingredients instead.",
             "details": str(e),
         }), 500
 
@@ -624,7 +660,10 @@ Rules: Use required ingredients. Step-by-step instructions.{macro_summary} Valid
         error_msg = f"Failed to parse JSON response: {str(e)}"
         if response_text:
             error_msg += f"\nRaw response: {response_text[:500]}"
-        return jsonify({"error": error_msg}), 500
+        return jsonify({
+            "error": error_msg,
+            "user_message": "We ran into a problem generating your meals. Please try again in a moment.",
+        }), 500
     except Exception as e:
         # Handle OpenAI API errors specifically
         error_str = str(e)
@@ -700,6 +739,7 @@ Rules: Use required ingredients. Step-by-step instructions.{macro_summary} Valid
             # Generic error
             error_dict = {
                 "error": "Error generating meals",
+                "user_message": "We ran into a problem generating your meals. Please try again in a moment.",
                 "message": str(e),
                 "type": "unknown_error",
                 "status_code": 500
@@ -843,7 +883,8 @@ def voice_ingredients():
         print(f"Error in voice_ingredients: {str(e)}")
         return jsonify({
             "error": "Unexpected server error",
-            "details": str(e)
+            "user_message": "We couldn't process the audio. Please try again or type your ingredients instead.",
+            "details": str(e),
         }), 500
 
 # ---------- Security: SSRF protection ----------
@@ -1157,7 +1198,11 @@ def extract_recipe_from_video():
                 "hint": "TikTok/Instagram often require cookies/login. Set YTDLP_COOKIES_FILE on the server."
             }), 400
         except Exception as e:
-            return jsonify({"error": "Audio extraction failed", "details": str(e)}), 500
+            return jsonify({
+                "error": "Audio extraction failed",
+                "user_message": "We couldn't get the audio from this video. Please try another link or add the recipe manually.",
+                "details": str(e),
+            }), 500
 
         print(f"✅ Audio extracted: {len(audio_bytes)} bytes in {time.time()-t0:.2f}s")
 
@@ -1176,7 +1221,8 @@ def extract_recipe_from_video():
         if not transcript_text:
             return jsonify({
                 "error": "Failed to transcribe video",
-                "message": "No transcript generated from video audio"
+                "user_message": "We couldn't understand the audio from this video. Try another link or add the recipe manually.",
+                "message": "No transcript generated from video audio",
             }), 500
 
         print(f"✅ Transcript generated: {len(transcript_text)} characters")
@@ -1193,6 +1239,7 @@ def extract_recipe_from_video():
             except Exception as e:
                 return jsonify({
                     "error": "Failed to extract recipe from transcript chunk",
+                    "user_message": "We couldn't extract a recipe from this link. Please try another or add the recipe manually.",
                     "chunk": idx,
                     "details": str(e),
                     "transcript": transcript_text
@@ -1219,7 +1266,11 @@ def extract_recipe_from_video():
 
     except Exception as e:
         print(f"💥 Critical error in extract_recipe_from_video: {str(e)}")
-        return jsonify({"error": "Unexpected server error", "details": str(e)}), 500
+        return jsonify({
+                "error": "Unexpected server error",
+                "user_message": DEFAULT_500_USER_MESSAGE,
+                "details": str(e),
+            }), 500
 
 #####video only code ends here#####
 
@@ -1806,6 +1857,13 @@ def normalize_recipe_from_jsonld(recipe_obj: dict, soup: BeautifulSoup):
             if isinstance(v, (str, int, float)):
                 norm_nutrition[k] = str(v)
 
+    # Cuisine: recipeCuisine can be string or list in JSON-LD
+    cuisine_raw = recipe_obj.get("recipeCuisine") or ""
+    if isinstance(cuisine_raw, list) and cuisine_raw:
+        cuisine = ", ".join(str(x).strip() for x in cuisine_raw if x)
+    else:
+        cuisine = str(cuisine_raw).strip() if cuisine_raw else ""
+
     return {
         "name": name,
         "ingredients": norm_ingredients,
@@ -1814,7 +1872,8 @@ def normalize_recipe_from_jsonld(recipe_obj: dict, soup: BeautifulSoup):
         "prep_time": prep,
         "cook_time": cook,
         "total_time": total,
-        "nutrition": norm_nutrition
+        "nutrition": norm_nutrition,
+        "cuisine": cuisine,
     }, image
 def clean_page_text(html: str) -> str:
     soup = BeautifulSoup(html, "lxml")
@@ -1836,6 +1895,7 @@ Return ONLY valid JSON:
   "cook_time": "",
   "total_time": "",
   "notes": [],
+  "cuisine": "",
   "nutrition": {
     "calories": "",
     "protein_g": "",
@@ -1845,6 +1905,7 @@ Return ONLY valid JSON:
 }
 Rules:
 - Don't hallucinate for the structure. If fields like servings or times are unknown, use "" or [].
+- Infer cuisine from recipe name, ingredients, or context when evident (e.g. Italian, Mexican, Indian, American); otherwise use "".
 - You MUST provide a best-effort numeric estimate (as strings) for nutrition macros PER SERVING: calories, protein_g, carbs_g, fat_g. Use your nutrition knowledge of typical ingredients/quantities to approximate. Only leave a macro field \"\" if there is literally no information about ingredients.
 - Return JSON only."""
     user = f"Webpage text:\n{page_text}"
@@ -1957,6 +2018,7 @@ Return ONLY valid JSON:
   "cook_time": "",
   "total_time": "",
   "notes": [],
+  "cuisine": "",
   "nutrition": {
     "calories": "",
     "protein_g": "",
@@ -1966,6 +2028,7 @@ Return ONLY valid JSON:
 }
 Rules:
 - Don't hallucinate. If unknown, use "" or [].
+- Infer cuisine from recipe name, ingredients, or visible context when evident (e.g. Italian, Mexican, Indian); otherwise use "".
 - You MUST provide a best-effort numeric estimate (as strings) for nutrition macros PER SERVING: calories, protein_g, carbs_g, fat_g. Use your nutrition knowledge of typical ingredients/quantities to approximate from what you see. Only leave a macro field \"\" if there is literally no information about ingredients.
 - Return JSON only. Read all text visible across the images. Merge ingredients and instructions from all pages into one recipe."""
     content = [{"type": "text", "text": "Extract the recipe from these image(s) and return the JSON. If there are multiple images, treat them as one multi-page recipe and merge into a single recipe."}]
@@ -1985,6 +2048,14 @@ Rules:
     return json.loads(completion.choices[0].message.content)
 
 
+def _ensure_recipe_cuisine(recipe: dict) -> str:
+    """Ensure recipe has a cuisine field; return normalized cuisine string for response."""
+    if not recipe:
+        return ""
+    recipe["cuisine"] = (recipe.get("cuisine") or "").strip()
+    return recipe["cuisine"]
+
+
 @app.route("/extract-recipe", methods=["POST"])
 def extract_recipe():
     # Image input: multipart (field 'image', single or multiple files) or JSON (imageBase64/images array)
@@ -1995,6 +2066,7 @@ def extract_recipe():
     if image_data_urls:
         try:
             recipe = extract_recipe_from_images_llm(image_data_urls)
+            cuisine = _ensure_recipe_cuisine(recipe)
             tags = extract_recipe_tags(recipe)
             source = {
                 "type": "image",
@@ -2012,7 +2084,11 @@ def extract_recipe():
                 "extraction": {"method": "image_vision", "confidence": 0.6},
             })
         except Exception as e:
-            return jsonify({"error": "Failed to extract recipe from image", "details": str(e)}), 500
+            return jsonify({
+                "error": "Failed to extract recipe from image",
+                "user_message": "We couldn't extract a recipe from this image. Please try another photo or add the recipe manually.",
+                "details": str(e),
+            }), 500
 
     data = request.get_json(silent=True) or {}
     url = data.get("url") or data.get("videoUrl") or data.get("recipeUrl")
@@ -2059,6 +2135,7 @@ def extract_recipe():
 
         # Determine source type and extract tags
         source_type = determine_source_type(url)
+        cuisine = _ensure_recipe_cuisine(recipe)
         tags = extract_recipe_tags(recipe)
         
         source = {
@@ -2078,8 +2155,29 @@ def extract_recipe():
             "extraction": {"method": method, "confidence": 0.7 if method == "jsonld" else 0.5}
         })
 
+    except requests.exceptions.HTTPError as e:
+        status = e.response.status_code if e.response is not None else 502
+
+        if status == 402:
+            user_message = "We couldn't extract a recipe from this link. This site may be paywalled or block automated access—try another link or add the recipe manually."
+        elif 400 <= status < 500:
+            user_message = "We couldn't extract a recipe from this link. Please check the URL or try a different recipe page."
+        else:
+            user_message = "We couldn't extract a recipe from this link. Please try again later or add the recipe manually."
+
+        return jsonify({
+            "error": "WEBPAGE_FETCH_FAILED",
+            "status": status,
+            "user_message": user_message,
+            "details": str(e),
+        }), 400
+
     except Exception as e:
-        return jsonify({"error": "Failed to extract recipe from webpage", "details": str(e)}), 500
+        return jsonify({
+            "error": "UNEXPECTED_EXTRACT_RECIPE_ERROR",
+            "user_message": "We couldn't extract a recipe from this link. Please try another link or add the recipe manually.",
+            "details": str(e),
+        }), 500
 
 
 
@@ -2122,6 +2220,7 @@ Return ONLY valid JSON matching:
   "cook_time": "",
   "total_time": "",
   "notes": [],
+  "cuisine": "",
   "nutrition": {
     "calories": "",
     "protein_g": "",
@@ -2131,6 +2230,7 @@ Return ONLY valid JSON matching:
 }
 Rules:
 - Don't hallucinate for the structure. If fields like servings or times are unknown, use "" or [].
+- Infer cuisine from recipe name, ingredients, or speaker context when evident (e.g. Italian, Mexican, Indian); otherwise use "".
 - Ingredients must include quantities when stated; else quantity "".
 - Instructions must be actionable, chronological, and detailed.
 - You MUST provide a best-effort numeric estimate (as strings) for nutrition macros PER SERVING: calories, protein_g, carbs_g, fat_g. Use your nutrition knowledge of typical ingredients/quantities and transcript context to approximate. Only leave a macro field \"\" if there is literally no information about ingredients.
@@ -2178,6 +2278,7 @@ Return ONLY valid JSON matching:
   "cook_time": "",
   "total_time": "",
   "notes": [],
+  "cuisine": "",
   "nutrition": {
     "calories": "",
     "protein_g": "",
@@ -2189,6 +2290,7 @@ Rules:
 - Deduplicate ingredients case-insensitively; keep most specific quantity.
 - Remove duplicate steps, ensure correct chronological order.
 - Ensure steps are detailed and actionable.
+- For cuisine: use the first non-empty cuisine from the parts; if none, use "".
 - Merge/average any provided nutrition macros (calories, protein_g, carbs_g, fat_g) into a single best-effort estimate PER SERVING. If some parts omit macros, use available information from other parts. Only leave a macro field \"\" if ALL parts lack enough information.
 - Output JSON only."""
 
@@ -2619,7 +2721,11 @@ def extract_recipe_from_video_internal(video_url: str):
                 "cookies_configured": cookies_configured,
             }), 400
         except Exception as e:
-            return jsonify({"error": "Video download failed", "details": str(e)}), 500
+            return jsonify({
+                "error": "Video download failed",
+                "user_message": "We couldn't download this video. Please try another link or add the recipe manually.",
+                "details": str(e),
+            }), 500
 
         print(f"✅ Video downloaded in {time.time() - t0:.2f}s")
 
@@ -2629,6 +2735,7 @@ def extract_recipe_from_video_internal(video_url: str):
             print("⚠️ Could not extract audio from video; using frame+vision fallback...")
             recipe, source, extraction_method = _run_frame_vision_fallback_from_path(video_path, video_url, meta)
             if recipe and source:
+                cuisine = _ensure_recipe_cuisine(recipe)
                 tags = extract_recipe_tags(recipe)
                 return jsonify({
                     "source": source,
@@ -2640,6 +2747,7 @@ def extract_recipe_from_video_internal(video_url: str):
                 }), 200
             return jsonify({
                 "error": "Failed to extract recipe from video",
+                "user_message": "We couldn't extract a recipe from this link. Please try another or add the recipe manually.",
                 "message": "Could not extract audio and frame+vision fallback failed. Ensure ffmpeg is installed.",
             }), 500
 
@@ -2659,6 +2767,7 @@ def extract_recipe_from_video_internal(video_url: str):
             print("🎬 No usable recipe instructions from audio; using frame+vision fallback (reusing video)...")
             recipe, source, extraction_method = _run_frame_vision_fallback_from_path(video_path, video_url, meta)
             if recipe and source:
+                cuisine = _ensure_recipe_cuisine(recipe)
                 tags = extract_recipe_tags(recipe)
                 return jsonify({
                     "source": source,
@@ -2670,6 +2779,7 @@ def extract_recipe_from_video_internal(video_url: str):
                 }), 200
             return jsonify({
                 "error": "Failed to extract recipe from video",
+                "user_message": "We couldn't extract a recipe from this link. Please try another or add the recipe manually.",
                 "message": "No transcript from audio and frame+vision fallback failed. Ensure ffmpeg is installed.",
             }), 500
 
@@ -2680,6 +2790,7 @@ def extract_recipe_from_video_internal(video_url: str):
             print("🎬 No chunks from transcript; using frame+vision fallback (reusing video)...")
             recipe, source, extraction_method = _run_frame_vision_fallback_from_path(video_path, video_url, meta)
             if recipe and source:
+                cuisine = _ensure_recipe_cuisine(recipe)
                 tags = extract_recipe_tags(recipe)
                 return jsonify({
                     "source": source,
@@ -2689,7 +2800,10 @@ def extract_recipe_from_video_internal(video_url: str):
                     "extraction": {"method": extraction_method, "confidence": 0.5},
                     "meta": meta,
                 }), 200
-            return jsonify({"error": "Transcript is empty after cleanup"}), 500
+            return jsonify({
+                "error": "Transcript is empty after cleanup",
+                "user_message": "We couldn't extract a recipe from this link. Please try another or add the recipe manually.",
+            }), 500
 
         # Extract recipe from transcript chunks in parallel for faster response
         parts = [None] * len(chunks)
@@ -2709,6 +2823,7 @@ def extract_recipe_from_video_internal(video_url: str):
             print(f"⚠️ Transcript chunk extraction failed (chunk {chunk_failed['idx']}); using frame+vision fallback (reusing video)...")
             recipe, source, extraction_method = _run_frame_vision_fallback_from_path(video_path, video_url, meta)
             if recipe and source:
+                cuisine = _ensure_recipe_cuisine(recipe)
                 tags = extract_recipe_tags(recipe)
                 return jsonify({
                     "source": source,
@@ -2720,13 +2835,17 @@ def extract_recipe_from_video_internal(video_url: str):
                 }), 200
             return jsonify({
                 "error": "Failed to extract recipe from transcript chunk",
+                "user_message": "We couldn't extract a recipe from this link. Please try another or add the recipe manually.",
                 "chunk": chunk_failed["idx"],
                 "details": str(chunk_failed["error"]),
                 "transcript": transcript_text
             }), 500
         parts = [p for p in parts if p is not None]
         if not parts:
-            return jsonify({"error": "No recipe parts extracted from transcript"}), 500
+            return jsonify({
+                "error": "No recipe parts extracted from transcript",
+                "user_message": "We couldn't extract a recipe from this link. Please try another or add the recipe manually.",
+            }), 500
 
         recipe = _merge_recipe_parts(parts) if len(parts) > 1 else parts[0]
         ingredients = recipe.get("ingredients") or []
@@ -2747,6 +2866,7 @@ def extract_recipe_from_video_internal(video_url: str):
             if fallback_recipe and fallback_source and (
                 fallback_recipe.get("instructions") or fallback_recipe.get("ingredients")
             ):
+                cuisine = _ensure_recipe_cuisine(fallback_recipe)
                 tags = extract_recipe_tags(fallback_recipe)
                 return jsonify({
                     "source": fallback_source,
@@ -2762,6 +2882,7 @@ def extract_recipe_from_video_internal(video_url: str):
                 video_path, video_url, meta
             )
             if fallback_recipe and fallback_source:
+                cuisine = _ensure_recipe_cuisine(fallback_recipe)
                 tags = extract_recipe_tags(fallback_recipe)
                 return jsonify({
                     "source": fallback_source,
@@ -2773,6 +2894,7 @@ def extract_recipe_from_video_internal(video_url: str):
                 }), 200
 
         source_type = determine_source_type(video_url)
+        cuisine = _ensure_recipe_cuisine(recipe)
         tags = extract_recipe_tags(recipe)
         source = {
             "type": "video",
@@ -2793,7 +2915,11 @@ def extract_recipe_from_video_internal(video_url: str):
 
     except Exception as e:
         print(f"💥 Critical error in extract_recipe_from_video_internal: {str(e)}")
-        return jsonify({"error": "Unexpected server error", "details": str(e)}), 500
+        return jsonify({
+                "error": "Unexpected server error",
+                "user_message": DEFAULT_500_USER_MESSAGE,
+                "details": str(e),
+            }), 500
     finally:
         if temp_dir:
             shutil.rmtree(temp_dir, ignore_errors=True)

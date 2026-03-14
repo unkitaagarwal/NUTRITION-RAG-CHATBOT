@@ -1864,6 +1864,12 @@ def normalize_recipe_from_jsonld(recipe_obj: dict, soup: BeautifulSoup):
     else:
         cuisine = str(cuisine_raw).strip() if cuisine_raw else ""
 
+    # Meal type: recipeCategory often has "Breakfast", "Lunch", etc.
+    meal_type_raw = recipe_obj.get("recipeCategory") or ""
+    if isinstance(meal_type_raw, list) and meal_type_raw:
+        meal_type_raw = meal_type_raw[0] if meal_type_raw else ""
+    meal_type_raw = str(meal_type_raw).strip() if meal_type_raw else ""
+
     return {
         "name": name,
         "ingredients": norm_ingredients,
@@ -1874,6 +1880,7 @@ def normalize_recipe_from_jsonld(recipe_obj: dict, soup: BeautifulSoup):
         "total_time": total,
         "nutrition": norm_nutrition,
         "cuisine": cuisine,
+        "meal_type": meal_type_raw,
     }, image
 def clean_page_text(html: str) -> str:
     soup = BeautifulSoup(html, "lxml")
@@ -1895,6 +1902,7 @@ Return ONLY valid JSON:
   "cook_time": "",
   "total_time": "",
   "notes": [],
+  "meal_type": "",
   "cuisine": "",
   "nutrition": {
     "calories": "",
@@ -1905,6 +1913,7 @@ Return ONLY valid JSON:
 }
 Rules:
 - Don't hallucinate for the structure. If fields like servings or times are unknown, use "" or [].
+- meal_type: exactly one of Breakfast, Lunch, Dinner, Snack (infer from context).
 - Infer cuisine from recipe name, ingredients, or context when evident (e.g. Italian, Mexican, Indian, American); otherwise use "".
 - You MUST provide a best-effort numeric estimate (as strings) for nutrition macros PER SERVING: calories, protein_g, carbs_g, fat_g. Use your nutrition knowledge of typical ingredients/quantities to approximate. Only leave a macro field \"\" if there is literally no information about ingredients.
 - Return JSON only."""
@@ -2018,6 +2027,7 @@ Return ONLY valid JSON:
   "cook_time": "",
   "total_time": "",
   "notes": [],
+  "meal_type": "",
   "cuisine": "",
   "nutrition": {
     "calories": "",
@@ -2028,6 +2038,7 @@ Return ONLY valid JSON:
 }
 Rules:
 - Don't hallucinate. If unknown, use "" or [].
+- meal_type: exactly one of Breakfast, Lunch, Dinner, Snack (infer from context).
 - Infer cuisine from recipe name, ingredients, or visible context when evident (e.g. Italian, Mexican, Indian); otherwise use "".
 - You MUST provide a best-effort numeric estimate (as strings) for nutrition macros PER SERVING: calories, protein_g, carbs_g, fat_g. Use your nutrition knowledge of typical ingredients/quantities to approximate from what you see. Only leave a macro field \"\" if there is literally no information about ingredients.
 - Return JSON only. Read all text visible across the images. Merge ingredients and instructions from all pages into one recipe."""
@@ -2048,12 +2059,122 @@ Rules:
     return json.loads(completion.choices[0].message.content)
 
 
-def _ensure_recipe_cuisine(recipe: dict) -> str:
-    """Ensure recipe has a cuisine field; return normalized cuisine string for response."""
+# Allowed values for /extract-recipe response attributes
+MEAL_TYPES = ("Breakfast", "Lunch", "Dinner", "Snack")
+CUISINES = ("Italian", "Mexican", "American", "Asian", "Mediterranean", "Indian", "Chinese", "Japanese", "Thai", "Middle Eastern")
+DIET_FLAGS = ("High Protein", "High Fiber", "Low Carb", "Keto", "Vegetarian", "Vegan", "Gluten Free", "Balanced")
+
+
+def normalize_meal_type(raw: str) -> str:
+    """Map free-text meal type to one of Breakfast, Lunch, Dinner, Snack."""
+    if not raw or not isinstance(raw, str):
+        return "Dinner"  # default
+    s = raw.strip().lower()
+    if not s:
+        return "Dinner"
+    if s in ("breakfast", "brunch") or "breakfast" in s or "brunch" in s:
+        return "Breakfast"
+    if s in ("lunch", "brunch") or "lunch" in s:
+        return "Lunch"
+    if s in ("dinner", "supper", "main") or "dinner" in s or "supper" in s:
+        return "Dinner"
+    if s in ("snack", "appetizer", "appetiser", "side", "dessert") or "snack" in s:
+        return "Snack"
+    return "Dinner"
+
+
+def normalize_cuisine(raw: str) -> str:
+    """Map free-text cuisine to one of the allowed CUISINES."""
+    if not raw or not isinstance(raw, str):
+        return "American"
+    s = raw.strip().lower()
+    if not s:
+        return "American"
+    # Direct and fuzzy matches
+    mapping = [
+        ("italian", "Italian"), ("mexican", "Mexican"), ("american", "American"),
+        ("asian", "Asian"), ("mediterranean", "Mediterranean"), ("indian", "Indian"),
+        ("chinese", "Chinese"), ("japanese", "Japanese"), ("japenese", "Japanese"),
+        ("thai", "Thai"), ("middle eastern", "Middle Eastern"), ("middle east", "Middle Eastern"),
+        ("korean", "Asian"), ("vietnamese", "Asian"), ("greek", "Mediterranean"),
+        ("spanish", "Mediterranean"), ("french", "Mediterranean"),
+    ]
+    for key, value in mapping:
+        if key in s or s in key:
+            return value
+    # Fallback: if single word might be cuisine, try match
+    for c in CUISINES:
+        if c.lower() in s or s in c.lower():
+            return c
+    return "American"
+
+
+def extract_recipe_diet_flags(recipe: dict) -> list[str]:
+    """Return diet flags from fixed set: High Protein, High Fiber, Low Carb, Keto, Vegetarian, Vegan, Gluten Free, Balanced."""
+    flags = []
     if not recipe:
-        return ""
-    recipe["cuisine"] = (recipe.get("cuisine") or "").strip()
-    return recipe["cuisine"]
+        return flags
+    ingredients = recipe.get("ingredients", [])
+    nutrition = recipe.get("nutrition") or {}
+    ingredient_names = []
+    for ing in ingredients:
+        if isinstance(ing, dict):
+            ingredient_names.append(ing.get("name", "").lower())
+        elif isinstance(ing, str):
+            ingredient_names.append(ing.lower())
+    ingredient_text = " ".join(ingredient_names)
+
+    # Vegetarian (no meat/fish/poultry)
+    meat_keywords = ["chicken", "beef", "pork", "lamb", "turkey", "duck", "fish", "salmon", "tuna", "shrimp", "crab", "lobster", "meat", "bacon", "sausage", "ham", "steak"]
+    if not any(k in ingredient_text for k in meat_keywords) and ingredient_text:
+        flags.append("Vegetarian")
+
+    # Vegan (no animal products)
+    animal_keywords = meat_keywords + ["milk", "cheese", "butter", "cream", "yogurt", "egg", "honey", "gelatin", "whey", "casein"]
+    if not any(k in ingredient_text for k in animal_keywords) and ingredient_text:
+        flags.append("Vegan")
+
+    # High Protein
+    protein_val = nutrition.get("protein") or nutrition.get("proteinContent") or nutrition.get("protein_g")
+    if isinstance(protein_val, str):
+        match = re.search(r"(\d+\.?\d*)", protein_val)
+        protein_val = float(match.group(1)) if match else None
+    high_protein_ings = ["chicken", "beef", "turkey", "fish", "salmon", "tuna", "eggs", "tofu", "tempeh", "lentils", "beans", "chickpeas", "quinoa", "greek yogurt", "cottage cheese", "protein powder"]
+    if (protein_val and protein_val > 20) or any(ing in ingredient_text for ing in high_protein_ings):
+        flags.append("High Protein")
+
+    # High Fiber
+    fiber_ings = ["oats", "lentils", "beans", "chickpeas", "quinoa", "barley", "broccoli", "avocado", "chia", "flax", "whole grain", "brown rice"]
+    if any(ing in ingredient_text for ing in fiber_ings):
+        flags.append("High Fiber")
+
+    # Low Carb / Keto (heuristic: few grains/sugar)
+    carb_heavy = ["flour", "pasta", "rice", "bread", "sugar", "potato", "oat", "quinoa", "corn", "beans"]
+    carb_count = sum(1 for c in carb_heavy if c in ingredient_text)
+    if carb_count <= 1 and ingredient_text:
+        flags.append("Low Carb")
+    if carb_count <= 1 and any(f in ingredient_text for f in ["avocado", "cheese", "cream", "olive oil", "coconut"]):
+        flags.append("Keto")
+
+    # Gluten Free (no wheat, barley, rye)
+    if not any(g in ingredient_text for g in ["wheat", "flour", "barley", "rye", "bread", "pasta", "couscous"]):
+        flags.append("Gluten Free")
+
+    # Balanced (default if nothing else or general)
+    if not flags or len(flags) >= 2:
+        flags.append("Balanced")
+
+    # Return only from allowed set, deduplicated, order preserved
+    return list(dict.fromkeys(f for f in flags if f in DIET_FLAGS))
+
+
+def _enrich_recipe_response(recipe: dict) -> None:
+    """Set meal_type, cuisine (normalized), and diet_flags on recipe for /extract-recipe response."""
+    if not recipe:
+        return
+    recipe["meal_type"] = normalize_meal_type(recipe.get("meal_type"))
+    recipe["cuisine"] = normalize_cuisine(recipe.get("cuisine"))
+    recipe["diet_flags"] = extract_recipe_diet_flags(recipe)
 
 
 @app.route("/extract-recipe", methods=["POST"])
@@ -2066,7 +2187,7 @@ def extract_recipe():
     if image_data_urls:
         try:
             recipe = extract_recipe_from_images_llm(image_data_urls)
-            cuisine = _ensure_recipe_cuisine(recipe)
+            _enrich_recipe_response(recipe)
             tags = extract_recipe_tags(recipe)
             source = {
                 "type": "image",
@@ -2135,7 +2256,7 @@ def extract_recipe():
 
         # Determine source type and extract tags
         source_type = determine_source_type(url)
-        cuisine = _ensure_recipe_cuisine(recipe)
+        _enrich_recipe_response(recipe)
         tags = extract_recipe_tags(recipe)
         
         source = {
@@ -2220,6 +2341,7 @@ Return ONLY valid JSON matching:
   "cook_time": "",
   "total_time": "",
   "notes": [],
+  "meal_type": "",
   "cuisine": "",
   "nutrition": {
     "calories": "",
@@ -2230,6 +2352,7 @@ Return ONLY valid JSON matching:
 }
 Rules:
 - Don't hallucinate for the structure. If fields like servings or times are unknown, use "" or [].
+- meal_type: exactly one of Breakfast, Lunch, Dinner, Snack (infer from context).
 - Infer cuisine from recipe name, ingredients, or speaker context when evident (e.g. Italian, Mexican, Indian); otherwise use "".
 - Ingredients must include quantities when stated; else quantity "".
 - Instructions must be actionable, chronological, and detailed.
@@ -2278,6 +2401,7 @@ Return ONLY valid JSON matching:
   "cook_time": "",
   "total_time": "",
   "notes": [],
+  "meal_type": "",
   "cuisine": "",
   "nutrition": {
     "calories": "",
@@ -2290,6 +2414,7 @@ Rules:
 - Deduplicate ingredients case-insensitively; keep most specific quantity.
 - Remove duplicate steps, ensure correct chronological order.
 - Ensure steps are detailed and actionable.
+- For meal_type: use the first non-empty from parts (one of Breakfast, Lunch, Dinner, Snack); if none, use "Dinner".
 - For cuisine: use the first non-empty cuisine from the parts; if none, use "".
 - Merge/average any provided nutrition macros (calories, protein_g, carbs_g, fat_g) into a single best-effort estimate PER SERVING. If some parts omit macros, use available information from other parts. Only leave a macro field \"\" if ALL parts lack enough information.
 - Output JSON only."""
@@ -2735,7 +2860,7 @@ def extract_recipe_from_video_internal(video_url: str):
             print("⚠️ Could not extract audio from video; using frame+vision fallback...")
             recipe, source, extraction_method = _run_frame_vision_fallback_from_path(video_path, video_url, meta)
             if recipe and source:
-                cuisine = _ensure_recipe_cuisine(recipe)
+                _enrich_recipe_response(recipe)
                 tags = extract_recipe_tags(recipe)
                 return jsonify({
                     "source": source,
@@ -2767,7 +2892,7 @@ def extract_recipe_from_video_internal(video_url: str):
             print("🎬 No usable recipe instructions from audio; using frame+vision fallback (reusing video)...")
             recipe, source, extraction_method = _run_frame_vision_fallback_from_path(video_path, video_url, meta)
             if recipe and source:
-                cuisine = _ensure_recipe_cuisine(recipe)
+                _enrich_recipe_response(recipe)
                 tags = extract_recipe_tags(recipe)
                 return jsonify({
                     "source": source,
@@ -2790,7 +2915,7 @@ def extract_recipe_from_video_internal(video_url: str):
             print("🎬 No chunks from transcript; using frame+vision fallback (reusing video)...")
             recipe, source, extraction_method = _run_frame_vision_fallback_from_path(video_path, video_url, meta)
             if recipe and source:
-                cuisine = _ensure_recipe_cuisine(recipe)
+                _enrich_recipe_response(recipe)
                 tags = extract_recipe_tags(recipe)
                 return jsonify({
                     "source": source,
@@ -2823,7 +2948,7 @@ def extract_recipe_from_video_internal(video_url: str):
             print(f"⚠️ Transcript chunk extraction failed (chunk {chunk_failed['idx']}); using frame+vision fallback (reusing video)...")
             recipe, source, extraction_method = _run_frame_vision_fallback_from_path(video_path, video_url, meta)
             if recipe and source:
-                cuisine = _ensure_recipe_cuisine(recipe)
+                _enrich_recipe_response(recipe)
                 tags = extract_recipe_tags(recipe)
                 return jsonify({
                     "source": source,
@@ -2866,7 +2991,7 @@ def extract_recipe_from_video_internal(video_url: str):
             if fallback_recipe and fallback_source and (
                 fallback_recipe.get("instructions") or fallback_recipe.get("ingredients")
             ):
-                cuisine = _ensure_recipe_cuisine(fallback_recipe)
+                _enrich_recipe_response(fallback_recipe)
                 tags = extract_recipe_tags(fallback_recipe)
                 return jsonify({
                     "source": fallback_source,
@@ -2882,7 +3007,7 @@ def extract_recipe_from_video_internal(video_url: str):
                 video_path, video_url, meta
             )
             if fallback_recipe and fallback_source:
-                cuisine = _ensure_recipe_cuisine(fallback_recipe)
+                _enrich_recipe_response(fallback_recipe)
                 tags = extract_recipe_tags(fallback_recipe)
                 return jsonify({
                     "source": fallback_source,
@@ -2894,7 +3019,7 @@ def extract_recipe_from_video_internal(video_url: str):
                 }), 200
 
         source_type = determine_source_type(video_url)
-        cuisine = _ensure_recipe_cuisine(recipe)
+        _enrich_recipe_response(recipe)
         tags = extract_recipe_tags(recipe)
         source = {
             "type": "video",

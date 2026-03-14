@@ -30,7 +30,10 @@
   - **URL:** JSON `url` or `videoUrl` or `recipeUrl` (+ optional `mode`: `"auto"` | `"video"` | `"webpage"`).
 - **Output (success):** JSON with:
   - `source` — `type`, `url`, `provider`, `title`, `image`, `source_type`
-  - `recipe` — `name`, `ingredients[]`, `instructions[]`, `servings`, `prep_time`, `cook_time`, `total_time`, `notes[]`, `cuisine`
+  - `recipe` — `name`, `ingredients[]`, `instructions[]`, `servings`, `prep_time`, `cook_time`, `total_time`, `notes[]`, `meal_type`, `cuisine`, `diet_flags`
+  - `meal_type` — one of: Breakfast, Lunch, Dinner, Snack
+  - `cuisine` — one of: Italian, Mexican, American, Asian, Mediterranean, Indian, Chinese, Japanese, Thai, Middle Eastern
+  - `diet_flags` — subset of: High Protein, High Fiber, Low Carb, Keto, Vegetarian, Vegan, Gluten Free, Balanced
   - `tags` — e.g. High Protein, Vegetarian, Vegan, Quick, Easy
   - `transcript` — only for video when transcript path is used; else `null`
   - `extraction` — `method`, `confidence`

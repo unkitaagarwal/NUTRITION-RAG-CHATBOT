@@ -3,14 +3,17 @@ from langchain_community.vectorstores import Chroma
 from langchain_openai import ChatOpenAI
 from langchain_openai import OpenAIEmbeddings
 from langchain.chains import RetrievalQA
-from firebase_utils import get_user_context, get_user_chat_history, save_user_chat
+from firebase_utils import get_user_context, get_user_chat_history, save_user_chat, init_firestore
 from dotenv import load_dotenv
 import os
+import csv
 import io
 import json
 import re
 import base64
 import tempfile
+from datetime import datetime, timedelta
+import uuid
 from openai import OpenAI
 from threading import Thread
 import yt_dlp
@@ -2168,13 +2171,258 @@ def extract_recipe_diet_flags(recipe: dict) -> list[str]:
     return list(dict.fromkeys(f for f in flags if f in DIET_FLAGS))
 
 
+def _short_recipe_description(recipe: dict) -> str:
+    """
+    Build a short, one-line summary of the recipe (max 100 chars) for /extract-recipe response.
+    Uses recipe name + diet/style flags. Ends with a full stop; no ellipsis.
+    """
+    if not recipe:
+        return ""
+    name = (recipe.get("name") or "").strip()
+    diet_flags = recipe.get("diet_flags") or []
+    diet_words = " ".join(str(d).lower() for d in diet_flags if d).strip()
+    if diet_words and name:
+        desc = f"{diet_words} {name}"
+    elif name:
+        desc = name
+    else:
+        desc = diet_words or "Recipe"
+    desc = re.sub(r"\s+", " ", desc).strip()
+    if len(desc) > 100:
+        desc = desc[:99].rstrip()
+        if desc and not desc.endswith("."):
+            desc = desc + "."
+    elif desc and not desc.endswith("."):
+        desc = desc + "."
+    return desc
+
+
 def _enrich_recipe_response(recipe: dict) -> None:
-    """Set meal_type, cuisine (normalized), and diet_flags on recipe for /extract-recipe response."""
+    """Set meal_type, cuisine (normalized), diet_flags, and description on recipe for /extract-recipe response."""
     if not recipe:
         return
     recipe["meal_type"] = normalize_meal_type(recipe.get("meal_type"))
     recipe["cuisine"] = normalize_cuisine(recipe.get("cuisine"))
     recipe["diet_flags"] = extract_recipe_diet_flags(recipe)
+    recipe["description"] = _short_recipe_description(recipe)
+
+
+def _guess_difficulty_from_tags(tags: list[str]) -> str:
+    tags = [t.lower() for t in (tags or [])]
+    if "easy" in tags:
+        return "Easy"
+    if "medium" in tags:
+        return "Medium"
+    if "hard" in tags:
+        return "Hard"
+    return "Easy"
+
+
+def _time_str_to_minutes_for_cook_time(time_str: str) -> int:
+    """
+    Convert a human-readable time string into minutes (numeric only for cookTime).
+    Handles formats like '20 mins', '1 hr 30 mins', '45 min', '2 hours', 'PT30M'.
+    """
+    if not time_str:
+        return 0
+    s = str(time_str).strip().lower()
+    if not s:
+        return 0
+
+    total = 0
+
+    # Hours
+    m = re.search(r"(\d+)\s*(h|hr|hrs|hour|hours)", s)
+    if m:
+        total += int(m.group(1)) * 60
+
+    # Minutes
+    m = re.search(r"(\d+)\s*(m|min|mins|minute|minutes)", s)
+    if m:
+        total += int(m.group(1))
+
+    # ISO 8601 PTxxHxxM
+    if s.startswith("pt"):
+        h = re.search(r"(\d+)h", s)
+        m2 = re.search(r"(\d+)m", s)
+        if h:
+            total += int(h.group(1)) * 60
+        if m2:
+            total += int(m2.group(1))
+
+    # Fallback: if still zero, try to parse first integer as minutes
+    if total == 0:
+        m = re.search(r"(\d+)", s)
+        if m:
+            total = int(m.group(1))
+
+    return total
+
+
+@app.route("/bulk-import-recipes", methods=["POST"])
+def bulk_import_recipes():
+    """
+    Bulk operations for recipes using the recipe-log collection.
+
+    - Default behavior (no `action`): accept a CSV file (form field `file`)
+      with a `recipe_url` column. For each row, call /extract-recipe with that
+      URL and save the result into the Firestore `recipe-log` collection.
+
+    - Delete behavior (`action=delete` + `createdDate=YYYY-MM-DD`): delete all
+      recipe-log documents whose createdAt falls on that date (UTC).
+    """
+    action = (request.form.get("action") or "").strip().lower()
+    created_date_str = (request.form.get("createdDate") or "").strip()
+
+    db = init_firestore()
+    collection = db.collection("recipe-log")
+
+    # If action=delete, delete all entries for that created date and return.
+    if action == "delete":
+        if not created_date_str:
+            return jsonify({"error": "createdDate is required when action=delete (format: YYYY-MM-DD)"}), 400
+        try:
+            day = datetime.fromisoformat(created_date_str).date()
+        except ValueError:
+            return jsonify({"error": "createdDate must be in YYYY-MM-DD format"}), 400
+
+        start = datetime(day.year, day.month, day.day)
+        end = start + timedelta(days=1)
+
+        docs = collection.where("createdAt", ">=", start).where("createdAt", "<", end).stream()
+        deleted = 0
+        for doc in docs:
+            doc.reference.delete()  
+            deleted += 1
+
+        return jsonify({
+            "action": "delete",
+            "createdDate": created_date_str,
+            "deleted": deleted,
+        })
+
+    # Existing behavior: CSV import
+    file = request.files.get("file")
+    if not file:
+        return jsonify({"error": "CSV file is required (field name: 'file')"}), 400
+
+    try:
+        content = file.read().decode("utf-8")
+    except Exception:
+        return jsonify({"error": "Failed to read CSV file; must be UTF-8 text"}), 400
+
+    reader = csv.DictReader(io.StringIO(content))
+    if "recipe_url" not in reader.fieldnames:
+        return jsonify({"error": "CSV must contain a 'recipe_url' column"}), 400
+
+    # Base URL for this service (can point to Render, etc.)
+    base_url = os.getenv("EXTRACT_RECIPE_BASE_URL", "http://localhost:5002")
+
+    imported = 0
+    failed = []
+
+    for idx, row in enumerate(reader, start=1):
+        url = (row.get("recipe_url") or "").strip()
+        if not url:
+            failed.append({"row": idx, "reason": "Empty recipe_url"})
+            continue
+
+        try:
+            resp = requests.post(
+                f"{base_url}/extract-recipe",
+                json={"url": url, "mode": "auto"},
+                timeout=120,
+            )
+        except Exception as e:
+            failed.append({"row": idx, "url": url, "reason": f"Request error: {e}"})
+            continue
+
+        try:
+            data = resp.json()
+        except Exception:
+            failed.append({"row": idx, "url": url, "reason": "Non-JSON response from /extract-recipe"})
+            continue
+
+        if not resp.ok or not data.get("recipe"):
+            failed.append({
+                "row": idx,
+                "url": url,
+                "reason": data.get("user_message") or data.get("error") or "extract-recipe failed",
+            })
+            continue
+
+        recipe = data["recipe"]
+        source = data.get("source") or {}
+        tags = data.get("tags") or []
+
+        # Ensure enrichment (just in case /extract-recipe behavior changes)
+        _enrich_recipe_response(recipe)
+
+        # Map to Firestore recipe-log schema (as per screenshot)
+        recipe_id = str(uuid.uuid4())
+        title = (recipe.get("name") or "").strip()
+        cook_time_str = recipe.get("cook_time") or recipe.get("total_time", "")
+        cook_time_minutes = _time_str_to_minutes_for_cook_time(cook_time_str)
+
+        # Short description (max 100 chars, ends with full stop; already set by _enrich_recipe_response)
+        desc = (recipe.get("description") or title or "").strip()
+        if len(desc) > 100:
+            desc = desc[:99].rstrip()
+            if desc and not desc.endswith("."):
+                desc = desc + "."
+        elif desc and not desc.endswith("."):
+            desc = desc + "."
+
+        # Steps: Firestore format [{ instruction, order, duration }, ...] (plain text, no "1.", "2." in instruction)
+        raw_instructions = recipe.get("instructions") or []
+        steps = []
+        for i, raw in enumerate(raw_instructions, start=1):
+            text = (raw.get("instruction", raw) if isinstance(raw, dict) else str(raw)).strip()
+            # Strip leading "1. ", "Step 1: ", etc.
+            text = re.sub(r"^(?:\d+[.)]\s*|step\s*\d+\s*[.:]\s*)", "", text, flags=re.IGNORECASE).strip()
+            steps.append({
+                "instruction": text,
+                "order": i,
+                "duration": None,
+            })
+
+        doc = {
+            "recipeId": recipe_id,
+            "category": recipe.get("meal_type", "Dinner"),
+            "cookTime": cook_time_minutes,
+            "createdAt": datetime.utcnow(),
+            "title": title,
+            "description": desc,
+            "difficulty": _guess_difficulty_from_tags(tags),
+            "imageUrl": source.get("image") or "",
+            "ingredients": [
+                {
+                    "name": ing.get("name", ""),
+                    "amount": ing.get("quantity", ""),
+                }
+                for ing in (recipe.get("ingredients") or [])
+                if isinstance(ing, dict)
+            ],
+            "isFavorite": False,
+            "nutrition": recipe.get("nutrition") or {},
+            "steps": steps,
+            "sourceUrl": source.get("url") or url,
+            "cuisine": recipe.get("cuisine", ""),
+            "dietFlags": recipe.get("diet_flags", []),
+            "tags": tags,
+        }
+
+        try:
+            # Store under deterministic recipeId so each recipe has a stable ID
+            collection.document(recipe_id).set(doc)
+            imported += 1
+        except Exception as e:
+            failed.append({"row": idx, "url": url, "reason": f"Firestore error: {e}"})
+
+    return jsonify({
+        "imported": imported,
+        "failed": failed,
+    })
 
 
 @app.route("/extract-recipe", methods=["POST"])

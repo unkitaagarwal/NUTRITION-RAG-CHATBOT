@@ -30,7 +30,7 @@
   - **URL:** JSON `url` or `videoUrl` or `recipeUrl` (+ optional `mode`: `"auto"` | `"video"` | `"webpage"`).
 - **Output (success):** JSON with:
   - `source` — `type`, `url`, `provider`, `title`, `image`, `source_type`
-  - `recipe` — `name`, `ingredients[]`, `instructions[]`, `servings`, `prep_time`, `cook_time`, `total_time`, `notes[]`, `meal_type`, `cuisine`, `diet_flags`
+  - `recipe` — `name`, `description` (short one-line summary, max 100 chars, ends with full stop), `ingredients[]`, `instructions[]`, `servings`, `prep_time`, `cook_time`, `total_time`, `notes[]`, `meal_type`, `cuisine`, `diet_flags`
   - `meal_type` — one of: Breakfast, Lunch, Dinner, Snack
   - `cuisine` — one of: Italian, Mexican, American, Asian, Mediterranean, Indian, Chinese, Japanese, Thai, Middle Eastern
   - `diet_flags` — subset of: High Protein, High Fiber, Low Carb, Keto, Vegetarian, Vegan, Gluten Free, Balanced

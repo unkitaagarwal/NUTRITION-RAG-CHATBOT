@@ -65,3 +65,4 @@ vector_store/
 # Temporary files
 *.tmp
 *.tempfirebase_service_account_mealmap.json
+firebase_service_account_mealmap.json

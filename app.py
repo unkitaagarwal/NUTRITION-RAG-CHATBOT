@@ -2071,10 +2071,10 @@ DIET_FLAGS = ("High Protein", "High Fiber", "Low Carb", "Keto", "Vegetarian", "V
 def normalize_meal_type(raw: str) -> str:
     """Map free-text meal type to one of Breakfast, Lunch, Dinner, Snack."""
     if not raw or not isinstance(raw, str):
-        return "Dinner"  # default
+        return "Lunch / Dinner"  # default
     s = raw.strip().lower()
     if not s:
-        return "Dinner"
+        return "Lunch / Dinner"
     if s in ("breakfast", "brunch") or "breakfast" in s or "brunch" in s:
         return "Breakfast"
     if s in ("lunch", "brunch") or "lunch" in s:
@@ -2083,7 +2083,7 @@ def normalize_meal_type(raw: str) -> str:
         return "Dinner"
     if s in ("snack", "appetizer", "appetiser", "side", "dessert") or "snack" in s:
         return "Snack"
-    return "Dinner"
+    return "Lunch / Dinner"
 
 
 def normalize_cuisine(raw: str) -> str:

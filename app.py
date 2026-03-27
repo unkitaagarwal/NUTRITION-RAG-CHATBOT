@@ -15,7 +15,8 @@ import tempfile
 from datetime import datetime, timedelta
 import uuid
 from openai import OpenAI
-from threading import Thread
+from threading import Thread, Lock
+from collections import defaultdict
 import yt_dlp
 import shutil
 import time
@@ -34,6 +35,11 @@ load_dotenv()
 # Initialize OpenAI client for voice functionality
 client = OpenAI()
 app = Flask(__name__)
+
+# In-memory de-dup memory for /recommend-meals/day calls per plan_id.
+# This keeps day plans distinct for sequential calls using the same plan_id.
+_plan_meal_name_history = defaultdict(set)
+_plan_meal_history_lock = Lock()
 
 # Initialize once
 # ---------- Config ----------
@@ -760,6 +766,997 @@ def speak():
     )
     audio_stream = io.BytesIO(response.read())
     return send_file(audio_stream, mimetype="audio/mpeg")
+
+
+def _get_meal_keys(num_meals: int) -> list[str]:
+    """
+    Return canonical meal keys for dynamic meal count.
+    First four keys are breakfast/lunch/dinner/snacks, extras are snacks_2, snacks_3, ...
+    """
+    base = ["breakfast", "lunch", "dinner", "snacks"]
+    if num_meals <= 4:
+        return base[:num_meals]
+    extra = [f"snacks_{i}" for i in range(2, num_meals - 4 + 2)]
+    return base + extra
+
+
+def _meal_type_from_key(meal_key: str) -> str:
+    if meal_key == "breakfast":
+        return "Breakfast"
+    if meal_key == "lunch":
+        return "Lunch"
+    if meal_key == "dinner":
+        return "Dinner"
+    return "Snack"
+
+
+def _chat_completion_limit_kw(model: str, max_tokens: int) -> dict:
+    """
+    Some newer OpenAI chat models reject max_tokens and require max_completion_tokens.
+    """
+    m = (model or "").lower()
+    if m.startswith("gpt-5") or m.startswith("o1") or m.startswith("o3"):
+        return {"max_completion_tokens": max_tokens}
+    return {"max_tokens": max_tokens}
+
+
+def _recommend_llm_completion_budget(model: str, base_max: int) -> int:
+    """
+    GPT-5 / o-series may use much of max_completion_tokens for internal reasoning before
+    emitting visible JSON; small budgets can yield empty message.content.
+    """
+    m = (model or "").lower()
+    if m.startswith("gpt-5") or m.startswith("o1") or m.startswith("o3"):
+        return max(base_max, 4096)
+    return base_max
+
+
+def _model_prefers_completion_token_param(model: str) -> bool:
+    m = (model or "").lower()
+    return m.startswith("gpt-5") or m.startswith("o1") or m.startswith("o3")
+
+
+def _chat_response_message_text(completion) -> str:
+    try:
+        msg = completion.choices[0].message
+        if msg and msg.content:
+            return str(msg.content).strip()
+    except (IndexError, AttributeError, TypeError):
+        pass
+    return ""
+
+
+def _meal_has_name(meal: object) -> bool:
+    return isinstance(meal, dict) and bool(str(meal.get("name", "")).strip())
+
+
+def _unwrap_recommend_day_payload(day_obj: dict, meal_keys: list[str], day_number: int) -> dict:
+    """
+    Models sometimes return weekly-shaped JSON:
+      { "days": [ { "breakfast": {...}, ... } ], "daily_macro_targets": ... }
+    with empty top-level meal slots. Prefer the inner day object when it has the real meals.
+    """
+    if not isinstance(day_obj, dict):
+        return day_obj
+    days_arr = day_obj.get("days")
+    if not isinstance(days_arr, list) or not days_arr:
+        return day_obj
+    first = days_arr[0]
+    if not isinstance(first, dict):
+        return day_obj
+
+    def score(d: dict) -> int:
+        return sum(1 for k in meal_keys if _meal_has_name(d.get(k)))
+
+    if score(first) > score(day_obj):
+        out = dict(first)
+        out["day"] = out.get("day", day_number)
+        return out
+    return day_obj
+
+
+def _log_recommend_api_request(route_label: str, data: dict) -> None:
+    """
+    Print request URL, method, and JSON body to server stdout (terminal).
+    Set LOG_API_REQUESTS=1 (or true) in the environment to enable.
+    """
+    if os.getenv("LOG_API_REQUESTS", "").lower() not in ("1", "true", "yes"):
+        return
+    try:
+        print(f"\n[{route_label}] ========== incoming request ==========")
+        print(f"[{route_label}] {request.method} {request.url}")
+        print(f"[{route_label}] remote: {request.remote_addr}")
+        ct = request.headers.get("Content-Type", "")
+        print(f"[{route_label}] Content-Type: {ct}")
+        body = json.dumps(data, ensure_ascii=False, indent=2)
+        if len(body) > 16000:
+            body = body[:16000] + "\n... [truncated]"
+        print(f"[{route_label}] JSON body:\n{body}")
+        print(f"[{route_label}] ========== end request ==========\n")
+    except Exception as e:
+        print(f"[{route_label}] logging error: {e}")
+
+
+@app.route("/recommend-meals", methods=["POST"])
+def recommend_meals():
+    """
+    Generate a multi-day meal plan with dynamic num_days and num_meals.
+    """
+    data = request.get_json(silent=True) or {}
+    _log_recommend_api_request("recommend-meals", data)
+
+    # Accept both spellings to be resilient with client payloads.
+    dietary_preferences = data.get("dietary_preferences", data.get("dietry_pref", []))
+    dietary_restrictions = data.get("dietary_restrictions", data.get("dietry_restr", []))
+    # Performance-first defaults for mobile UX:
+    # - include_images defaults to False (image generation is the slowest part)
+    # - fast_mode defaults to True (single attempt/day, lower token budget)
+    include_images = data.get("include_images", False)
+    include_steps = data.get("include_steps", True)
+    include_macros = data.get("include_macros", True)
+    if include_steps is None:
+        include_steps = True
+    if include_macros is None:
+        include_macros = True
+    include_steps = bool(include_steps)
+    include_macros = bool(include_macros)
+    fast_mode = data.get("fast_mode", True)
+    strict_calorie_alignment = data.get("strict_calorie_alignment", True)
+    if strict_calorie_alignment is None:
+        strict_calorie_alignment = True
+    strict_calorie_alignment = bool(strict_calorie_alignment)
+    recommend_model = os.getenv("RECOMMEND_MEALS_MODEL", "gpt-5.4-mini")
+    num_meals = int(data.get("num_meals", 4))
+    if num_meals < 1 or num_meals > 8:
+        return jsonify({"error": "num_meals must be between 1 and 8"}), 400
+    num_days = int(data.get("num_days", 7))
+    if num_days < 1 or num_days > 30:
+        return jsonify({"error": "num_days must be between 1 and 30"}), 400
+    meal_keys = _get_meal_keys(num_meals)
+    plan_id = data.get("plan_id") or str(uuid.uuid4())
+    default_image_url = data.get("default_image_url") or os.getenv(
+        "DEFAULT_MEAL_IMAGE_URL",
+        "https://images.unsplash.com/photo-1498837167922-ddd27525d352?auto=format&fit=crop&w=1200&q=80",
+    )
+
+    required_fields = [
+        "goal", "gender", "age", "height_cm", "weight_kg",
+        "target_weight_kg", "activity_level"
+    ]
+    missing = [f for f in required_fields if data.get(f) in (None, "")]
+    if missing:
+        return jsonify({
+            "error": "Missing required fields",
+            "missing_fields": missing,
+        }), 400
+
+    if not isinstance(dietary_preferences, list):
+        return jsonify({"error": "dietary_preferences (or dietry_pref) must be an array"}), 400
+    if not isinstance(dietary_restrictions, list):
+        return jsonify({"error": "dietary_restrictions (or dietry_restr) must be an array"}), 400
+
+    meal_split_percent = data.get("meal_split_percent")
+    if not isinstance(meal_split_percent, dict):
+        even = round(1.0 / len(meal_keys), 4)
+        meal_split_percent = {k: even for k in meal_keys}
+    for k in meal_keys:
+        if k not in meal_split_percent:
+            meal_split_percent[k] = 0.0
+
+    # Estimate daily calorie/macronutrient targets before generation.
+    def _calculate_daily_targets(payload: dict) -> dict:
+        goal = str(payload.get("goal", "maintain")).lower()
+        gender = str(payload.get("gender", "other")).lower()
+        age = float(payload.get("age", 25))
+        height_cm = float(payload.get("height_cm", 170))
+        weight_kg = float(payload.get("weight_kg", 70))
+        target_weight_kg = float(payload.get("target_weight_kg", weight_kg))
+        activity_level = str(payload.get("activity_level", "lightly_active")).lower()
+
+        # Mifflin-St Jeor BMR constants
+        if gender == "male":
+            s = 5
+        elif gender == "female":
+            s = -161
+        else:
+            s = -78  # midpoint approximation for non-binary/other
+
+        bmr = 10 * weight_kg + 6.25 * height_cm - 5 * age + s
+
+        activity_multipliers = {
+            "not_active": 1.2,
+            "lightly_active": 1.375,
+            "active": 1.55,
+            "very_active": 1.725,
+        }
+        tdee = bmr * activity_multipliers.get(activity_level, 1.375)
+
+        # Goal adjustment
+        if goal == "fat_loss":
+            calories = tdee - 450
+        elif goal == "muscle_gain":
+            calories = tdee + 300
+        else:
+            calories = tdee
+
+        # Sensible floor
+        min_cals = 1500 if gender == "male" else 1200
+        calories = max(calories, min_cals)
+
+        # Macro split
+        # Protein scaled by goal (g/kg), fat baseline 0.8 g/kg, carbs fill remainder.
+        protein_per_kg = 1.8 if goal == "fat_loss" else (2.0 if goal == "muscle_gain" else 1.6)
+        protein_g = protein_per_kg * target_weight_kg
+        fat_g = 0.8 * target_weight_kg
+
+        protein_kcal = protein_g * 4
+        fat_kcal = fat_g * 9
+        carbs_kcal = max(calories - protein_kcal - fat_kcal, calories * 0.25)
+        carbs_g = carbs_kcal / 4
+
+        return {
+            "calories": round(calories),
+            "protein_g": round(protein_g),
+            "carbs_g": round(carbs_g),
+            "fat_g": round(fat_g),
+            "bmr": round(bmr),
+            "tdee": round(tdee),
+        }
+
+    target_macros = data.get("target_daily_intake")
+    if target_macros is None:
+        target_macros = _calculate_daily_targets(data)
+    elif not isinstance(target_macros, dict):
+        return jsonify({"error": "target_daily_intake must be an object when provided"}), 400
+
+    def _to_float(v):
+        try:
+            return float(v)
+        except Exception:
+            return 0.0
+
+    target_macros = {
+        "calories": round(_to_float(target_macros.get("calories", 0)), 0),
+        "protein_g": round(_to_float(target_macros.get("protein_g", 0)), 1),
+        "carbs_g": round(_to_float(target_macros.get("carbs_g", 0)), 1),
+        "fat_g": round(_to_float(target_macros.get("fat_g", 0)), 1),
+        "bmr": round(_to_float(target_macros.get("bmr", 0)), 0) if "bmr" in target_macros else None,
+        "tdee": round(_to_float(target_macros.get("tdee", 0)), 0) if "tdee" in target_macros else None,
+    }
+
+    meal_schema_keys = ", ".join([f"\"{k}\": {{...}}" for k in meal_keys])
+    meal_names = ", ".join(meal_keys)
+    meal_fields_parts = ["name", "description", "ingredients (array)", "cook_time_min (number)", "cuisine", "meal_type"]
+    if include_macros:
+        meal_fields_parts = [
+            "name",
+            "description",
+            "calories",
+            "protein_g",
+            "carbs_g",
+            "fat_g",
+            "ingredients (array)",
+            "cook_time_min (number)",
+            "cuisine",
+            "meal_type",
+        ]
+    if include_steps:
+        meal_fields_parts.append("steps (array)")
+    meal_fields_line = ", ".join(meal_fields_parts)
+    steps_rule = (
+        "Include steps array per meal (max 4 short steps each)."
+        if include_steps
+        else "Do NOT include a steps field for any meal."
+    )
+    macros_rule = (
+        "Include per-meal calories, protein_g, carbs_g, fat_g (numeric)."
+        if include_macros
+        else "Do NOT include calories, protein_g, carbs_g, or fat_g on any meal."
+    )
+
+    system_prompt = (
+        "You are an expert nutritionist and meal planner.\n"
+        "Return ONLY valid JSON (no markdown, no commentary).\n"
+        f"Build a {num_days}-day plan with {num_meals} meals per day using these keys: {meal_names}.\n"
+        "Meals must align with the user's goal, demographics, body stats, activity level, dietary preferences, and dietary restrictions.\n"
+        "Keep meals practical and realistic.\n"
+        f"For each meal include ONLY these fields: {meal_fields_line}.\n"
+        f"{macros_rule}\n"
+        f"{steps_rule}\n\n"
+        "Output schema:\n"
+        "{\n"
+        '  "days": [\n'
+        "    {\n"
+        '      "day": 1,\n'
+        f"      {meal_schema_keys}\n"
+        "    }\n"
+        "  ],\n"
+        '  "daily_macro_targets": {\n'
+        '    "calories": 0,\n'
+        '    "protein_g": 0,\n'
+        '    "carbs_g": 0,\n'
+        '    "fat_g": 0\n'
+        "  },\n"
+        '  "notes": []\n'
+        "}\n\n"
+        "Rules:\n"
+        f'- Exactly {num_days} day objects in "days".\n'
+        f"- Day values must be 1..{num_days}.\n"
+        "- Use numeric values for cook_time_min, and for calories/protein_g/carbs_g/fat_g when included.\n"
+        "- meal_type must be one of: Breakfast, Lunch, Dinner, Snack (mapped from meal key).\n"
+        "- Keep output compact: max 8 ingredients and max 4 short steps per meal (when steps are included).\n"
+        "- Keep description to a single short line.\n"
+        "- Ensure unique meal names across different days in this same weekly plan.\n"
+        "- When asked for a single day, return ONLY that day as one object; never return a top-level \"days\" array.\n"
+        "- Return valid JSON only.\n"
+    )
+
+    user_payload = {
+        "plan_id": plan_id,
+        "goal": data.get("goal"),
+        "gender": data.get("gender"),
+        "age": data.get("age"),
+        "height_cm": data.get("height_cm"),
+        "weight_kg": data.get("weight_kg"),
+        "target_weight_kg": data.get("target_weight_kg"),
+        "activity_level": data.get("activity_level"),
+        "dietary_preferences": dietary_preferences,
+        "dietary_restrictions": dietary_restrictions,
+        "target_daily_intake": target_macros,
+        "meal_split_percent": meal_split_percent,
+        "num_days": num_days,
+        "num_meals": num_meals,
+        "meal_keys": meal_keys,
+        "include_steps": include_steps,
+        "include_macros": include_macros,
+    }
+
+    response_text = None
+    try:
+        def _generate_day_plan(day_number: int, avoid_names: list[str]) -> tuple[dict | None, str | None]:
+            """
+            Generate one day's plan. Returns (day_obj, raw_text_on_failure).
+            """
+            max_attempts = 1 if fast_mode else 2
+            if not include_steps and not include_macros:
+                max_tokens = 700 if fast_mode else 1000
+            elif not include_steps or not include_macros:
+                max_tokens = 900 if fast_mode else 1300
+            else:
+                max_tokens = 1100 if fast_mode else 1600
+            for attempt in range(max_attempts):
+                no_repeat_instruction = ""
+                if avoid_names:
+                    no_repeat_instruction = (
+                        "Avoid reusing these meal names from prior days in this same weekly plan: "
+                        + ", ".join(avoid_names[:120])
+                        + ". Use distinct/new meal names for this day."
+                    )
+                day_messages = [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
+                    {
+                        "role": "user",
+                        "content": (
+                            f"Generate ONLY day {day_number} as ONE JSON object with keys: "
+                            f"\"day\" (number {day_number}), {meal_schema_keys}. "
+                            "Put breakfast/lunch/dinner/etc. at the ROOT of that object. "
+                            "Do NOT wrap the day inside a \"days\" array or add weekly-plan wrappers."
+                        ),
+                    },
+                    {"role": "user", "content": no_repeat_instruction},
+                ]
+                if attempt == 1:
+                    day_messages.append({
+                        "role": "user",
+                        "content": "Regenerate compactly with very short steps and ensure fully valid JSON.",
+                    })
+
+                budget = _recommend_llm_completion_budget(recommend_model, max_tokens)
+                completion = client.chat.completions.create(
+                    model=recommend_model,
+                    messages=day_messages,
+                    temperature=0.1 if fast_mode else 0.2,
+                    **_chat_completion_limit_kw(recommend_model, budget),
+                    timeout=25 if fast_mode else 40,
+                    response_format={"type": "json_object"},
+                )
+                raw = _chat_response_message_text(completion)
+                if not raw and _model_prefers_completion_token_param(recommend_model):
+                    completion = client.chat.completions.create(
+                        model=recommend_model,
+                        messages=day_messages,
+                        temperature=0.1 if fast_mode else 0.2,
+                        **_chat_completion_limit_kw(recommend_model, max(budget, 8192)),
+                        timeout=60,
+                    )
+                    raw = _chat_response_message_text(completion)
+                try:
+                    day_obj = _force_json(raw)
+                    if not isinstance(day_obj, dict):
+                        continue
+                    day_obj = _unwrap_recommend_day_payload(day_obj, meal_keys, day_number)
+                    day_obj["day"] = day_obj.get("day", day_number)
+                    return day_obj, None
+                except Exception:
+                    if attempt == (max_attempts - 1):
+                        return None, raw
+            return None, None
+
+        # Sequential generation so each day can avoid meals from prior generated days.
+        day_results = {}
+        day_failures = []
+        used_meal_names = set()
+        for day_number in range(1, num_days + 1):
+            try:
+                day_obj, failed_raw = _generate_day_plan(day_number, sorted(used_meal_names))
+                if day_obj is None:
+                    day_failures.append({
+                        "day": day_number,
+                        "error": "Invalid JSON for day plan",
+                        "raw_response": (failed_raw or "")[:500],
+                    })
+                    continue
+                day_results[day_number] = day_obj
+                for mk in meal_keys:
+                    name = str(day_obj.get(mk, {}).get("name", "")).strip().lower()
+                    if name:
+                        used_meal_names.add(name)
+            except Exception as e:
+                day_failures.append({
+                    "day": day_number,
+                    "error": str(e),
+                })
+
+        if day_failures:
+            return jsonify({
+                "error": "Failed to generate weekly meal plan",
+                "user_message": "We couldn't generate your weekly meal plan right now. Please try again.",
+                "details": "One or more day plans failed to generate.",
+                "failed_days": day_failures,
+            }), 500
+
+        days = [day_results[d] for d in range(1, num_days + 1)]
+        plan = {"days": {}}
+
+        required_meal_keys = meal_keys
+        for i, day_obj in enumerate(days, start=1):
+            if not isinstance(day_obj, dict):
+                return jsonify({"error": f"Invalid day object at index {i-1}"}), 500
+            day_obj["day"] = day_obj.get("day", i)
+            for mk in required_meal_keys:
+                if mk not in day_obj or not isinstance(day_obj.get(mk), dict):
+                    day_obj[mk] = {}
+                meal = day_obj[mk]
+                meal.setdefault("name", "")
+                meal.setdefault("description", "")
+                if include_macros:
+                    meal.setdefault("calories", 0)
+                    meal.setdefault("protein_g", 0)
+                    meal.setdefault("carbs_g", 0)
+                    meal.setdefault("fat_g", 0)
+                else:
+                    meal.pop("calories", None)
+                    meal.pop("protein_g", None)
+                    meal.pop("carbs_g", None)
+                    meal.pop("fat_g", None)
+                meal.setdefault("ingredients", [])
+                if include_steps:
+                    meal.setdefault("steps", [])
+                else:
+                    meal.pop("steps", None)
+                meal.setdefault("cook_time_min", 0)
+                meal.setdefault("cuisine", "")
+                meal.setdefault("imageUrl", default_image_url if include_images else None)
+                meal["meal_type"] = _meal_type_from_key(mk)
+
+            # Response shape requested: day number as key, details as value.
+            day_payload = dict(day_obj)
+            day_payload.pop("day", None)
+            # Drop plan-level keys the model sometimes nests inside a "day" by mistake.
+            day_payload.pop("days", None)
+            day_payload.pop("daily_macro_targets", None)
+            plan["days"][str(i)] = day_payload
+
+        if include_images:
+            meal_refs = []
+            for day_obj in days:
+                for mk in required_meal_keys:
+                    meal_refs.append(day_obj.get(mk, {}))
+
+            def _generate_meal_image(meal_obj: dict) -> str | None:
+                try:
+                    meal_name = meal_obj.get("name", "Meal")
+                    meal_desc = meal_obj.get("description", "")
+                    prompt = (
+                        f"Professional food photography of {meal_name}. "
+                        f"{meal_desc}. High quality, appetizing, natural lighting, plated dish."
+                    )
+                    img = client.images.generate(
+                        model="dall-e-2",
+                        prompt=prompt,
+                        size="256x256",
+                        n=1,
+                    )
+                    return img.data[0].url if img and img.data else None
+                except Exception:
+                    return None
+
+            with ThreadPoolExecutor(max_workers=4) as img_executor:
+                futures = {img_executor.submit(_generate_meal_image, meal): meal for meal in meal_refs}
+                for fut, meal_obj in futures.items():
+                    try:
+                        generated_url = fut.result()
+                        meal_obj["imageUrl"] = generated_url or default_image_url
+                    except Exception:
+                        meal_obj["imageUrl"] = default_image_url
+
+        def _sum_plan_macros():
+            total_cal = total_pro = total_carb = total_fat = 0.0
+            for day_obj in days:
+                for mk in required_meal_keys:
+                    meal = day_obj.get(mk, {})
+                    total_cal += float(meal.get("calories", 0) or 0)
+                    total_pro += float(meal.get("protein_g", 0) or 0)
+                    total_carb += float(meal.get("carbs_g", 0) or 0)
+                    total_fat += float(meal.get("fat_g", 0) or 0)
+            return total_cal, total_pro, total_carb, total_fat
+
+        # Derive average per-day macros from generated meals.
+        total_cal, total_pro, total_carb, total_fat = _sum_plan_macros() if include_macros else (0.0, 0.0, 0.0, 0.0)
+        target_daily_cal = float(target_macros["calories"])
+        estimated_daily_cal = (total_cal / float(num_days)) if total_cal else 0.0
+        lower_bound = target_daily_cal * 0.9
+        upper_bound = target_daily_cal * 1.1
+        correction_applied = False
+        correction_scale = 1.0
+
+        # Correction pass: keep generated daily calories within +/-10% of target
+        # by scaling meal portions/macros proportionally.
+        if include_macros and strict_calorie_alignment and estimated_daily_cal > 0 and (estimated_daily_cal < lower_bound or estimated_daily_cal > upper_bound):
+            correction_applied = True
+            correction_scale = target_daily_cal / estimated_daily_cal
+            # Avoid extreme scaling.
+            correction_scale = max(0.7, min(correction_scale, 1.5))
+
+            for day_obj in days:
+                for mk in required_meal_keys:
+                    meal = day_obj.get(mk, {})
+                    meal["calories"] = round(float(meal.get("calories", 0) or 0) * correction_scale, 1)
+                    meal["protein_g"] = round(float(meal.get("protein_g", 0) or 0) * correction_scale, 1)
+                    meal["carbs_g"] = round(float(meal.get("carbs_g", 0) or 0) * correction_scale, 1)
+                    meal["fat_g"] = round(float(meal.get("fat_g", 0) or 0) * correction_scale, 1)
+                    meal["portion_scale"] = round(correction_scale, 3)
+
+            total_cal, total_pro, total_carb, total_fat = _sum_plan_macros()
+
+        plan["plan_id"] = plan_id
+        plan["num_days"] = num_days
+        plan["num_meals"] = num_meals
+        plan["include_steps"] = include_steps
+        plan["include_macros"] = include_macros
+        plan["meal_split_percent"] = meal_split_percent
+        plan["daily_macro_targets"] = {
+            "calories": target_macros["calories"],
+            "protein_g": target_macros["protein_g"],
+            "carbs_g": target_macros["carbs_g"],
+            "fat_g": target_macros["fat_g"],
+            "estimated_from_generated_plan": {
+                "calories": round(total_cal / float(num_days), 1),
+                "protein_g": round(total_pro / float(num_days), 1),
+                "carbs_g": round(total_carb / float(num_days), 1),
+                "fat_g": round(total_fat / float(num_days), 1),
+            },
+            "calorie_alignment": {
+                "target_window": {
+                    "min": round(lower_bound, 1),
+                    "max": round(upper_bound, 1),
+                },
+                "correction_applied": correction_applied,
+                "portion_scale": round(correction_scale, 3),
+            },
+        }
+        plan["target_calories_by_day"] = [
+            {"day": day_num, "target_calories": target_macros["calories"]}
+            for day_num in range(1, num_days + 1)
+        ]
+        plan["metabolism"] = {
+            "bmr": target_macros["bmr"],
+            "tdee": target_macros["tdee"],
+        }
+        plan.setdefault("notes", [])
+
+        return jsonify(plan)
+    except Exception as e:
+        return jsonify({
+            "error": "Failed to generate weekly meal plan",
+            "user_message": "We couldn't generate your weekly meal plan right now. Please try again.",
+            "details": str(e),
+            "raw_response": response_text[:500] if response_text else None,
+        }), 500
+
+
+@app.route("/recommend-meals/day", methods=["POST"])
+def recommend_meals_day():
+    """
+    Generate one day meal plan (breakfast/lunch/dinner/snacks).
+    Designed for client-side parallel calls (day 1..7) with merge on client.
+    """
+    data = request.get_json(silent=True) or {}
+    _log_recommend_api_request("recommend-meals/day", data)
+
+    dietary_preferences = data.get("dietary_preferences", data.get("dietry_pref", []))
+    dietary_restrictions = data.get("dietary_restrictions", data.get("dietry_restr", []))
+    include_images = data.get("include_images", False)
+    include_steps = data.get("include_steps", True)
+    include_macros = data.get("include_macros", True)
+    if include_steps is None:
+        include_steps = True
+    if include_macros is None:
+        include_macros = True
+    include_steps = bool(include_steps)
+    include_macros = bool(include_macros)
+    fast_mode = data.get("fast_mode", True)
+    strict_calorie_alignment = data.get("strict_calorie_alignment", True)
+    recommend_model = os.getenv("RECOMMEND_MEALS_MODEL", "gpt-5.4-mini")
+    num_meals = int(data.get("num_meals", 4))
+    if num_meals < 1 or num_meals > 8:
+        return jsonify({"error": "num_meals must be between 1 and 8"}), 400
+    meal_keys = _get_meal_keys(num_meals)
+    plan_id = data.get("plan_id") or str(uuid.uuid4())
+    day_number = int(data.get("day_number", 1))
+    if day_number < 1 or day_number > 7:
+        return jsonify({"error": "day_number must be between 1 and 7"}), 400
+
+    default_image_url = data.get("default_image_url") or os.getenv(
+        "DEFAULT_MEAL_IMAGE_URL",
+        "https://images.unsplash.com/photo-1498837167922-ddd27525d352?auto=format&fit=crop&w=1200&q=80",
+    )
+
+    required_fields = [
+        "goal", "gender", "age", "height_cm", "weight_kg",
+        "target_weight_kg", "activity_level"
+    ]
+    missing = [f for f in required_fields if data.get(f) in (None, "")]
+    if missing:
+        return jsonify({"error": "Missing required fields", "missing_fields": missing}), 400
+    if not isinstance(dietary_preferences, list):
+        return jsonify({"error": "dietary_preferences (or dietry_pref) must be an array"}), 400
+    if not isinstance(dietary_restrictions, list):
+        return jsonify({"error": "dietary_restrictions (or dietry_restr) must be an array"}), 400
+
+    # Optional split to track calorie distribution per meal
+    meal_split_percent = data.get("meal_split_percent")
+    if not isinstance(meal_split_percent, dict):
+        # default even split across requested meal count
+        even = round(1.0 / len(meal_keys), 4)
+        meal_split_percent = {k: even for k in meal_keys}
+    for k in meal_keys:
+        if k not in meal_split_percent:
+            meal_split_percent[k] = 0.0
+
+    # Reuse same target estimation logic as weekly endpoint when target is not provided.
+    def _calculate_daily_targets(payload: dict) -> dict:
+        goal = str(payload.get("goal", "maintain")).lower()
+        gender = str(payload.get("gender", "other")).lower()
+        age = float(payload.get("age", 25))
+        height_cm = float(payload.get("height_cm", 170))
+        weight_kg = float(payload.get("weight_kg", 70))
+        target_weight_kg = float(payload.get("target_weight_kg", weight_kg))
+        activity_level = str(payload.get("activity_level", "lightly_active")).lower()
+
+        s = 5 if gender == "male" else (-161 if gender == "female" else -78)
+        bmr = 10 * weight_kg + 6.25 * height_cm - 5 * age + s
+        activity_multipliers = {
+            "not_active": 1.2,
+            "lightly_active": 1.375,
+            "active": 1.55,
+            "very_active": 1.725,
+        }
+        tdee = bmr * activity_multipliers.get(activity_level, 1.375)
+        if goal == "fat_loss":
+            calories = tdee - 450
+        elif goal == "muscle_gain":
+            calories = tdee + 300
+        else:
+            calories = tdee
+        min_cals = 1500 if gender == "male" else 1200
+        calories = max(calories, min_cals)
+        protein_per_kg = 1.8 if goal == "fat_loss" else (2.0 if goal == "muscle_gain" else 1.6)
+        protein_g = protein_per_kg * target_weight_kg
+        fat_g = 0.8 * target_weight_kg
+        protein_kcal = protein_g * 4
+        fat_kcal = fat_g * 9
+        carbs_kcal = max(calories - protein_kcal - fat_kcal, calories * 0.25)
+        carbs_g = carbs_kcal / 4
+        return {
+            "calories": round(calories),
+            "protein_g": round(protein_g),
+            "carbs_g": round(carbs_g),
+            "fat_g": round(fat_g),
+            "bmr": round(bmr),
+            "tdee": round(tdee),
+        }
+
+    # Important: if client passes target_daily_intake, do NOT recalculate it.
+    # Only calculate when it is missing.
+    target_daily_intake = data.get("target_daily_intake")
+    if target_daily_intake is None:
+        target_daily_intake = _calculate_daily_targets(data)
+    elif not isinstance(target_daily_intake, dict):
+        return jsonify({"error": "target_daily_intake must be an object when provided"}), 400
+
+    # Safe numeric casting (handles strings coming from client).
+    def _to_float(v):
+        try:
+            return float(v)
+        except Exception:
+            return 0.0
+
+    target_daily_intake = {
+        "calories": round(_to_float(target_daily_intake.get("calories", 0)), 0),
+        "protein_g": round(_to_float(target_daily_intake.get("protein_g", 0)), 1),
+        "carbs_g": round(_to_float(target_daily_intake.get("carbs_g", 0)), 1),
+        "fat_g": round(_to_float(target_daily_intake.get("fat_g", 0)), 1),
+        "bmr": round(_to_float(target_daily_intake.get("bmr", 0)), 0) if "bmr" in target_daily_intake else None,
+        "tdee": round(_to_float(target_daily_intake.get("tdee", 0)), 0) if "tdee" in target_daily_intake else None,
+    }
+
+    target_daily_cal = float(target_daily_intake.get("calories", 0) or 0)
+
+    day_meal_schema_keys = ", ".join([f"\"{k}\": {{...}}" for k in meal_keys])
+    day_meal_names = ", ".join(meal_keys)
+
+    with _plan_meal_history_lock:
+        prior_meal_names = sorted(_plan_meal_name_history.get(plan_id, set()))
+
+    meal_fields_parts = ["name", "description", "ingredients (array)", "cook_time_min (number)", "cuisine", "meal_type"]
+    if include_macros:
+        meal_fields_parts = [
+            "name",
+            "description",
+            "calories",
+            "protein_g",
+            "carbs_g",
+            "fat_g",
+            "ingredients (array)",
+            "cook_time_min (number)",
+            "cuisine",
+            "meal_type",
+        ]
+    if include_steps:
+        meal_fields_parts.append("steps (array)")
+    meal_fields_line = ", ".join(meal_fields_parts)
+
+    steps_rule = (
+        "Include steps array per meal (max 4 short steps each)."
+        if include_steps
+        else "Do NOT include a steps field for any meal."
+    )
+    macros_rule = (
+        "Include per-meal calories, protein_g, carbs_g, fat_g (numeric)."
+        if include_macros
+        else "Do NOT include calories, protein_g, carbs_g, or fat_g on any meal."
+    )
+
+    no_repeat_rule = ""
+    if prior_meal_names:
+        no_repeat_rule = (
+            "For this plan_id, avoid reusing meal names from previous days: "
+            + ", ".join(prior_meal_names[:120])
+            + ". Use distinct/new meal names for this day."
+        )
+
+    system_prompt = f"""You are an expert nutritionist and meal planner.
+Return ONLY valid JSON.
+Generate ONE day meal plan with exactly {num_meals} meals using these keys: {day_meal_names}.
+For each meal include ONLY these fields: {meal_fields_line}.
+{macros_rule}
+{steps_rule}
+{no_repeat_rule}
+Keep compact: max 8 ingredients per meal.
+"""
+
+    user_payload = {
+        "plan_id": plan_id,
+        "day_number": day_number,
+        "goal": data.get("goal"),
+        "gender": data.get("gender"),
+        "age": data.get("age"),
+        "height_cm": data.get("height_cm"),
+        "weight_kg": data.get("weight_kg"),
+        "target_weight_kg": data.get("target_weight_kg"),
+        "activity_level": data.get("activity_level"),
+        "dietary_preferences": dietary_preferences,
+        "dietary_restrictions": dietary_restrictions,
+        "target_daily_intake": target_daily_intake,
+        "meal_split_percent": meal_split_percent,
+        "num_meals": num_meals,
+        "meal_keys": meal_keys,
+        "include_steps": include_steps,
+        "include_macros": include_macros,
+        "avoid_meal_names": prior_meal_names,
+    }
+
+    response_text = None
+    try:
+        max_attempts = 1 if fast_mode else 2
+        if not include_steps and not include_macros:
+            max_tokens = 700 if fast_mode else 1000
+        elif not include_steps or not include_macros:
+            max_tokens = 900 if fast_mode else 1300
+        else:
+            max_tokens = 1100 if fast_mode else 1600
+        day_obj = None
+        for attempt in range(max_attempts):
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
+                {"role": "user", "content": f"Return JSON schema: {{\"day\": {day_number}, {day_meal_schema_keys}}}"},
+            ]
+            if attempt == 1:
+                messages.append({"role": "user", "content": "Regenerate with stricter compactness and valid JSON."})
+            budget = _recommend_llm_completion_budget(recommend_model, max_tokens)
+            completion = client.chat.completions.create(
+                model=recommend_model,
+                messages=messages,
+                temperature=0.1 if fast_mode else 0.2,
+                **_chat_completion_limit_kw(recommend_model, budget),
+                timeout=25 if fast_mode else 40,
+                response_format={"type": "json_object"},
+            )
+            response_text = _chat_response_message_text(completion)
+            if not response_text and _model_prefers_completion_token_param(recommend_model):
+                completion = client.chat.completions.create(
+                    model=recommend_model,
+                    messages=messages,
+                    temperature=0.1 if fast_mode else 0.2,
+                    **_chat_completion_limit_kw(recommend_model, max(budget, 8192)),
+                    timeout=60,
+                )
+                response_text = _chat_response_message_text(completion)
+            try:
+                parsed = _force_json(response_text)
+                if isinstance(parsed, dict):
+                    day_obj = parsed
+                    break
+            except Exception:
+                day_obj = None
+
+        if day_obj is None:
+            raise ValueError("Could not parse one-day JSON output")
+
+        day_obj["day"] = day_number
+        required_meal_keys = meal_keys
+        for mk in required_meal_keys:
+            if mk not in day_obj or not isinstance(day_obj.get(mk), dict):
+                day_obj[mk] = {}
+            meal = day_obj[mk]
+            meal.setdefault("name", "")
+            meal.setdefault("description", "")
+            if include_macros:
+                meal.setdefault("calories", 0)
+                meal.setdefault("protein_g", 0)
+                meal.setdefault("carbs_g", 0)
+                meal.setdefault("fat_g", 0)
+            else:
+                meal.pop("calories", None)
+                meal.pop("protein_g", None)
+                meal.pop("carbs_g", None)
+                meal.pop("fat_g", None)
+            meal.setdefault("ingredients", [])
+            if include_steps:
+                meal.setdefault("steps", [])
+            else:
+                meal.pop("steps", None)
+            meal.setdefault("cook_time_min", 0)
+            meal.setdefault("cuisine", "")
+            meal.setdefault("imageUrl", default_image_url if include_images else None)
+            meal["meal_type"] = _meal_type_from_key(mk)
+
+        # Update per-plan de-dup history with generated meal names.
+        generated_names = {
+            str(day_obj.get(k, {}).get("name", "")).strip().lower()
+            for k in required_meal_keys
+            if str(day_obj.get(k, {}).get("name", "")).strip()
+        }
+        if generated_names:
+            with _plan_meal_history_lock:
+                _plan_meal_name_history[plan_id].update(generated_names)
+
+        if include_images:
+            def _generate_meal_image(meal_obj: dict) -> str | None:
+                try:
+                    prompt = f"Professional food photography of {meal_obj.get('name', 'Meal')}. {meal_obj.get('description', '')}. High quality, appetizing, plated dish."
+                    img = client.images.generate(model="dall-e-2", prompt=prompt, size="256x256", n=1)
+                    return img.data[0].url if img and img.data else None
+                except Exception:
+                    return None
+
+            with ThreadPoolExecutor(max_workers=4) as ex:
+                futures = {ex.submit(_generate_meal_image, day_obj.get(k, {})): k for k in required_meal_keys}
+                for fut, k in futures.items():
+                    try:
+                        day_obj[k]["imageUrl"] = fut.result() or default_image_url
+                    except Exception:
+                        day_obj[k]["imageUrl"] = default_image_url
+
+        # Day totals + optional correction alignment to target calories (requires per-meal macros)
+        totals = {"calories": 0.0, "protein_g": 0.0, "carbs_g": 0.0, "fat_g": 0.0}
+        if include_macros:
+            for k in required_meal_keys:
+                m = day_obj.get(k, {})
+                totals["calories"] += float(m.get("calories", 0) or 0)
+                totals["protein_g"] += float(m.get("protein_g", 0) or 0)
+                totals["carbs_g"] += float(m.get("carbs_g", 0) or 0)
+                totals["fat_g"] += float(m.get("fat_g", 0) or 0)
+
+        lower = target_daily_cal * 0.9
+        upper = target_daily_cal * 1.1
+        correction_applied = False
+        portion_scale = 1.0
+        if (
+            include_macros
+            and strict_calorie_alignment
+            and totals["calories"] > 0
+            and (totals["calories"] < lower or totals["calories"] > upper)
+        ):
+            correction_applied = True
+            portion_scale = max(0.7, min(target_daily_cal / totals["calories"], 1.5))
+            for k in required_meal_keys:
+                m = day_obj.get(k, {})
+                m["calories"] = round(float(m.get("calories", 0) or 0) * portion_scale, 1)
+                m["protein_g"] = round(float(m.get("protein_g", 0) or 0) * portion_scale, 1)
+                m["carbs_g"] = round(float(m.get("carbs_g", 0) or 0) * portion_scale, 1)
+                m["fat_g"] = round(float(m.get("fat_g", 0) or 0) * portion_scale, 1)
+                m["portion_scale"] = round(portion_scale, 3)
+            totals = {"calories": 0.0, "protein_g": 0.0, "carbs_g": 0.0, "fat_g": 0.0}
+            for k in required_meal_keys:
+                m = day_obj.get(k, {})
+                totals["calories"] += float(m.get("calories", 0) or 0)
+                totals["protein_g"] += float(m.get("protein_g", 0) or 0)
+                totals["carbs_g"] += float(m.get("carbs_g", 0) or 0)
+                totals["fat_g"] += float(m.get("fat_g", 0) or 0)
+
+        response = {
+            "plan_id": plan_id,
+            "day_number": day_number,
+            "include_steps": include_steps,
+            "include_macros": include_macros,
+            "day": day_obj,
+            "target_daily_intake": {
+                "calories": target_daily_intake.get("calories", 0),
+                "protein_g": target_daily_intake.get("protein_g", 0),
+                "carbs_g": target_daily_intake.get("carbs_g", 0),
+                "fat_g": target_daily_intake.get("fat_g", 0),
+            },
+            "daily_totals": {
+                "calories": round(totals["calories"], 1),
+                "protein_g": round(totals["protein_g"], 1),
+                "carbs_g": round(totals["carbs_g"], 1),
+                "fat_g": round(totals["fat_g"], 1),
+            },
+            "variance_from_target": {
+                "calories": round(totals["calories"] - target_daily_cal, 1),
+                "calories_pct": round(((totals["calories"] - target_daily_cal) / target_daily_cal) * 100, 1) if target_daily_cal else 0,
+                "target_window": {"min": round(lower, 1), "max": round(upper, 1)},
+                "correction_applied": correction_applied,
+                "portion_scale": round(portion_scale, 3),
+            },
+            "meal_split_percent": meal_split_percent,
+            "metabolism": {
+                "bmr": target_daily_intake.get("bmr"),
+                "tdee": target_daily_intake.get("tdee"),
+            },
+        }
+        return jsonify(response)
+    except Exception as e:
+        return jsonify({
+            "error": "Failed to generate day meal plan",
+            "user_message": "We couldn't generate your day meal plan right now. Please try again.",
+            "details": str(e),
+            "raw_response": response_text[:500] if response_text else None,
+        }), 500
 
 #####video only code starts here#####
 

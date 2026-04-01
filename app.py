@@ -25,6 +25,11 @@ import ipaddress
 from urllib.parse import urlparse
 import requests
 from bs4 import BeautifulSoup
+
+try:
+    from openpyxl import load_workbook
+except ImportError:
+    load_workbook = None
 import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -3256,6 +3261,167 @@ def _time_str_to_minutes_for_cook_time(time_str: str) -> int:
     return total
 
 
+def _build_recipe_log_document(
+    recipe: dict,
+    source: dict,
+    url: str,
+    tags: list,
+    extra: dict | None = None,
+) -> tuple[str, dict]:
+    """Build Firestore recipe-log shaped document; optional extra fields merged in."""
+    recipe_id = str(uuid.uuid4())
+    title = (recipe.get("name") or "").strip()
+    cook_time_str = recipe.get("cook_time") or recipe.get("total_time", "")
+    cook_time_minutes = _time_str_to_minutes_for_cook_time(cook_time_str)
+    desc = (recipe.get("description") or title or "").strip()
+    if len(desc) > 100:
+        desc = desc[:99].rstrip()
+        if desc and not desc.endswith("."):
+            desc = desc + "."
+    elif desc and not desc.endswith("."):
+        desc = desc + "."
+
+    raw_instructions = recipe.get("instructions") or []
+    steps = []
+    for i, raw in enumerate(raw_instructions, start=1):
+        text = (raw.get("instruction", raw) if isinstance(raw, dict) else str(raw)).strip()
+        text = re.sub(r"^(?:\d+[.)]\s*|step\s*\d+\s*[.:]\s*)", "", text, flags=re.IGNORECASE).strip()
+        steps.append({
+            "instruction": text,
+            "order": i,
+            "duration": None,
+        })
+
+    doc = {
+        "recipeId": recipe_id,
+        "category": recipe.get("meal_type", "Dinner"),
+        "cookTime": cook_time_minutes,
+        "createdAt": datetime.utcnow(),
+        "title": title,
+        "description": desc,
+        "difficulty": _guess_difficulty_from_tags(tags),
+        "imageUrl": source.get("image") or "",
+        "ingredients": [
+            {
+                "name": ing.get("name", ""),
+                "amount": ing.get("quantity", ""),
+            }
+            for ing in (recipe.get("ingredients") or [])
+            if isinstance(ing, dict)
+        ],
+        "isFavorite": False,
+        "nutrition": recipe.get("nutrition") or {},
+        "steps": steps,
+        "sourceUrl": source.get("url") or url,
+        "cuisine": recipe.get("cuisine", ""),
+        "dietFlags": recipe.get("diet_flags", []),
+        "tags": tags,
+    }
+    if extra:
+        doc.update(extra)
+    return recipe_id, doc
+
+
+def _cookbook_name_to_slug(name: str, slug_counts: dict[str, int]) -> str:
+    raw = str(name or "").strip()
+    slug = re.sub(r"[^\w\s-]", "", raw, flags=re.UNICODE)
+    slug = re.sub(r"[-\s]+", "_", slug.strip().lower())
+    slug = slug.strip("_")[:120] or "cookbook"
+    n = slug_counts.get(slug, 0)
+    slug_counts[slug] = n + 1
+    if n == 0:
+        return slug
+    return f"{slug}_{n}"
+
+
+def _norm_cookbook_tab_title(s: str | None) -> str:
+    if s is None:
+        return ""
+    t = str(s).strip()
+    t = re.sub(r"^\d+\.\s*", "", t)
+    return t.strip().lower()
+
+
+def _parse_cookbooks_index_sheet(ws) -> tuple[list[dict] | None, str | None]:
+    """First sheet: Cookbook Name + Category columns."""
+    rows = list(ws.iter_rows(min_row=1, values_only=True))
+    if not rows:
+        return None, "First sheet is empty"
+    header_cells = [str(c).strip().lower() if c is not None else "" for c in rows[0]]
+    name_idx = category_idx = None
+    for i, h in enumerate(header_cells):
+        hnorm = h.replace("  ", " ").strip()
+        if hnorm in ("cookbook name", "cookbook_name", "cookbookname"):
+            name_idx = i
+        if hnorm == "category":
+            category_idx = i
+    if name_idx is None or category_idx is None:
+        return None, "First sheet must have 'Cookbook Name' and 'Category' columns"
+
+    def _cell(r, idx):
+        if r is None or idx >= len(r):
+            return ""
+        v = r[idx]
+        return str(v).strip() if v is not None else ""
+
+    cookbooks = []
+    for row in rows[1:]:
+        if row is None:
+            continue
+        cname = _cell(row, name_idx)
+        if not cname:
+            continue
+        cookbooks.append({
+            "cookbook_name": cname,
+            "category": _cell(row, category_idx),
+        })
+    if not cookbooks:
+        return None, "No cookbook rows found on first sheet"
+    return cookbooks, None
+
+
+def _match_cookbook_for_sheet_title(sheet_title: str, cookbooks: list[dict]) -> dict | None:
+    nt = _norm_cookbook_tab_title(sheet_title)
+    if not nt:
+        return None
+    for cb in cookbooks:
+        nn = _norm_cookbook_tab_title(cb["cookbook_name"])
+        if not nn:
+            continue
+        if nt == nn or nt.endswith(nn) or nn.endswith(nt):
+            return cb
+    return None
+
+
+def _iter_recipe_urls_from_sheet(ws) -> tuple[list[tuple[int, str]], str | None]:
+    rows = list(ws.iter_rows(min_row=1, values_only=True))
+    if not rows:
+        return [], "Sheet has no rows"
+    headers = [str(c).strip().lower() if c is not None else "" for c in rows[0]]
+    url_idx = None
+    for i, h in enumerate(headers):
+        h2 = h.replace("  ", " ").strip()
+        if h2 in ("recipe url", "recipe_url", "recipeurl", "url"):
+            url_idx = i
+            break
+        if "recipe" in h2 and "url" in h2:
+            url_idx = i
+            break
+    if url_idx is None:
+        return [], "No 'Recipe URL' column found"
+    out = []
+    for r_i, row in enumerate(rows[1:], start=2):
+        if row is None or url_idx >= len(row):
+            continue
+        cell = row[url_idx]
+        if cell is None:
+            continue
+        url = str(cell).strip()
+        if url.lower().startswith("http"):
+            out.append((r_i, url))
+    return out, None
+
+
 @app.route("/bulk-import-recipes", methods=["POST"])
 def bulk_import_recipes():
     """
@@ -3267,6 +3433,12 @@ def bulk_import_recipes():
 
     - Delete behavior (`action=delete` + `createdDate=YYYY-MM-DD`): delete all
       recipe-log documents whose createdAt falls on that date (UTC).
+
+    - Cookbook insert (`action=cookbook insert`): accept an `.xlsx` file. The first
+      sheet lists cookbooks (Cookbook Name, Category). Each following sheet is named
+      like a cookbook tab; rows use a Recipe URL column. Each URL is passed to
+      `/extract-recipe`; results are stored as `cookbooks/{slug}` documents (metadata)
+      with recipes in `cookbooks/{slug}/recipes/{recipeId}`.
     """
     action = (request.form.get("action") or "").strip().lower()
     created_date_str = (request.form.get("createdDate") or "").strip()
@@ -3296,6 +3468,143 @@ def bulk_import_recipes():
             "action": "delete",
             "createdDate": created_date_str,
             "deleted": deleted,
+        })
+
+    # Cookbook insert: XLSX with index sheet + per-cookbook sheets -> Firestore cookbooks/*
+    if action == "cookbook insert":
+        if load_workbook is None:
+            return jsonify({"error": "openpyxl is required for cookbook insert; pip install openpyxl"}), 500
+        file = request.files.get("file")
+        if not file or not file.filename:
+            return jsonify({"error": "XLSX file is required (field name: 'file')"}), 400
+        fn = (file.filename or "").lower()
+        if not fn.endswith((".xlsx", ".xlsm")):
+            return jsonify({"error": "cookbook insert requires an .xlsx (or .xlsm) file"}), 400
+
+        try:
+            raw_bytes = file.read()
+            wb = load_workbook(io.BytesIO(raw_bytes), data_only=True)
+        except Exception as e:
+            return jsonify({"error": "Failed to read workbook", "details": str(e)}), 400
+
+        sheets = wb.sheetnames
+        if len(sheets) < 2:
+            return jsonify({"error": "Workbook must have at least 2 sheets (index + one cookbook)"}), 400
+
+        index_ws = wb[sheets[0]]
+        cookbooks_raw, err = _parse_cookbooks_index_sheet(index_ws)
+        if err:
+            return jsonify({"error": err}), 400
+
+        slug_counts: dict[str, int] = {}
+        cookbooks = []
+        for cb in cookbooks_raw:
+            slug = _cookbook_name_to_slug(cb["cookbook_name"], slug_counts)
+            cookbooks.append({**cb, "slug": slug})
+
+        base_url = os.getenv("EXTRACT_RECIPE_BASE_URL", "http://localhost:5002")
+        recipes_sub = (os.getenv("FIRESTORE_COOKBOOK_RECIPES_SUBCOLLECTION") or "recipes").strip() or "recipes"
+        cookbooks_col = db.collection("cookbooks")
+
+        for cb in cookbooks:
+            cookbook_doc = cookbooks_col.document(cb["slug"])
+            cookbook_doc.set({
+                "cookbookName": cb["cookbook_name"],
+                "category": cb["category"],
+                "updatedAt": datetime.utcnow(),
+                "schemaVersion": 1,
+                "type": "cookbook",
+            }, merge=True)
+
+        imported = 0
+        failed: list[dict] = []
+
+        for sheet_name in sheets[1:]:
+            ws = wb[sheet_name]
+            cb = _match_cookbook_for_sheet_title(sheet_name, cookbooks)
+            if not cb:
+                failed.append({
+                    "sheet": sheet_name,
+                    "row": None,
+                    "url": None,
+                    "reason": "No matching Cookbook Name on first sheet for this tab",
+                })
+                continue
+            urls, uerr = _iter_recipe_urls_from_sheet(ws)
+            if uerr:
+                failed.append({"sheet": sheet_name, "row": None, "url": None, "reason": uerr})
+                continue
+            if not urls:
+                failed.append({
+                    "sheet": sheet_name,
+                    "row": None,
+                    "url": None,
+                    "reason": "No recipe URLs found",
+                })
+                continue
+
+            recipes_ref = cookbooks_col.document(cb["slug"]).collection(recipes_sub)
+            for row_idx, url in urls:
+                try:
+                    resp = requests.post(
+                        f"{base_url}/extract-recipe",
+                        json={"url": url, "mode": "auto"},
+                        timeout=120,
+                    )
+                except Exception as e:
+                    failed.append({"sheet": sheet_name, "row": row_idx, "url": url, "reason": f"Request error: {e}"})
+                    continue
+                try:
+                    data = resp.json()
+                except Exception:
+                    failed.append({
+                        "sheet": sheet_name,
+                        "row": row_idx,
+                        "url": url,
+                        "reason": "Non-JSON response from /extract-recipe",
+                    })
+                    continue
+                if not resp.ok or not data.get("recipe"):
+                    failed.append({
+                        "sheet": sheet_name,
+                        "row": row_idx,
+                        "url": url,
+                        "reason": data.get("user_message") or data.get("error") or "extract-recipe failed",
+                    })
+                    continue
+
+                recipe = data["recipe"]
+                source = data.get("source") or {}
+                tags = data.get("tags") or []
+                _enrich_recipe_response(recipe)
+                recipe_id, doc = _build_recipe_log_document(
+                    recipe,
+                    source,
+                    url,
+                    tags,
+                    extra={
+                        "cookbookName": cb["cookbook_name"],
+                        "cookbookCategory": cb["category"],
+                    },
+                )
+                try:
+                    recipes_ref.document(recipe_id).set(doc)
+                    imported += 1
+                except Exception as e:
+                    failed.append({
+                        "sheet": sheet_name,
+                        "row": row_idx,
+                        "url": url,
+                        "reason": f"Firestore error: {e}",
+                    })
+
+        return jsonify({
+            "action": "cookbook insert",
+            "firestore_paths": f"cookbooks/{{slug}} and cookbooks/{{slug}}/{recipes_sub}/{{recipeId}}",
+            "recipes_subcollection": recipes_sub,
+            "cookbooks_registered": len(cookbooks),
+            "imported": imported,
+            "failed": failed,
         })
 
     # Existing behavior: CSV import
@@ -3355,59 +3664,7 @@ def bulk_import_recipes():
         # Ensure enrichment (just in case /extract-recipe behavior changes)
         _enrich_recipe_response(recipe)
 
-        # Map to Firestore recipe-log schema (as per screenshot)
-        recipe_id = str(uuid.uuid4())
-        title = (recipe.get("name") or "").strip()
-        cook_time_str = recipe.get("cook_time") or recipe.get("total_time", "")
-        cook_time_minutes = _time_str_to_minutes_for_cook_time(cook_time_str)
-
-        # Short description (max 100 chars, ends with full stop; already set by _enrich_recipe_response)
-        desc = (recipe.get("description") or title or "").strip()
-        if len(desc) > 100:
-            desc = desc[:99].rstrip()
-            if desc and not desc.endswith("."):
-                desc = desc + "."
-        elif desc and not desc.endswith("."):
-            desc = desc + "."
-
-        # Steps: Firestore format [{ instruction, order, duration }, ...] (plain text, no "1.", "2." in instruction)
-        raw_instructions = recipe.get("instructions") or []
-        steps = []
-        for i, raw in enumerate(raw_instructions, start=1):
-            text = (raw.get("instruction", raw) if isinstance(raw, dict) else str(raw)).strip()
-            # Strip leading "1. ", "Step 1: ", etc.
-            text = re.sub(r"^(?:\d+[.)]\s*|step\s*\d+\s*[.:]\s*)", "", text, flags=re.IGNORECASE).strip()
-            steps.append({
-                "instruction": text,
-                "order": i,
-                "duration": None,
-            })
-
-        doc = {
-            "recipeId": recipe_id,
-            "category": recipe.get("meal_type", "Dinner"),
-            "cookTime": cook_time_minutes,
-            "createdAt": datetime.utcnow(),
-            "title": title,
-            "description": desc,
-            "difficulty": _guess_difficulty_from_tags(tags),
-            "imageUrl": source.get("image") or "",
-            "ingredients": [
-                {
-                    "name": ing.get("name", ""),
-                    "amount": ing.get("quantity", ""),
-                }
-                for ing in (recipe.get("ingredients") or [])
-                if isinstance(ing, dict)
-            ],
-            "isFavorite": False,
-            "nutrition": recipe.get("nutrition") or {},
-            "steps": steps,
-            "sourceUrl": source.get("url") or url,
-            "cuisine": recipe.get("cuisine", ""),
-            "dietFlags": recipe.get("diet_flags", []),
-            "tags": tags,
-        }
+        recipe_id, doc = _build_recipe_log_document(recipe, source, url, tags)
 
         try:
             # Store under deterministic recipeId so each recipe has a stable ID

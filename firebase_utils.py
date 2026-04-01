@@ -2,6 +2,7 @@ import firebase_admin
 from firebase_admin import credentials, firestore
 from datetime import datetime
 import threading
+import os
 
 _firestore_client = None
 _firestore_lock = threading.Lock()
@@ -13,7 +14,12 @@ def init_firestore():
 
     with _firestore_lock:
         if not firebase_admin._apps:
-            cred = credentials.Certificate("firebase_service_account.json")
+            sa_path = os.path.expanduser(
+                os.path.expandvars(
+                    os.getenv("FIREBASE_SERVICE_ACCOUNT_PATH", "firebase_service_account.json")
+                )
+            )
+            cred = credentials.Certificate(sa_path)
             firebase_admin.initialize_app(cred)
         if _firestore_client is None:
             _firestore_client = firestore.client()

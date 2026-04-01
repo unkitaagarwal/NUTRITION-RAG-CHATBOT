@@ -5,6 +5,7 @@
 
 # Firebase service account (contains sensitive credentials)
 firebase_service_account.json
+mealmap_firebase_service_account.json
 
 # Python
 __pycache__/

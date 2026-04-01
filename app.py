@@ -790,6 +790,29 @@ def _meal_type_from_key(meal_key: str) -> str:
     return "Snack"
 
 
+def _dietary_restrictions_plant_based_prompt_block(restrictions: list) -> str:
+    """
+    When restrictions include vegan or vegetarian, return strict LLM instructions so
+    recommendations exclude meat (vegan: no animal products at all).
+    """
+    if not isinstance(restrictions, list):
+        return ""
+    lowered = [str(x).lower() for x in restrictions if x is not None]
+    if any("vegan" in r for r in lowered):
+        return (
+            "CRITICAL — VEGAN: Every meal must be fully plant-based. "
+            "Do NOT include meat, poultry, fish, shellfish, eggs, dairy, honey, gelatin, or other animal-derived ingredients. "
+            "Use only vegan proteins and ingredients (legumes, tofu, tempeh, seitan, nuts, seeds, plant milks, etc.).\n"
+        )
+    if any("vegetarian" in r for r in lowered):
+        return (
+            "CRITICAL — VEGETARIAN: Every meal must be vegetarian. "
+            "Do NOT include meat, poultry, fish, or shellfish. "
+            "Eggs and dairy are allowed unless other restrictions forbid them.\n"
+        )
+    return ""
+
+
 def _chat_completion_limit_kw(model: str, max_tokens: int) -> dict:
     """
     Some newer OpenAI chat models reject max_tokens and require max_completion_tokens.
@@ -935,6 +958,8 @@ def recommend_meals():
     if not isinstance(dietary_restrictions, list):
         return jsonify({"error": "dietary_restrictions (or dietry_restr) must be an array"}), 400
 
+    plant_diet_prompt = _dietary_restrictions_plant_based_prompt_block(dietary_restrictions)
+
     meal_split_percent = data.get("meal_split_percent")
     if not isinstance(meal_split_percent, dict):
         even = round(1.0 / len(meal_keys), 4)
@@ -1059,6 +1084,7 @@ def recommend_meals():
         "Return ONLY valid JSON (no markdown, no commentary).\n"
         f"Build a {num_days}-day plan with {num_meals} meals per day using these keys: {meal_names}.\n"
         "Meals must align with the user's goal, demographics, body stats, activity level, dietary preferences, and dietary restrictions.\n"
+        f"{plant_diet_prompt}"
         "Keep meals practical and realistic.\n"
         f"For each meal include ONLY these fields: {meal_fields_line}.\n"
         f"{macros_rule}\n"
@@ -1425,6 +1451,8 @@ def recommend_meals_day():
     if not isinstance(dietary_restrictions, list):
         return jsonify({"error": "dietary_restrictions (or dietry_restr) must be an array"}), 400
 
+    plant_diet_prompt = _dietary_restrictions_plant_based_prompt_block(dietary_restrictions)
+
     # Optional split to track calorie distribution per meal
     meal_split_percent = data.get("meal_split_percent")
     if not isinstance(meal_split_percent, dict):
@@ -1550,7 +1578,8 @@ def recommend_meals_day():
     system_prompt = f"""You are an expert nutritionist and meal planner.
 Return ONLY valid JSON.
 Generate ONE day meal plan with exactly {num_meals} meals using these keys: {day_meal_names}.
-For each meal include ONLY these fields: {meal_fields_line}.
+Meals must align with the user's goal, demographics, body stats, activity level, dietary preferences, and dietary restrictions.
+{plant_diet_prompt}For each meal include ONLY these fields: {meal_fields_line}.
 {macros_rule}
 {steps_rule}
 {no_repeat_rule}

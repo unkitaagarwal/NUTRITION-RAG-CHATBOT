@@ -813,6 +813,75 @@ def _dietary_restrictions_plant_based_prompt_block(restrictions: list) -> str:
     return ""
 
 
+def _recommend_meals_dalle_size() -> str:
+    """Smallest DALL·E 2 size (256x256) for fastest image generation; override via env."""
+    allowed = {"256x256", "512x512", "1024x1024"}
+    s = (os.getenv("RECOMMEND_MEALS_DALLE_SIZE") or "256x256").strip()
+    return s if s in allowed else "256x256"
+
+
+def _recommend_meals_image_pool_size(num_images: int) -> int:
+    """Parallel DALL·E calls; higher = lower wall-clock time (capped)."""
+    try:
+        w = int(os.getenv("RECOMMEND_MEALS_IMAGE_MAX_WORKERS", "8"))
+    except ValueError:
+        w = 8
+    w = max(1, min(w, 16))
+    return min(w, max(1, num_images))
+
+
+def _meal_image_prompt_for_recommend(name: str, desc: str, *, fast_mode: bool) -> str:
+    """Short prompts = slightly faster API handling; truncate description for lower token load."""
+    n = (name or "Meal").strip()[:100]
+    d = (desc or "").strip()
+    d = d[:40] if fast_mode else d[:70]
+    if d:
+        return f"Food photo: {n}. {d}"
+    return f"Food photo: {n}"
+
+
+def _food_logging_dalle_size() -> str:
+    """Default smallest for speed; FOOD_LOGGING_DALLE_SIZE overrides RECOMMEND_MEALS_DALLE_SIZE."""
+    allowed = {"256x256", "512x512", "1024x1024"}
+    s = (
+        os.getenv("FOOD_LOGGING_DALLE_SIZE")
+        or os.getenv("RECOMMEND_MEALS_DALLE_SIZE")
+        or "256x256"
+    ).strip()
+    return s if s in allowed else "256x256"
+
+
+def _food_logging_image_pool_size(num_images: int) -> int:
+    try:
+        w = int(
+            os.getenv("FOOD_LOGGING_IMAGE_MAX_WORKERS")
+            or os.getenv("RECOMMEND_MEALS_IMAGE_MAX_WORKERS", "8")
+        )
+    except ValueError:
+        w = 8
+    w = max(1, min(w, 16))
+    return min(w, max(1, num_images))
+
+
+def _generate_food_log_meal_image_url(meal: dict, *, size: str) -> str | None:
+    """DALL·E 2, compact prompt — optimized for /food-logging latency."""
+    try:
+        prompt = _meal_image_prompt_for_recommend(
+            meal.get("name", "Meal"),
+            meal.get("description", ""),
+            fast_mode=True,
+        )
+        img = client.images.generate(
+            model="dall-e-2",
+            prompt=prompt,
+            size=size,
+            n=1,
+        )
+        return img.data[0].url if img and img.data else None
+    except Exception:
+        return None
+
+
 def _chat_completion_limit_kw(model: str, max_tokens: int) -> dict:
     """
     Some newer OpenAI chat models reject max_tokens and require max_completion_tokens.
@@ -913,7 +982,8 @@ def recommend_meals():
     dietary_restrictions = data.get("dietary_restrictions", data.get("dietry_restr", []))
     # Performance-first defaults for mobile UX:
     # - include_images defaults to False (image generation is the slowest part)
-    # - fast_mode defaults to True (single attempt/day, lower token budget)
+    # - fast_mode defaults to True (single attempt/day, lower token budget; also shorter image prompts)
+    # - Images: RECOMMEND_MEALS_DALLE_SIZE (default 256x256), RECOMMEND_MEALS_IMAGE_MAX_WORKERS (default 8)
     include_images = data.get("include_images", False)
     include_steps = data.get("include_steps", True)
     include_macros = data.get("include_macros", True)
@@ -1290,25 +1360,27 @@ def recommend_meals():
                 for mk in required_meal_keys:
                     meal_refs.append(day_obj.get(mk, {}))
 
+            _dalle_sz = _recommend_meals_dalle_size()
+            _img_workers = _recommend_meals_image_pool_size(len(meal_refs))
+
             def _generate_meal_image(meal_obj: dict) -> str | None:
                 try:
                     meal_name = meal_obj.get("name", "Meal")
                     meal_desc = meal_obj.get("description", "")
-                    prompt = (
-                        f"Professional food photography of {meal_name}. "
-                        f"{meal_desc}. High quality, appetizing, natural lighting, plated dish."
+                    prompt = _meal_image_prompt_for_recommend(
+                        meal_name, meal_desc, fast_mode=bool(fast_mode)
                     )
                     img = client.images.generate(
                         model="dall-e-2",
                         prompt=prompt,
-                        size="256x256",
+                        size=_dalle_sz,
                         n=1,
                     )
                     return img.data[0].url if img and img.data else None
                 except Exception:
                     return None
 
-            with ThreadPoolExecutor(max_workers=4) as img_executor:
+            with ThreadPoolExecutor(max_workers=_img_workers) as img_executor:
                 futures = {img_executor.submit(_generate_meal_image, meal): meal for meal in meal_refs}
                 for fut, meal_obj in futures.items():
                     try:
@@ -1694,15 +1766,27 @@ Keep compact: max 8 ingredients per meal.
                 _plan_meal_name_history[plan_id].update(generated_names)
 
         if include_images:
+            _dalle_sz = _recommend_meals_dalle_size()
+            _img_workers = _recommend_meals_image_pool_size(len(required_meal_keys))
+
             def _generate_meal_image(meal_obj: dict) -> str | None:
                 try:
-                    prompt = f"Professional food photography of {meal_obj.get('name', 'Meal')}. {meal_obj.get('description', '')}. High quality, appetizing, plated dish."
-                    img = client.images.generate(model="dall-e-2", prompt=prompt, size="256x256", n=1)
+                    prompt = _meal_image_prompt_for_recommend(
+                        meal_obj.get("name", "Meal"),
+                        meal_obj.get("description", ""),
+                        fast_mode=bool(fast_mode),
+                    )
+                    img = client.images.generate(
+                        model="dall-e-2",
+                        prompt=prompt,
+                        size=_dalle_sz,
+                        n=1,
+                    )
                     return img.data[0].url if img and img.data else None
                 except Exception:
                     return None
 
-            with ThreadPoolExecutor(max_workers=4) as ex:
+            with ThreadPoolExecutor(max_workers=_img_workers) as ex:
                 futures = {ex.submit(_generate_meal_image, day_obj.get(k, {})): k for k in required_meal_keys}
                 for fut, k in futures.items():
                     try:
@@ -1792,17 +1876,28 @@ Keep compact: max 8 ingredients per meal.
 # ---------------------------
 # Helper: Transcribe Audio
 # ---------------------------
-def transcribe_audio_file(audio_bytes: bytes, file_name: str) -> str:
+def transcribe_audio_file(
+    audio_bytes: bytes,
+    file_name: str,
+    *,
+    language: str | None = None,
+) -> str:
+    """
+    Whisper transcription. Optional `language` (ISO-639-1, e.g. en) skips language detection and can reduce latency.
+    """
     try:
         # Create file-like object
         audio_file = io.BytesIO(audio_bytes)
         audio_file.name = file_name
 
-        transcription = client.audio.transcriptions.create(
-            model="whisper-1",  # Cost-effective: Much cheaper than gpt-4o-transcribe, same quality
-            file=audio_file,
-            response_format="text",
-        )
+        t_kwargs: dict = {
+            "model": "whisper-1",  # Cost-effective: Much cheaper than gpt-4o-transcribe, same quality
+            "file": audio_file,
+            "response_format": "text",
+        }
+        if language:
+            t_kwargs["language"] = language
+        transcription = client.audio.transcriptions.create(**t_kwargs)
 
         transcript_text = (
             transcription if isinstance(transcription, str) else str(transcription)
@@ -1869,6 +1964,72 @@ def extract_ingredients(transcript: str):
         raise Exception(f"Ingredient extraction failed: {e}")
 
 
+def extract_meals_from_voice_log_transcript(transcript: str, *, fast: bool = False) -> list[dict]:
+    """
+    Parse spoken food log into structured meals with estimated calories and macros.
+    Tuned for latency: small completion budget, compact prompt.
+    """
+    model = os.getenv("VOICE_LOGGING_MODEL", "gpt-4o-mini")
+    default_cap = 500 if fast else 800
+    try:
+        max_out = int(os.getenv("VOICE_LOGGING_MAX_COMPLETION_TOKENS", str(default_cap)))
+    except ValueError:
+        max_out = default_cap
+    if fast:
+        max_out = min(max_out, 600)
+    max_out = max(256, min(max_out, 4000))
+
+    system_prompt = (
+        "Extract food log items from the transcript. Return ONLY JSON: "
+        '{"meals":[{"name":"","description":"","meal_type":"Breakfast|Lunch|Dinner|Snack|Unknown",'
+        '"calories":0,"protein_g":0,"carbs_g":0,"fat_g":0}]}. '
+        "One entry per distinct meal/snack; estimate kcal and macros for typical portions. "
+        "Non-food or empty transcript → {\"meals\":[]}. No markdown."
+    )
+    completion = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": transcript[:12000]},
+        ],
+        temperature=0.1,
+        **_chat_completion_limit_kw(model, max_out),
+        response_format={"type": "json_object"},
+    )
+    raw = completion.choices[0].message.content
+    if not raw:
+        return []
+    obj = _force_json(raw)
+    meals = obj.get("meals", [])
+    if not isinstance(meals, list):
+        return []
+    out: list[dict] = []
+    for m in meals:
+        if not isinstance(m, dict):
+            continue
+        try:
+            cals = float(m.get("calories", 0) or 0)
+        except (TypeError, ValueError):
+            cals = 0.0
+
+        def _nf(key: str) -> float:
+            try:
+                return float(m.get(key, 0) or 0)
+            except (TypeError, ValueError):
+                return 0.0
+
+        out.append({
+            "name": str(m.get("name", "Meal")).strip() or "Meal",
+            "description": str(m.get("description", "")).strip(),
+            "meal_type": str(m.get("meal_type", "Unknown")).strip() or "Unknown",
+            "calories": int(round(cals)),
+            "protein_g": round(_nf("protein_g"), 1),
+            "carbs_g": round(_nf("carbs_g"), 1),
+            "fat_g": round(_nf("fat_g"), 1),
+        })
+    return out
+
+
 # ---------------------------
 # MAIN ENDPOINT (File Upload Only)
 # ---------------------------
@@ -1915,6 +2076,99 @@ def voice_ingredients():
             "user_message": "We couldn't process the audio. Please try again or type your ingredients instead.",
             "details": str(e),
         }), 500
+
+
+@app.route("/food-logging", methods=["POST"])
+def food_logging():
+    """
+    Form fields:
+    - action: "voice" (default) — requires multipart audio; runs transcribe_audio_file (Whisper).
+      "text" — provide transcript via form field transcript or text; no audio.
+    - audio: file (required when action=voice)
+    - transcript / text: food log text (required when action=text)
+    - fast (optional): 1/true — smaller LLM completion budget for meal extraction only.
+    Each meal in the response always includes imageUrl (DALL·E or DEFAULT_MEAL_IMAGE_URL fallback).
+    Whisper: optional env FOOD_LOGGING_WHISPER_LANGUAGE (e.g. en) can reduce latency.
+    """
+    try:
+        action = (request.form.get("action") or request.args.get("action") or "voice").strip().lower()
+        if action not in ("voice", "text"):
+            return jsonify({
+                "error": "Invalid action",
+                "allowed": ["voice", "text"],
+            }), 400
+
+        default_image_url = os.getenv(
+            "DEFAULT_MEAL_IMAGE_URL",
+            "https://images.unsplash.com/photo-1498837167922-ddd27525d352?auto=format&fit=crop&w=1200&q=80",
+        )
+        fast_flag = (request.form.get("fast") or request.args.get("fast") or "").strip().lower() in (
+            "1", "true", "yes",
+        )
+
+        if action == "voice":
+            if "audio" not in request.files:
+                return jsonify({"error": "Audio file is required when action=voice"}), 400
+
+            audio_file = request.files["audio"]
+            if not audio_file.filename:
+                return jsonify({"error": "Uploaded audio file is empty"}), 400
+
+            audio_bytes = audio_file.read()
+            if not audio_bytes:
+                return jsonify({"error": "Uploaded audio file is empty"}), 400
+
+            print(f"[food-logging] action=voice audio: {audio_file.filename}, {len(audio_bytes)} bytes")
+
+            whisper_lang = (os.getenv("FOOD_LOGGING_WHISPER_LANGUAGE") or "").strip() or None
+            transcript = transcribe_audio_file(
+                audio_bytes,
+                audio_file.filename,
+                language=whisper_lang,
+            )
+        else:
+            transcript = (request.form.get("transcript") or request.form.get("text") or "").strip()
+            if not transcript:
+                return jsonify({
+                    "error": "transcript or text is required when action=text",
+                }), 400
+            print(f"[food-logging] action=text, len={len(transcript)} chars")
+        if not transcript or not transcript.strip():
+            return jsonify({
+                "error": "No speech detected",
+                "transcript": "",
+                "meals": [],
+                "user_message": "We couldn't detect speech in this recording. Try again or speak more clearly.",
+            }), 400
+
+        meals = extract_meals_from_voice_log_transcript(transcript, fast=fast_flag)
+
+        if meals:
+            dalle_sz = _food_logging_dalle_size()
+            workers = _food_logging_image_pool_size(len(meals))
+
+            def _image_for_meal(m: dict) -> str | None:
+                return _generate_food_log_meal_image_url(m, size=dalle_sz)
+
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                urls = list(ex.map(_image_for_meal, meals))
+            for meal, url in zip(meals, urls):
+                meal["imageUrl"] = url or default_image_url
+
+        return jsonify({
+            "transcript": transcript,
+            "meals": meals,
+            "message": f"Logged {len(meals)} meal(s).",
+        })
+
+    except Exception as e:
+        print(f"Error in food_logging: {str(e)}")
+        return jsonify({
+            "error": "Unexpected server error",
+            "user_message": "We couldn't process your food log. Please try again or type what you ate.",
+            "details": str(e),
+        }), 500
+
 
 # ---------- Security: SSRF protection ----------
 def _is_private_host(hostname: str) -> bool:

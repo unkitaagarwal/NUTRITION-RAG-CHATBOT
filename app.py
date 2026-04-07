@@ -1964,12 +1964,8 @@ def extract_ingredients(transcript: str):
         raise Exception(f"Ingredient extraction failed: {e}")
 
 
-def extract_meals_from_voice_log_transcript(transcript: str, *, fast: bool = False) -> list[dict]:
-    """
-    Parse spoken food log into structured meals with estimated calories and macros.
-    Tuned for latency: small completion budget, compact prompt.
-    """
-    model = os.getenv("VOICE_LOGGING_MODEL", "gpt-4o-mini")
+def _voice_logging_completion_budget(*, fast: bool) -> int:
+    """Shared max output tokens for voice + photo food logging LLM calls."""
     default_cap = 500 if fast else 800
     try:
         max_out = int(os.getenv("VOICE_LOGGING_MAX_COMPLETION_TOKENS", str(default_cap)))
@@ -1977,29 +1973,11 @@ def extract_meals_from_voice_log_transcript(transcript: str, *, fast: bool = Fal
         max_out = default_cap
     if fast:
         max_out = min(max_out, 600)
-    max_out = max(256, min(max_out, 4000))
+    return max(256, min(max_out, 4000))
 
-    system_prompt = (
-        "Extract food log items from the transcript. Return ONLY JSON: "
-        '{"meals":[{"name":"","description":"","meal_type":"Breakfast|Lunch|Dinner|Snack|Unknown",'
-        '"calories":0,"protein_g":0,"carbs_g":0,"fat_g":0}]}. '
-        "One entry per distinct meal/snack; estimate kcal and macros for typical portions. "
-        "Non-food or empty transcript → {\"meals\":[]}. No markdown."
-    )
-    completion = client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": transcript[:12000]},
-        ],
-        temperature=0.1,
-        **_chat_completion_limit_kw(model, max_out),
-        response_format={"type": "json_object"},
-    )
-    raw = completion.choices[0].message.content
-    if not raw:
-        return []
-    obj = _force_json(raw)
+
+def _normalize_food_log_meals_from_obj(obj: dict) -> list[dict]:
+    """Normalize LLM JSON `meals` array into the /food-logging meal shape."""
     meals = obj.get("meals", [])
     if not isinstance(meals, list):
         return []
@@ -2028,6 +2006,171 @@ def extract_meals_from_voice_log_transcript(transcript: str, *, fast: bool = Fal
             "fat_g": round(_nf("fat_g"), 1),
         })
     return out
+
+
+def extract_meals_from_voice_log_transcript(transcript: str, *, fast: bool = False) -> list[dict]:
+    """
+    Parse spoken food log into structured meals with estimated calories and macros.
+    Tuned for latency: small completion budget, compact prompt.
+    """
+    model = os.getenv("VOICE_LOGGING_MODEL", "gpt-4o-mini")
+    max_out = _voice_logging_completion_budget(fast=fast)
+
+    system_prompt = (
+        "Extract food log items from the transcript. Return ONLY JSON: "
+        '{"meals":[{"name":"","description":"","meal_type":"Breakfast|Lunch|Dinner|Snack|Unknown",'
+        '"calories":0,"protein_g":0,"carbs_g":0,"fat_g":0}]}. '
+        "One entry per distinct meal/snack; estimate kcal and macros for typical portions. "
+        "Non-food or empty transcript → {\"meals\":[]}. No markdown."
+    )
+    completion = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": transcript[:12000]},
+        ],
+        temperature=0.1,
+        **_chat_completion_limit_kw(model, max_out),
+        response_format={"type": "json_object"},
+    )
+    raw = completion.choices[0].message.content
+    if not raw:
+        return []
+    obj = _force_json(raw)
+    return _normalize_food_log_meals_from_obj(obj)
+
+
+def extract_meals_from_food_photo(image_data_url: str, *, fast: bool = False) -> tuple[list[dict], str]:
+    """
+    Vision: identify food in a meal photo and return the same meal objects as voice/text logging.
+    Second return value is a short summary for the `transcript` field (what was visible).
+    """
+    model = os.getenv("FOOD_LOGGING_PHOTO_MODEL") or os.getenv("VOICE_LOGGING_MODEL", "gpt-4o-mini")
+    max_out = _voice_logging_completion_budget(fast=fast)
+
+    system_prompt = (
+        "You analyze photos of food for a meal logging app. Identify dishes and estimate portions. "
+        "Return ONLY JSON: "
+        '{"summary":"1–2 sentences describing what food is visible (or empty if none).","meals":['
+        '{"name":"","description":"","meal_type":"Breakfast|Lunch|Dinner|Snack|Unknown",'
+        '"calories":0,"protein_g":0,"carbs_g":0,"fat_g":0}]}. '
+        "One meal entry per distinct dish; if one plate has several items, you may use one combined entry with a clear description. "
+        "Estimate kcal and macros for likely portion sizes from the image. "
+        "If the image shows no edible food, is too blurry, or is not food → {\"summary\":\"\",\"meals\":[]}. "
+        "No markdown."
+    )
+    completion = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Analyze this food photo and return the JSON."},
+                    {"type": "image_url", "image_url": {"url": image_data_url}},
+                ],
+            },
+        ],
+        temperature=0.1,
+        **_chat_completion_limit_kw(model, max_out),
+        response_format={"type": "json_object"},
+    )
+    raw = completion.choices[0].message.content
+    if not raw:
+        return [], ""
+    obj = _force_json(raw)
+    summary = str(obj.get("summary", "")).strip()
+    meals = _normalize_food_log_meals_from_obj(obj)
+    return meals, summary
+
+
+def _multipart_upload_mimetype(uploaded_file) -> str | None:
+    for attr in ("mimetype", "content_type"):
+        v = getattr(uploaded_file, attr, None)
+        if v:
+            return str(v).strip()
+    return None
+
+
+def _looks_like_image_multipart_file(filename: str | None, mimetype: str | None) -> bool:
+    """True if upload is likely an image (extension or Content-Type)."""
+    mt = (mimetype or "").strip().lower()
+    if mt.startswith("image/"):
+        return True
+    fn = (filename or "").lower()
+    return fn.endswith(
+        (".jpg", ".jpeg", ".png", ".gif", ".webp", ".heic", ".heif", ".bmp", ".tif", ".tiff"),
+    )
+
+
+def _content_type_for_image_filename(filename: str) -> str:
+    fn = filename.lower()
+    if fn.endswith((".jpg", ".jpeg")):
+        return "image/jpeg"
+    if fn.endswith(".png"):
+        return "image/png"
+    if fn.endswith(".gif"):
+        return "image/gif"
+    if fn.endswith(".webp"):
+        return "image/webp"
+    if fn.endswith((".heic", ".heif")):
+        return "image/heic"
+    if fn.endswith((".bmp",)):
+        return "image/bmp"
+    if fn.endswith((".tif", ".tiff")):
+        return "image/tiff"
+    return "image/jpeg"
+
+
+def _food_logging_image_data_url_from_request() -> tuple[str | None, str | None]:
+    """
+    Build a data: URL for vision from multipart or JSON (imageBase64 + imageFormat).
+
+    Multipart field names tried in order: image, photo, file, audio.
+    The audio key is accepted only when the part looks like an image (some clients reuse the voice field).
+
+    Returns (data_url, None) or (None, error_message for 400 responses).
+    """
+    for key in ("image", "photo", "file", "audio"):
+        if key not in request.files:
+            continue
+        uploaded_file = request.files.get(key)
+        if not uploaded_file or not uploaded_file.filename:
+            continue
+        mt_part = _multipart_upload_mimetype(uploaded_file)
+        if not _looks_like_image_multipart_file(uploaded_file.filename, mt_part):
+            continue
+        image_bytes = uploaded_file.read()
+        if not image_bytes:
+            return None, "Uploaded image file is empty"
+        content_type = _content_type_for_image_filename(uploaded_file.filename)
+        mt = (mt_part or "").strip().lower()
+        if mt.startswith("image/"):
+            content_type = mt
+        image_base64 = base64.b64encode(image_bytes).decode("utf-8")
+        return f"data:{content_type};base64,{image_base64}", None
+
+    if request.is_json:
+        data = request.get_json(silent=True) or {}
+        image_base64 = data.get("imageBase64") or data.get("image")
+        if image_base64:
+            if "," in str(image_base64):
+                image_base64 = str(image_base64).split(",")[-1]
+            image_format = (data.get("imageFormat") or "jpg").lower()
+            format_to_mime = {
+                "jpg": "image/jpeg",
+                "jpeg": "image/jpeg",
+                "png": "image/png",
+                "gif": "image/gif",
+                "webp": "image/webp",
+            }
+            content_type = format_to_mime.get(image_format, "image/jpeg")
+            return f"data:{content_type};base64,{image_base64}", None
+
+    return None, (
+        "Image is required when action=photo. "
+        "Use multipart fields image, photo, file, or audio (if the file is an image), or JSON imageBase64."
+    )
 
 
 # ---------------------------
@@ -2084,26 +2227,41 @@ def food_logging():
     Form fields:
     - action: "voice" (default) — requires multipart audio; runs transcribe_audio_file (Whisper).
       "text" — provide transcript via form field transcript or text; no audio.
+      "photo" — multipart image under `image`, `photo`, `file`, or `audio` (if the upload is an image),
+        or JSON with imageBase64 (+ imageFormat). Uses vision to identify food and estimate macros;
+        `transcript` is a short summary of what was seen.
     - audio: file (required when action=voice)
     - transcript / text: food log text (required when action=text)
     - fast (optional): 1/true — smaller LLM completion budget for meal extraction only.
-    Each meal in the response always includes imageUrl (DALL·E or DEFAULT_MEAL_IMAGE_URL fallback).
+    Each meal in the response always includes imageUrl (user photo when action=photo and size allows,
+    else DALL·E or DEFAULT_MEAL_IMAGE_URL fallback).
     Whisper: optional env FOOD_LOGGING_WHISPER_LANGUAGE (e.g. en) can reduce latency.
+    Photo: optional FOOD_LOGGING_PHOTO_MODEL (defaults to VOICE_LOGGING_MODEL / gpt-4o-mini).
+    Optional FOOD_LOGGING_PHOTO_MAX_DATA_URL_CHARS — if the data URL exceeds this, imageUrl uses DALL·E instead
+    of echoing the upload (keeps JSON payloads smaller).
     """
     try:
-        action = (request.form.get("action") or request.args.get("action") or "voice").strip().lower()
-        if action not in ("voice", "text"):
+        json_body = request.get_json(silent=True) or {}
+        action = (
+            request.form.get("action")
+            or request.args.get("action")
+            or json_body.get("action")
+            or "voice"
+        )
+        action = str(action).strip().lower()
+        if action not in ("voice", "text", "photo"):
             return jsonify({
                 "error": "Invalid action",
-                "allowed": ["voice", "text"],
+                "allowed": ["voice", "text", "photo"],
             }), 400
 
         default_image_url = os.getenv(
             "DEFAULT_MEAL_IMAGE_URL",
             "https://images.unsplash.com/photo-1498837167922-ddd27525d352?auto=format&fit=crop&w=1200&q=80",
         )
-        fast_flag = (request.form.get("fast") or request.args.get("fast") or "").strip().lower() in (
-            "1", "true", "yes",
+        fast_flag = (
+            (request.form.get("fast") or request.args.get("fast") or "").strip().lower() in ("1", "true", "yes")
+            or str(json_body.get("fast", "")).strip().lower() in ("1", "true", "yes")
         )
 
         if action == "voice":
@@ -2126,13 +2284,67 @@ def food_logging():
                 audio_file.filename,
                 language=whisper_lang,
             )
-        else:
+        elif action == "text":
             transcript = (request.form.get("transcript") or request.form.get("text") or "").strip()
             if not transcript:
                 return jsonify({
                     "error": "transcript or text is required when action=text",
                 }), 400
             print(f"[food-logging] action=text, len={len(transcript)} chars")
+        else:
+            # action == "photo"
+            photo_data_url, img_err = _food_logging_image_data_url_from_request()
+            if img_err or not photo_data_url:
+                return jsonify({"error": img_err or "Image required"}), 400
+            print(f"[food-logging] action=photo, data_url_len={len(photo_data_url)}")
+            meals, transcript = extract_meals_from_food_photo(photo_data_url, fast=fast_flag)
+            if not meals and not (transcript or "").strip():
+                return jsonify({
+                    "error": "No food detected",
+                    "transcript": "",
+                    "meals": [],
+                    "user_message": "We couldn't identify food in this photo. Try a clearer picture, better lighting, or use voice or text logging.",
+                }), 400
+            # Skip the shared voice/text path below
+            if not meals:
+                return jsonify({
+                    "transcript": transcript,
+                    "meals": [],
+                    "message": "No structured meals extracted from this photo.",
+                    "action": "photo",
+                })
+
+            try:
+                max_embed = int(os.getenv("FOOD_LOGGING_PHOTO_MAX_DATA_URL_CHARS", "2000000"))
+            except ValueError:
+                max_embed = 2000000
+            use_photo_as_image_url = (
+                photo_data_url
+                and len(photo_data_url) <= max_embed
+                and (os.getenv("FOOD_LOGGING_PHOTO_USE_DALLE", "").strip().lower() not in ("1", "true", "yes"))
+            )
+            if use_photo_as_image_url:
+                for m in meals:
+                    m["imageUrl"] = photo_data_url
+            else:
+                dalle_sz = _food_logging_dalle_size()
+                workers = _food_logging_image_pool_size(len(meals))
+
+                def _image_for_meal(m: dict) -> str | None:
+                    return _generate_food_log_meal_image_url(m, size=dalle_sz)
+
+                with ThreadPoolExecutor(max_workers=workers) as ex:
+                    urls = list(ex.map(_image_for_meal, meals))
+                for meal, url in zip(meals, urls):
+                    meal["imageUrl"] = url or default_image_url
+
+            return jsonify({
+                "transcript": transcript,
+                "meals": meals,
+                "message": f"Logged {len(meals)} meal(s) from photo.",
+                "action": "photo",
+            })
+
         if not transcript or not transcript.strip():
             return jsonify({
                 "error": "No speech detected",

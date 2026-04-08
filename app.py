@@ -813,8 +813,15 @@ def _dietary_restrictions_plant_based_prompt_block(restrictions: list) -> str:
     return ""
 
 
-def _recommend_meals_dalle_size() -> str:
-    """Smallest DALL·E 2 size (256x256) for fastest image generation; override via env."""
+def _recommend_meals_dalle_size(*, image_quality: str | None = None) -> str:
+    """
+    DALL·E 2 only supports 256 / 512 / 1024. Default `image_quality` is low (256x256) for speed.
+    Legacy: unknown `image_quality` falls back to RECOMMEND_MEALS_DALLE_SIZE env then 256x256.
+    """
+    q = (image_quality or "low").strip().lower()
+    tier = {"low": "256x256", "medium": "512x512", "high": "1024x1024"}
+    if q in tier:
+        return tier[q]
     allowed = {"256x256", "512x512", "1024x1024"}
     s = (os.getenv("RECOMMEND_MEALS_DALLE_SIZE") or "256x256").strip()
     return s if s in allowed else "256x256"
@@ -823,7 +830,7 @@ def _recommend_meals_dalle_size() -> str:
 def _recommend_meals_image_pool_size(num_images: int) -> int:
     """Parallel DALL·E calls; higher = lower wall-clock time (capped)."""
     try:
-        w = int(os.getenv("RECOMMEND_MEALS_IMAGE_MAX_WORKERS", "8"))
+        w = int(os.getenv("RECOMMEND_MEALS_IMAGE_MAX_WORKERS", "16"))
     except ValueError:
         w = 8
     w = max(1, min(w, 16))
@@ -973,6 +980,7 @@ def _log_recommend_api_request(route_label: str, data: dict) -> None:
 def recommend_meals():
     """
     Generate a multi-day meal plan with dynamic num_days and num_meals.
+    When include_images is true, image_quality may be low|medium|high (default low = 256px DALL·E).
     """
     data = request.get_json(silent=True) or {}
     _log_recommend_api_request("recommend-meals", data)
@@ -983,7 +991,8 @@ def recommend_meals():
     # Performance-first defaults for mobile UX:
     # - include_images defaults to False (image generation is the slowest part)
     # - fast_mode defaults to True (single attempt/day, lower token budget; also shorter image prompts)
-    # - Images: RECOMMEND_MEALS_DALLE_SIZE (default 256x256), RECOMMEND_MEALS_IMAGE_MAX_WORKERS (default 8)
+    # - image_quality: low|medium|high → DALL·E 2 256/512/1024 (default low for fastest images)
+    # - RECOMMEND_MEALS_IMAGE_MAX_WORKERS (default 16) caps parallel DALL·E calls
     include_images = data.get("include_images", False)
     include_steps = data.get("include_steps", True)
     include_macros = data.get("include_macros", True)
@@ -998,6 +1007,9 @@ def recommend_meals():
     if strict_calorie_alignment is None:
         strict_calorie_alignment = True
     strict_calorie_alignment = bool(strict_calorie_alignment)
+    _img_quality = str(data.get("image_quality") or "low").strip().lower()
+    if _img_quality not in ("low", "medium", "high"):
+        _img_quality = "low"
     recommend_model = os.getenv("RECOMMEND_MEALS_MODEL", "gpt-5.4-mini")
     num_meals = int(data.get("num_meals", 4))
     if num_meals < 1 or num_meals > 8:
@@ -1360,15 +1372,16 @@ def recommend_meals():
                 for mk in required_meal_keys:
                     meal_refs.append(day_obj.get(mk, {}))
 
-            _dalle_sz = _recommend_meals_dalle_size()
+            _dalle_sz = _recommend_meals_dalle_size(image_quality=_img_quality)
             _img_workers = _recommend_meals_image_pool_size(len(meal_refs))
+            _img_prompt_fast = bool(fast_mode) or (_img_quality == "low")
 
             def _generate_meal_image(meal_obj: dict) -> str | None:
                 try:
                     meal_name = meal_obj.get("name", "Meal")
                     meal_desc = meal_obj.get("description", "")
                     prompt = _meal_image_prompt_for_recommend(
-                        meal_name, meal_desc, fast_mode=bool(fast_mode)
+                        meal_name, meal_desc, fast_mode=_img_prompt_fast
                     )
                     img = client.images.generate(
                         model="dall-e-2",
@@ -1479,6 +1492,7 @@ def recommend_meals_day():
     """
     Generate one day meal plan (breakfast/lunch/dinner/snacks).
     Designed for client-side parallel calls (day 1..7) with merge on client.
+    When include_images is true, image_quality may be low|medium|high (default low = 256px DALL·E).
     """
     data = request.get_json(silent=True) or {}
     _log_recommend_api_request("recommend-meals/day", data)
@@ -1496,6 +1510,9 @@ def recommend_meals_day():
     include_macros = bool(include_macros)
     fast_mode = data.get("fast_mode", True)
     strict_calorie_alignment = data.get("strict_calorie_alignment", True)
+    _img_quality = str(data.get("image_quality") or "low").strip().lower()
+    if _img_quality not in ("low", "medium", "high"):
+        _img_quality = "low"
     recommend_model = os.getenv("RECOMMEND_MEALS_MODEL", "gpt-5.4-mini")
     num_meals = int(data.get("num_meals", 4))
     if num_meals < 1 or num_meals > 8:
@@ -1766,15 +1783,16 @@ Keep compact: max 8 ingredients per meal.
                 _plan_meal_name_history[plan_id].update(generated_names)
 
         if include_images:
-            _dalle_sz = _recommend_meals_dalle_size()
+            _dalle_sz = _recommend_meals_dalle_size(image_quality=_img_quality)
             _img_workers = _recommend_meals_image_pool_size(len(required_meal_keys))
+            _img_prompt_fast = bool(fast_mode) or (_img_quality == "low")
 
             def _generate_meal_image(meal_obj: dict) -> str | None:
                 try:
                     prompt = _meal_image_prompt_for_recommend(
                         meal_obj.get("name", "Meal"),
                         meal_obj.get("description", ""),
-                        fast_mode=bool(fast_mode),
+                        fast_mode=_img_prompt_fast,
                     )
                     img = client.images.generate(
                         model="dall-e-2",
@@ -2233,12 +2251,10 @@ def food_logging():
     - audio: file (required when action=voice)
     - transcript / text: food log text (required when action=text)
     - fast (optional): 1/true — smaller LLM completion budget for meal extraction only.
-    Each meal in the response always includes imageUrl (user photo when action=photo and size allows,
-    else DALL·E or DEFAULT_MEAL_IMAGE_URL fallback).
+    Each meal in the response includes imageUrl: for action=photo this is always the same image sent in the
+    request (data URL); for voice/text, DALL·E or DEFAULT_MEAL_IMAGE_URL fallback.
     Whisper: optional env FOOD_LOGGING_WHISPER_LANGUAGE (e.g. en) can reduce latency.
     Photo: optional FOOD_LOGGING_PHOTO_MODEL (defaults to VOICE_LOGGING_MODEL / gpt-4o-mini).
-    Optional FOOD_LOGGING_PHOTO_MAX_DATA_URL_CHARS — if the data URL exceeds this, imageUrl uses DALL·E instead
-    of echoing the upload (keeps JSON payloads smaller).
     """
     try:
         json_body = request.get_json(silent=True) or {}
@@ -2314,29 +2330,8 @@ def food_logging():
                     "action": "photo",
                 })
 
-            try:
-                max_embed = int(os.getenv("FOOD_LOGGING_PHOTO_MAX_DATA_URL_CHARS", "2000000"))
-            except ValueError:
-                max_embed = 2000000
-            use_photo_as_image_url = (
-                photo_data_url
-                and len(photo_data_url) <= max_embed
-                and (os.getenv("FOOD_LOGGING_PHOTO_USE_DALLE", "").strip().lower() not in ("1", "true", "yes"))
-            )
-            if use_photo_as_image_url:
-                for m in meals:
-                    m["imageUrl"] = photo_data_url
-            else:
-                dalle_sz = _food_logging_dalle_size()
-                workers = _food_logging_image_pool_size(len(meals))
-
-                def _image_for_meal(m: dict) -> str | None:
-                    return _generate_food_log_meal_image_url(m, size=dalle_sz)
-
-                with ThreadPoolExecutor(max_workers=workers) as ex:
-                    urls = list(ex.map(_image_for_meal, meals))
-                for meal, url in zip(meals, urls):
-                    meal["imageUrl"] = url or default_image_url
+            for m in meals:
+                m["imageUrl"] = photo_data_url
 
             return jsonify({
                 "transcript": transcript,

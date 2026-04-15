@@ -1,10 +1,31 @@
 import firebase_admin
-from firebase_admin import credentials, firestore
+from firebase_admin import credentials, firestore, storage
 from datetime import datetime
+import json
+import os
 import threading
+import uuid
+
+import requests
 
 _firestore_client = None
 _firestore_lock = threading.Lock()
+
+_FIREBASE_CREDENTIALS_PATH = os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON", "firebase_service_account.json")
+_MEAL_IMAGE_MAX_BYTES = int(os.getenv("MEAL_IMAGE_MAX_DOWNLOAD_BYTES", str(12 * 1024 * 1024)))
+
+
+def _firebase_default_bucket_name() -> str:
+    explicit = (os.getenv("FIREBASE_STORAGE_BUCKET") or "").strip()
+    if explicit:
+        return explicit
+    try:
+        with open(_FIREBASE_CREDENTIALS_PATH, encoding="utf-8") as f:
+            pid = json.load(f).get("project_id")
+        return f"{pid}.appspot.com" if pid else ""
+    except Exception:
+        return ""
+
 
 def init_firestore():
     global _firestore_client
@@ -13,11 +34,138 @@ def init_firestore():
 
     with _firestore_lock:
         if not firebase_admin._apps:
-            cred = credentials.Certificate("firebase_service_account.json")
-            firebase_admin.initialize_app(cred)
+            cred = credentials.Certificate(_FIREBASE_CREDENTIALS_PATH)
+            bucket_name = _firebase_default_bucket_name()
+            opts = {"storageBucket": bucket_name} if bucket_name else {}
+            firebase_admin.initialize_app(cred, opts)
         if _firestore_client is None:
             _firestore_client = firestore.client()
     return _firestore_client
+
+
+def upload_meal_image_bytes_to_storage(data: bytes, content_type: str = "image/png") -> str | None:
+    """
+    Upload raw image bytes to Firebase Storage and return a public HTTPS URL, or None on failure/skip.
+    """
+    if (os.getenv("DISABLE_MEAL_IMAGE_PERSISTENCE") or "").strip().lower() in ("1", "true", "yes"):
+        return None
+    if not data or not isinstance(data, (bytes, bytearray)):
+        return None
+    data = bytes(data)
+    if len(data) > _MEAL_IMAGE_MAX_BYTES:
+        print("[meal-image] persist skipped: image too large")
+        return None
+
+    ct = (content_type or "image/png").split(";")[0].strip()
+    ext = ".png"
+    if "jpeg" in ct or "jpg" in ct:
+        ext = ".jpg"
+    elif "webp" in ct:
+        ext = ".webp"
+
+    init_firestore()
+    try:
+        bucket = storage.bucket()
+    except Exception as e:
+        print(f"[meal-image] storage bucket unavailable: {e}")
+        return None
+
+    object_name = f"generated-meals/{uuid.uuid4().hex}{ext}"
+    blob = bucket.blob(object_name)
+    try:
+        blob.upload_from_string(data, content_type=ct)
+        print(f"[meal-image] uploaded to Firebase Storage: {object_name}")
+    except Exception as e:
+        print(f"[meal-image] upload failed: {e}")
+        return None
+
+    # Always return the canonical firebasestorage.googleapis.com URL.
+    # blob.public_url returns a storage.googleapis.com URL which is a different domain
+    # and won't work with Flutter's Firebase SDK or cached network image widgets.
+    # make_public() is attempted as a best-effort ACL grant (no-op if uniform bucket-level
+    # access is enabled — Storage Rules handle public access in that case).
+    try:
+        blob.make_public()
+    except Exception as e:
+        print(f"[meal-image] make_public skipped (ok if Storage Rules grant public read): {e}")
+
+    bucket_name = bucket.name
+    encoded_name = object_name.replace("/", "%2F")
+    firebase_url = (
+        f"https://firebasestorage.googleapis.com/v0/b/{bucket_name}/o/{encoded_name}?alt=media"
+    )
+    print(f"[meal-image] returning Firebase URL: {firebase_url}")
+    return firebase_url
+
+
+def save_recommend_meal_image_record(
+    plan_id: str,
+    day_index: int,
+    meal_key: str,
+    image_url: str,
+) -> None:
+    """
+    Store a permanent meal image URL for /recommend-meals so clients (e.g. Flutter) can sync from Firestore.
+    Document id: {plan_id}_d{day_index}_{meal_key}
+    """
+    if not plan_id or not image_url:
+        return
+    try:
+        db = init_firestore()
+        doc_id = f"{plan_id}_d{day_index}_{meal_key}"
+        db.collection("recommend_meal_images").document(doc_id).set(
+            {
+                "plan_id": plan_id,
+                "day_index": day_index,
+                "meal_key": meal_key,
+                "image_url": image_url,
+                "updated_at": datetime.utcnow(),
+            },
+            merge=True,
+        )
+    except Exception as e:
+        print(f"[recommend-meal-image] firestore write failed: {e}")
+
+
+def _trusted_openai_generated_image_url(url: str) -> bool:
+    """Only fetch URLs we expect from OpenAI image APIs (SSRF-safe)."""
+    from urllib.parse import urlparse
+
+    u = urlparse(url)
+    if u.scheme != "https" or not u.hostname:
+        return False
+    h = u.hostname.lower()
+    return h.endswith(".blob.core.windows.net")
+
+
+def try_persist_meal_image_from_openai_url(url: str) -> str | None:
+    """
+    Download a short-lived OpenAI/DALL·E image URL and upload to Firebase Storage.
+    Returns a stable HTTPS URL (GCS public URL), or None on skip/failure.
+    """
+    if (os.getenv("DISABLE_MEAL_IMAGE_PERSISTENCE") or "").strip().lower() in ("1", "true", "yes"):
+        return None
+    if not url or not isinstance(url, str) or not _trusted_openai_generated_image_url(url):
+        return None
+    try:
+        r = requests.get(url, timeout=45, stream=True)
+        r.raise_for_status()
+        ct = (r.headers.get("Content-Type") or "image/png").split(";")[0].strip()
+        buf = bytearray()
+        for chunk in r.iter_content(65536):
+            if not chunk:
+                continue
+            buf.extend(chunk)
+            if len(buf) > _MEAL_IMAGE_MAX_BYTES:
+                print("[meal-image] persist skipped: image too large")
+                return None
+        data = bytes(buf)
+    except Exception as e:
+        print(f"[meal-image] download failed: {e}")
+        return None
+
+    return upload_meal_image_bytes_to_storage(data, ct)
+
 
 def get_user_context(email, max_logs=5):
     db = init_firestore()

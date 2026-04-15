@@ -3,7 +3,15 @@ from langchain_community.vectorstores import Chroma
 from langchain_openai import ChatOpenAI
 from langchain_openai import OpenAIEmbeddings
 from langchain.chains import RetrievalQA
-from firebase_utils import get_user_context, get_user_chat_history, save_user_chat, init_firestore
+from firebase_utils import (
+    get_user_context,
+    get_user_chat_history,
+    save_user_chat,
+    init_firestore,
+    try_persist_meal_image_from_openai_url,
+    upload_meal_image_bytes_to_storage,
+    save_recommend_meal_image_record,
+)
 from dotenv import load_dotenv
 import os
 import csv
@@ -870,8 +878,8 @@ def _food_logging_image_pool_size(num_images: int) -> int:
     return min(w, max(1, num_images))
 
 
-def _generate_food_log_meal_image_url(meal: dict, *, size: str) -> str | None:
-    """DALL·E 2, compact prompt — optimized for /food-logging latency."""
+def _generate_food_log_meal_image_b64(meal: dict, *, size: str) -> str | None:
+    """DALL·E 2 with b64_json — avoids temporary CDN URLs, decode + upload directly to Firebase."""
     try:
         prompt = _meal_image_prompt_for_recommend(
             meal.get("name", "Meal"),
@@ -883,10 +891,60 @@ def _generate_food_log_meal_image_url(meal: dict, *, size: str) -> str | None:
             prompt=prompt,
             size=size,
             n=1,
+            response_format="b64_json",
         )
-        return img.data[0].url if img and img.data else None
+        if img and img.data and img.data[0].b64_json:
+            return img.data[0].b64_json
+        return None
     except Exception:
         return None
+
+
+def _food_logging_finalize_image_from_b64(b64_json: str | None, default_image_url: str) -> str:
+    """Decode DALL·E b64_json and upload directly to Firebase Storage.
+    Returns a stable firebasestorage.googleapis.com URL, or default_image_url on failure.
+    """
+    if not b64_json:
+        return default_image_url
+    try:
+        raw = base64.b64decode(b64_json)
+    except Exception as e:
+        print(f"[food-logging] image b64 decode failed: {e}")
+        return default_image_url
+    url = upload_meal_image_bytes_to_storage(raw, "image/png")
+    return url if url else default_image_url
+
+
+def _finalize_meal_image_url(openai_url: str | None, default_image_url: str) -> str:
+    """Upload DALL·E CDN URL to Firebase Storage when possible; else return default URL."""
+    if not openai_url:
+        return default_image_url
+    permanent = try_persist_meal_image_from_openai_url(openai_url)
+    return permanent or default_image_url
+
+
+def _recommend_meals_finalize_image_from_b64(
+    b64_json: str | None,
+    default_image_url: str,
+    plan_id: str,
+    day_index: int,
+    meal_key: str,
+) -> str:
+    """
+    Decode DALL·E b64_json, upload to Firebase Storage, record URL in Firestore (recommend_meal_images).
+    """
+    if not b64_json:
+        return default_image_url
+    try:
+        raw = base64.b64decode(b64_json)
+    except Exception as e:
+        print(f"[recommend-meals] image b64 decode failed: {e}")
+        return default_image_url
+    url = upload_meal_image_bytes_to_storage(raw, "image/png")
+    if url:
+        save_recommend_meal_image_record(plan_id, day_index, meal_key, url)
+        return url
+    return default_image_url
 
 
 def _chat_completion_limit_kw(model: str, max_tokens: int) -> dict:
@@ -981,6 +1039,8 @@ def recommend_meals():
     """
     Generate a multi-day meal plan with dynamic num_days and num_meals.
     When include_images is true, image_quality may be low|medium|high (default low = 256px DALL·E).
+    Images use response_format=b64_json; the API decodes, uploads to Firebase Storage, stores URLs in
+    Firestore (collection recommend_meal_images), and sets each meal's imageUrl to the public URL.
     """
     data = request.get_json(silent=True) or {}
     _log_recommend_api_request("recommend-meals", data)
@@ -1367,16 +1427,17 @@ def recommend_meals():
             plan["days"][str(i)] = day_payload
 
         if include_images:
-            meal_refs = []
-            for day_obj in days:
+            meal_jobs: list[tuple[int, str, dict]] = []
+            for day_i, day_obj in enumerate(days, start=1):
                 for mk in required_meal_keys:
-                    meal_refs.append(day_obj.get(mk, {}))
+                    meal_jobs.append((day_i, mk, day_obj.get(mk, {})))
 
             _dalle_sz = _recommend_meals_dalle_size(image_quality=_img_quality)
-            _img_workers = _recommend_meals_image_pool_size(len(meal_refs))
+            _img_workers = _recommend_meals_image_pool_size(len(meal_jobs))
             _img_prompt_fast = bool(fast_mode) or (_img_quality == "low")
 
-            def _generate_meal_image(meal_obj: dict) -> str | None:
+            def _generate_meal_image_b64(job: tuple[int, str, dict]) -> str | None:
+                _, _, meal_obj = job
                 try:
                     meal_name = meal_obj.get("name", "Meal")
                     meal_desc = meal_obj.get("description", "")
@@ -1388,19 +1449,37 @@ def recommend_meals():
                         prompt=prompt,
                         size=_dalle_sz,
                         n=1,
+                        response_format="b64_json",
                     )
-                    return img.data[0].url if img and img.data else None
+                    if img and img.data and img.data[0].b64_json:
+                        return img.data[0].b64_json
+                    return None
                 except Exception:
                     return None
 
             with ThreadPoolExecutor(max_workers=_img_workers) as img_executor:
-                futures = {img_executor.submit(_generate_meal_image, meal): meal for meal in meal_refs}
-                for fut, meal_obj in futures.items():
+                futures = {img_executor.submit(_generate_meal_image_b64, job): job for job in meal_jobs}
+                raw_quads: list[tuple[int, str, dict, str | None]] = []
+                for fut, job in futures.items():
+                    day_i, mk, meal_obj = job
                     try:
-                        generated_url = fut.result()
-                        meal_obj["imageUrl"] = generated_url or default_image_url
+                        raw_quads.append((day_i, mk, meal_obj, fut.result()))
                     except Exception:
-                        meal_obj["imageUrl"] = default_image_url
+                        raw_quads.append((day_i, mk, meal_obj, None))
+            persist_workers = min(max(1, len(raw_quads)), _img_workers)
+
+            def _persist_recommend_image(
+                quad: tuple[int, str, dict, str | None],
+            ) -> str:
+                day_i, mk, _meal_obj, b64 = quad
+                return _recommend_meals_finalize_image_from_b64(
+                    b64, default_image_url, plan_id, day_i, mk
+                )
+
+            with ThreadPoolExecutor(max_workers=persist_workers) as ex_persist:
+                finals = list(ex_persist.map(_persist_recommend_image, raw_quads))
+            for (_day_i, _mk, meal_obj, _b64), final_u in zip(raw_quads, finals):
+                meal_obj["imageUrl"] = final_u
 
         def _sum_plan_macros():
             total_cal = total_pro = total_carb = total_fat = 0.0
@@ -1493,6 +1572,8 @@ def recommend_meals_day():
     Generate one day meal plan (breakfast/lunch/dinner/snacks).
     Designed for client-side parallel calls (day 1..7) with merge on client.
     When include_images is true, image_quality may be low|medium|high (default low = 256px DALL·E).
+    Images use response_format=b64_json; the API decodes and uploads to Firebase Storage, stores URLs in
+    Firestore (collection recommend_meal_images), and sets each meal's imageUrl to the public URL.
     """
     data = request.get_json(silent=True) or {}
     _log_recommend_api_request("recommend-meals/day", data)
@@ -1787,7 +1868,7 @@ Keep compact: max 8 ingredients per meal.
             _img_workers = _recommend_meals_image_pool_size(len(required_meal_keys))
             _img_prompt_fast = bool(fast_mode) or (_img_quality == "low")
 
-            def _generate_meal_image(meal_obj: dict) -> str | None:
+            def _generate_meal_image_b64(meal_obj: dict) -> str | None:
                 try:
                     prompt = _meal_image_prompt_for_recommend(
                         meal_obj.get("name", "Meal"),
@@ -1799,18 +1880,37 @@ Keep compact: max 8 ingredients per meal.
                         prompt=prompt,
                         size=_dalle_sz,
                         n=1,
+                        response_format="b64_json",
                     )
-                    return img.data[0].url if img and img.data else None
+                    if img and img.data and img.data[0].b64_json:
+                        return img.data[0].b64_json
+                    return None
                 except Exception:
                     return None
 
             with ThreadPoolExecutor(max_workers=_img_workers) as ex:
-                futures = {ex.submit(_generate_meal_image, day_obj.get(k, {})): k for k in required_meal_keys}
-                for fut, k in futures.items():
+                futs = {
+                    k: ex.submit(_generate_meal_image_b64, day_obj.get(k, {}))
+                    for k in required_meal_keys
+                }
+                raws: list[tuple[str, str | None]] = []
+                for k in required_meal_keys:
                     try:
-                        day_obj[k]["imageUrl"] = fut.result() or default_image_url
+                        raws.append((k, futs[k].result()))
                     except Exception:
-                        day_obj[k]["imageUrl"] = default_image_url
+                        raws.append((k, None))
+            persist_workers = min(max(1, len(raws)), _img_workers)
+
+            def _persist_day_image(pair: tuple[str, str | None]) -> str:
+                meal_key, b64 = pair
+                return _recommend_meals_finalize_image_from_b64(
+                    b64, default_image_url, plan_id, day_number, meal_key
+                )
+
+            with ThreadPoolExecutor(max_workers=persist_workers) as ex_persist:
+                finals = list(ex_persist.map(_persist_day_image, raws))
+            for k, u in zip([x[0] for x in raws], finals):
+                day_obj[k]["imageUrl"] = u
 
         # Day totals + optional correction alignment to target calories (requires per-meal macros)
         totals = {"calories": 0.0, "protein_g": 0.0, "carbs_g": 0.0, "fat_g": 0.0}
@@ -2252,7 +2352,8 @@ def food_logging():
     - transcript / text: food log text (required when action=text)
     - fast (optional): 1/true — smaller LLM completion budget for meal extraction only.
     Each meal in the response includes imageUrl: for action=photo this is always the same image sent in the
-    request (data URL); for voice/text, DALL·E or DEFAULT_MEAL_IMAGE_URL fallback.
+    request (data URL); for voice/text, DALL·E then upload to Firebase Storage when configured (stable URL),
+    otherwise the temporary OpenAI CDN URL or DEFAULT_MEAL_IMAGE_URL fallback.
     Whisper: optional env FOOD_LOGGING_WHISPER_LANGUAGE (e.g. en) can reduce latency.
     Photo: optional FOOD_LOGGING_PHOTO_MODEL (defaults to VOICE_LOGGING_MODEL / gpt-4o-mini).
     """
@@ -2354,13 +2455,17 @@ def food_logging():
             dalle_sz = _food_logging_dalle_size()
             workers = _food_logging_image_pool_size(len(meals))
 
-            def _image_for_meal(m: dict) -> str | None:
-                return _generate_food_log_meal_image_url(m, size=dalle_sz)
+            # Generate b64_json and upload to Firebase in a single parallel pass.
+            # This avoids the two-pool pattern (generate URL → download → re-upload)
+            # and always returns a stable firebasestorage.googleapis.com URL.
+            def _generate_and_persist(m: dict) -> str:
+                b64 = _generate_food_log_meal_image_b64(m, size=dalle_sz)
+                return _food_logging_finalize_image_from_b64(b64, default_image_url)
 
             with ThreadPoolExecutor(max_workers=workers) as ex:
-                urls = list(ex.map(_image_for_meal, meals))
-            for meal, url in zip(meals, urls):
-                meal["imageUrl"] = url or default_image_url
+                finalized = list(ex.map(_generate_and_persist, meals))
+            for meal, url in zip(meals, finalized):
+                meal["imageUrl"] = url
 
         return jsonify({
             "transcript": transcript,

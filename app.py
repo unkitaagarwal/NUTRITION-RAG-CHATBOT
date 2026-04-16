@@ -604,60 +604,23 @@ Rules: Use required ingredients. Step-by-step instructions.{macro_summary} Valid
             }
             validated_meals.append(validated_meal)
         
-        # Generate images for meals if requested
+        # Generate images for meals if requested (b64_json → Firebase Storage, same as /food-logging)
         if include_images:
-            def generate_meal_image(meal_data, index):
-                """Generate image for a single meal using DALL-E"""
-                try:
-                    meal_name = meal_data["name"]
-                    meal_desc = meal_data["description"]
-                    # Create a descriptive prompt for the image
-                    image_prompt = f"Professional food photography of {meal_name}. {meal_desc}. High quality, appetizing, well-lit, restaurant style, on a plate, food photography"
-                    
-                    # Generate image using DALL-E 2 (most cost-effective option)
-                    # Pricing: DALL-E 2 is cheaper than DALL-E 3
-                    # Size pricing: 256x256 < 512x512 < 1024x1024 (smaller = cheaper)
-                    # Using DALL-E 2 with 256x256 for maximum cost savings
-                    image_response = client.images.generate(
-                        model="dall-e-2",  # Most inexpensive model
-                        prompt=image_prompt,
-                        size="512x512", 
-                        n=1,
-                    )
-                    
-                    return image_response.data[0].url
-                except Exception as e:
-                    error_msg = str(e)
-                    print(f"❌ Error generating image for {meal_data['name']}: {error_msg}")
-                    # Log more details if it's an OpenAI API error
-                    if hasattr(e, 'response'):
-                        try:
-                            error_data = e.response.json() if hasattr(e.response, 'json') else {}
-                            print(f"   API Error details: {error_data}")
-                        except:
-                            pass
-                    return None
-            
-            # Generate images in parallel using threads for faster processing
-            image_results = {}
-            threads = []
-            
-            def generate_with_index(meal_idx, meal_data):
-                url = generate_meal_image(meal_data, meal_idx)
-                image_results[meal_idx] = url
-            
-            for idx, meal in enumerate(validated_meals):
-                thread = Thread(target=generate_with_index, args=(idx, meal))
-                threads.append(thread)
-                thread.start()
-            
-            # Wait for all image generation threads to complete (max 60 seconds timeout)
-            for thread in threads:
-                thread.join(timeout=60)
-            
-            # Assign image URLs to meals
-            for idx, meal in enumerate(validated_meals):
-                meal["imageUrl"] = image_results.get(idx)
+            default_image_url = os.getenv(
+                "DEFAULT_MEAL_IMAGE_URL",
+                "https://images.unsplash.com/photo-1498837167922-ddd27525d352?auto=format&fit=crop&w=1200&q=80",
+            )
+            dalle_sz = _food_logging_dalle_size()
+            workers = _food_logging_image_pool_size(len(validated_meals))
+
+            def _generate_and_persist(m: dict) -> str:
+                b64 = _generate_food_log_meal_image_b64(m, size=dalle_sz)
+                return _food_logging_finalize_image_from_b64(b64, default_image_url)
+
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                finalized = list(ex.map(_generate_and_persist, validated_meals))
+            for meal, url in zip(validated_meals, finalized):
+                meal["imageUrl"] = url
         
         # Compute totals
         totals = {

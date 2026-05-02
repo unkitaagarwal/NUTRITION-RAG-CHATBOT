@@ -606,10 +606,7 @@ Rules: Use required ingredients. Step-by-step instructions.{macro_summary} Valid
         
         # Generate images for meals if requested (b64_json → Firebase Storage, same as /food-logging)
         if include_images:
-            default_image_url = os.getenv(
-                "DEFAULT_MEAL_IMAGE_URL",
-                "https://images.unsplash.com/photo-1498837167922-ddd27525d352?auto=format&fit=crop&w=1200&q=80",
-            )
+            default_image_url = os.getenv("DEFAULT_MEAL_IMAGE_URL", "")
             dalle_sz = _food_logging_dalle_size()
             workers = _food_logging_image_pool_size(len(validated_meals))
 
@@ -863,6 +860,27 @@ def _generate_food_log_meal_image_b64(meal: dict, *, size: str) -> str | None:
         return None
 
 
+def _generate_food_log_meal_image_url(meal: dict, *, size: str) -> str | None:
+    """DALL·E 2 URL fallback when b64_json path fails."""
+    try:
+        prompt = _meal_image_prompt_for_recommend(
+            meal.get("name", "Meal"),
+            meal.get("description", ""),
+            fast_mode=True,
+        )
+        img = client.images.generate(
+            model="dall-e-2",
+            prompt=prompt,
+            size=size,
+            n=1,
+        )
+        if img and img.data and getattr(img.data[0], "url", None):
+            return img.data[0].url
+        return None
+    except Exception:
+        return None
+
+
 def _food_logging_finalize_image_from_b64(b64_json: str | None, default_image_url: str) -> str:
     """Decode DALL·E b64_json and upload directly to Firebase Storage.
     Returns a stable firebasestorage.googleapis.com URL, or default_image_url on failure.
@@ -883,7 +901,7 @@ def _finalize_meal_image_url(openai_url: str | None, default_image_url: str) -> 
     if not openai_url:
         return default_image_url
     permanent = try_persist_meal_image_from_openai_url(openai_url)
-    return permanent or default_image_url
+    return permanent or default_image_url or openai_url
 
 
 def _recommend_meals_finalize_image_from_b64(
@@ -1042,10 +1060,7 @@ def recommend_meals():
         return jsonify({"error": "num_days must be between 1 and 30"}), 400
     meal_keys = _get_meal_keys(num_meals)
     plan_id = data.get("plan_id") or str(uuid.uuid4())
-    default_image_url = data.get("default_image_url") or os.getenv(
-        "DEFAULT_MEAL_IMAGE_URL",
-        "https://images.unsplash.com/photo-1498837167922-ddd27525d352?auto=format&fit=crop&w=1200&q=80",
-    )
+    default_image_url = data.get("default_image_url") or os.getenv("DEFAULT_MEAL_IMAGE_URL", "")
 
     required_fields = [
         "goal", "gender", "age", "height_cm", "weight_kg",
@@ -1567,10 +1582,7 @@ def recommend_meals_day():
     if day_number < 1 or day_number > 7:
         return jsonify({"error": "day_number must be between 1 and 7"}), 400
 
-    default_image_url = data.get("default_image_url") or os.getenv(
-        "DEFAULT_MEAL_IMAGE_URL",
-        "https://images.unsplash.com/photo-1498837167922-ddd27525d352?auto=format&fit=crop&w=1200&q=80",
-    )
+    default_image_url = data.get("default_image_url") or os.getenv("DEFAULT_MEAL_IMAGE_URL", "")
 
     required_fields = [
         "goal", "gender", "age", "height_cm", "weight_kg",
@@ -2314,6 +2326,8 @@ def food_logging():
     - audio: file (required when action=voice)
     - transcript / text: food log text (required when action=text)
     - fast (optional): 1/true — smaller LLM completion budget for meal extraction only.
+    - include_image (optional): true/false across form fields, query, or JSON (default true).
+      When false, skip all meal image generation/attachment.
     Each meal in the response includes imageUrl: for action=photo this is always the same image sent in the
     request (data URL); for voice/text, DALL·E then upload to Firebase Storage when configured (stable URL),
     otherwise the temporary OpenAI CDN URL or DEFAULT_MEAL_IMAGE_URL fallback.
@@ -2335,14 +2349,17 @@ def food_logging():
                 "allowed": ["voice", "text", "photo"],
             }), 400
 
-        default_image_url = os.getenv(
-            "DEFAULT_MEAL_IMAGE_URL",
-            "https://images.unsplash.com/photo-1498837167922-ddd27525d352?auto=format&fit=crop&w=1200&q=80",
-        )
+        default_image_url = os.getenv("DEFAULT_MEAL_IMAGE_URL", "")
         fast_flag = (
             (request.form.get("fast") or request.args.get("fast") or "").strip().lower() in ("1", "true", "yes")
             or str(json_body.get("fast", "")).strip().lower() in ("1", "true", "yes")
         )
+        include_image_raw = (
+            request.form.get("include_image")
+            or request.args.get("include_image")
+            or json_body.get("include_image")
+        )
+        include_image = True if include_image_raw is None else str(include_image_raw).strip().lower() in ("1", "true", "yes")
 
         if action == "voice":
             if "audio" not in request.files:
@@ -2395,7 +2412,7 @@ def food_logging():
                 })
 
             for m in meals:
-                m["imageUrl"] = photo_data_url
+                m["imageUrl"] = photo_data_url if include_image else None
 
             return jsonify({
                 "transcript": transcript,
@@ -2414,7 +2431,7 @@ def food_logging():
 
         meals = extract_meals_from_voice_log_transcript(transcript, fast=fast_flag)
 
-        if meals:
+        if meals and include_image:
             dalle_sz = _food_logging_dalle_size()
             workers = _food_logging_image_pool_size(len(meals))
 
@@ -2423,12 +2440,19 @@ def food_logging():
             # and always returns a stable firebasestorage.googleapis.com URL.
             def _generate_and_persist(m: dict) -> str:
                 b64 = _generate_food_log_meal_image_b64(m, size=dalle_sz)
-                return _food_logging_finalize_image_from_b64(b64, default_image_url)
+                url = _food_logging_finalize_image_from_b64(b64, default_image_url)
+                if url:
+                    return url
+                openai_url = _generate_food_log_meal_image_url(m, size=dalle_sz)
+                return _finalize_meal_image_url(openai_url, default_image_url)
 
             with ThreadPoolExecutor(max_workers=workers) as ex:
                 finalized = list(ex.map(_generate_and_persist, meals))
             for meal, url in zip(meals, finalized):
                 meal["imageUrl"] = url
+        elif meals:
+            for meal in meals:
+                meal["imageUrl"] = None
 
         return jsonify({
             "transcript": transcript,

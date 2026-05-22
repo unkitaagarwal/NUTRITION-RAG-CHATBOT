@@ -26,6 +26,7 @@ from openai import OpenAI
 from threading import Thread, Lock
 from collections import defaultdict
 import yt_dlp
+import instaloader
 import shutil
 import time
 import socket
@@ -35,6 +36,7 @@ import requests
 from bs4 import BeautifulSoup
 import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import hashlib
 
 
 # Load environment variables first
@@ -49,6 +51,11 @@ app = Flask(__name__)
 _plan_meal_name_history = defaultdict(set)
 _plan_meal_history_lock = Lock()
 
+# In-memory cache for /extract-recipe-from-video results, keyed by SHA256 of the video URL.
+# Same video URL always produces the same recipe, so we never re-run the full pipeline.
+_recipe_cache: dict = {}
+_recipe_cache_lock = Lock()
+
 # Initialize once
 # ---------- Config ----------
 MAX_VIDEO_SECONDS = int(os.getenv("MAX_VIDEO_SECONDS", "900"))  # 15 min default
@@ -59,6 +66,8 @@ LLM_MODEL = os.getenv("RECIPE_LLM_MODEL", "gpt-4o-mini")  # change if needed
 RECIPE_LLM_MODEL = os.getenv("RECIPE_LLM_MODEL", "gpt-4o-mini")
 
 YT_PROXY = os.getenv("YT_PROXY")
+PROFILE_VIDEO_DOWNLOADS_DIR = os.getenv("PROFILE_VIDEO_DOWNLOADS_DIR", "./downloads/profile_videos")
+PROFILE_VIDEO_PARALLEL_DOWNLOADS = max(1, min(int(os.getenv("PROFILE_VIDEO_PARALLEL_DOWNLOADS", "4")), 10))
 
 # Note: Global ydl_opts is not used - proxy is conditionally applied in individual functions
 # Proxy is ONLY used for YouTube URLs, not for TikTok/Instagram/webpages
@@ -2539,7 +2548,8 @@ def ytdlp_base_opts(temp_dir: str, video_url: str = None):
     """
     opts = {
         # IMPORTANT: robust selector with fallbacks (handles many edge cases)
-        "format": "bestaudio/best/best",
+        # Prefer low-bitrate audio — Whisper doesn't need high quality, so this reduces download size/time
+        "format": "bestaudio[abr<=64]/bestaudio/best",
         "outtmpl": os.path.join(temp_dir, "%(id)s.%(ext)s"),
         "restrictfilenames": True,
         "noplaylist": True,
@@ -2552,11 +2562,11 @@ def ytdlp_base_opts(temp_dir: str, video_url: str = None):
         "extractor_args": {
             "youtube": {"player_client": ["android", "web"]}
         },
-        # Convert to mp3
+        # Convert to mp3 at low bitrate — Whisper transcription doesn't need high quality audio
         "postprocessors": [{
             "key": "FFmpegExtractAudio",
             "preferredcodec": "mp3",
-            "preferredquality": "192",
+            "preferredquality": "64",
         }],
     }
 
@@ -2589,22 +2599,23 @@ def get_video_metadata(video_url: str):
 def download_audio_mp3(video_url: str):
     """
     Downloads video audio and returns mp3 bytes + basic metadata.
+    Uses a single yt-dlp call to fetch metadata + download, avoiding the
+    redundant separate get_video_metadata() round-trip.
     """
     temp_dir = tempfile.mkdtemp()
     try:
-        # Pre-check duration before downloading (best effort)
-        info = get_video_metadata(video_url)
-        duration = info.get("duration")  # seconds
-        title = info.get("title") or ""
-        extractor = info.get("extractor_key") or info.get("extractor") or ""
-
-        if duration and duration > MAX_VIDEO_SECONDS:
-            raise ValueError(f"Video too long ({duration}s). Max allowed is {MAX_VIDEO_SECONDS}s")
-
         opts = ytdlp_base_opts(temp_dir, video_url)
 
         with yt_dlp.YoutubeDL(opts) as ydl:
-            ydl.download([video_url])
+            # extract_info with download=True fetches metadata AND downloads in one call
+            info_dict = ydl.extract_info(video_url, download=True)
+
+        duration = info_dict.get("duration")
+        title = info_dict.get("title") or ""
+        extractor = info_dict.get("extractor_key") or info_dict.get("extractor") or ""
+
+        if duration and duration > MAX_VIDEO_SECONDS:
+            raise ValueError(f"Video too long ({duration}s). Max allowed is {MAX_VIDEO_SECONDS}s")
 
         mp3s = [f for f in os.listdir(temp_dir) if f.endswith(".mp3")]
         if not mp3s:
@@ -2764,6 +2775,14 @@ def extract_recipe_from_video():
         if not ok:
             return jsonify({"error": err}), 400
 
+        # ── Cache check ──────────────────────────────────────────────────────────
+        url_key = hashlib.sha256(video_url.encode()).hexdigest()
+        with _recipe_cache_lock:
+            if url_key in _recipe_cache:
+                print(f"⚡ Cache hit for video URL: {video_url}")
+                return jsonify({**_recipe_cache[url_key], "cached": True})
+        # ─────────────────────────────────────────────────────────────────────────
+
         print(f"🎥 Processing video URL: {video_url}")
 
         # 1) Download + extract audio
@@ -2788,13 +2807,13 @@ def extract_recipe_from_video():
 
         print(f"✅ Audio extracted: {len(audio_bytes)} bytes in {time.time()-t0:.2f}s")
 
-        # 2) Whisper transcription
+        # 2) Transcription
         print("🎤 Transcribing audio...")
         audio_file_obj = io.BytesIO(audio_bytes)
         audio_file_obj.name = "audio.mp3"
 
         transcript = client.audio.transcriptions.create(
-            model="whisper-1",
+            model="gpt-4o-mini-transcribe",
             file=audio_file_obj,
             response_format="text",
         )
@@ -2810,22 +2829,37 @@ def extract_recipe_from_video():
         print(f"✅ Transcript generated: {len(transcript_text)} characters")
 
         # 3) LLM extraction with chunking + merge
+        # gpt-4o-mini has a 128k token context window; 80 000 chars ≈ 20 000 tokens,
+        # so almost every cooking video transcript fits in a single call — no merge needed.
         print("🍳 Extracting recipe information...")
-        chunks = chunk_text(transcript_text, max_chars=6000)
+        chunks = chunk_text(transcript_text, max_chars=80000)
 
-        parts = []
-        for idx, ch in enumerate(chunks, start=1):
-            try:
-                part = extract_recipe_from_transcript_chunk(ch)
-                parts.append(part)
-            except Exception as e:
-                return jsonify({
-                    "error": "Failed to extract recipe from transcript chunk",
-                    "user_message": "We couldn't extract a recipe from this link. Please try another or add the recipe manually.",
-                    "chunk": idx,
-                    "details": str(e),
-                    "transcript": transcript_text
-                }), 500
+        # Process all chunks concurrently — for a single-chunk transcript this is a no-op,
+        # but for multi-chunk transcripts it turns N sequential LLM round-trips into 1 parallel batch.
+        parts = [None] * len(chunks)
+        chunk_error = {}
+
+        with ThreadPoolExecutor(max_workers=len(chunks)) as executor:
+            future_to_idx = {
+                executor.submit(extract_recipe_from_transcript_chunk, ch): i
+                for i, ch in enumerate(chunks)
+            }
+            for future in as_completed(future_to_idx):
+                idx = future_to_idx[future]
+                try:
+                    parts[idx] = future.result()
+                except Exception as e:
+                    chunk_error["idx"] = idx + 1
+                    chunk_error["details"] = str(e)
+
+        if chunk_error:
+            return jsonify({
+                "error": "Failed to extract recipe from transcript chunk",
+                "user_message": "We couldn't extract a recipe from this link. Please try another or add the recipe manually.",
+                "chunk": chunk_error["idx"],
+                "details": chunk_error["details"],
+                "transcript": transcript_text
+            }), 500
 
         final_recipe = merge_recipe_parts(parts) if len(parts) > 1 else parts[0]
 
@@ -2838,13 +2872,20 @@ def extract_recipe_from_video():
         if not isinstance(instructions, list):
             instructions = [str(instructions)]
 
-        return jsonify({
+        result = {
             "ingredients": ingredients,
             "instructions": instructions,
             "transcript": transcript_text,
             "meta": meta,
             "message": f"Successfully extracted recipe with {len(ingredients)} ingredients and {len(instructions)} instructions"
-        })
+        }
+
+        # ── Cache write ──────────────────────────────────────────────────────────
+        with _recipe_cache_lock:
+            _recipe_cache[url_key] = result
+        # ─────────────────────────────────────────────────────────────────────────
+
+        return jsonify(result)
 
     except Exception as e:
         print(f"💥 Critical error in extract_recipe_from_video: {str(e)}")
@@ -4063,6 +4104,14 @@ def extract_recipe():
         return extract_recipe_from_video_internal(url)
 
     # Webpage pipeline
+    # ── Cache check ──────────────────────────────────────────────────────────
+    webpage_key = hashlib.sha256(url.encode()).hexdigest()
+    with _recipe_cache_lock:
+        if webpage_key in _recipe_cache:
+            print(f"⚡ Cache hit for webpage URL: {url}")
+            return jsonify({**_recipe_cache[webpage_key], "cached": True})
+    # ─────────────────────────────────────────────────────────────────────────
+
     try:
         html = fetch_html(url)
         recipes, soup = extract_jsonld_recipes(html)
@@ -4085,23 +4134,30 @@ def extract_recipe():
         source_type = determine_source_type(url)
         _enrich_recipe_response(recipe)
         tags = extract_recipe_tags(recipe)
-        
+
         source = {
             "type": "webpage",
             "url": url,
             "provider": (urlparse(url).hostname or ""),
             "title": recipe.get("name", "") or (soup.title.string.strip() if soup.title and soup.title.string else ""),
             "image": image,
-            "source_type": source_type  # Add source type: TikTok, YouTube, Instagram, Photos, Manual
+            "source_type": source_type,
         }
 
-        return jsonify({
+        _result = {
             "source": source,
             "recipe": recipe,
-            "tags": tags,  # Add tags: High Protein, Vegetarian, Vegan, Quick, Easy, Medium, Hard
+            "tags": tags,
             "transcript": None,
-            "extraction": {"method": method, "confidence": 0.7 if method == "jsonld" else 0.5}
-        })
+            "extraction": {"method": method, "confidence": 0.7 if method == "jsonld" else 0.5},
+        }
+
+        # ── Cache write ──────────────────────────────────────────────────────
+        with _recipe_cache_lock:
+            _recipe_cache[webpage_key] = _result
+        # ────────────────────────────────────────────────────────────────────
+
+        return jsonify(_result)
 
     except requests.exceptions.HTTPError as e:
         status = e.response.status_code if e.response is not None else 502
@@ -4126,7 +4182,6 @@ def extract_recipe():
             "user_message": "We couldn't extract a recipe from this link. Please try another link or add the recipe manually.",
             "details": str(e),
         }), 500
-
 
 
 
@@ -4401,19 +4456,12 @@ RECIPE_LLM_TIMEOUT = int(os.getenv("RECIPE_LLM_TIMEOUT", "120"))
 def _download_video_to_file(video_url: str):
     """
     Download video (not just audio) to a temp file for frame extraction.
+    Uses a single yt-dlp call (extract_info + download=True) to avoid the
+    redundant separate metadata round-trip from _yt_meta().
     Returns: (temp_dir, video_path, meta_dict). Caller must shutil.rmtree(temp_dir) when done.
     """
     temp_dir = tempfile.mkdtemp()
     try:
-        info = _yt_meta(video_url)
-        duration = info.get("duration")
-        title = info.get("title") or ""
-        extractor = info.get("extractor_key") or info.get("extractor") or ""
-        webpage_url = info.get("webpage_url") or video_url
-        thumbnail = info.get("thumbnail")
-        if duration and duration > MAX_VIDEO_SECONDS:
-            raise ValueError(f"Video too long ({duration}s). Max allowed is {MAX_VIDEO_SECONDS}s")
-
         ydl_opts = {
             "format": "best[height<=720]/best",
             "outtmpl": os.path.join(temp_dir, "%(id)s.%(ext)s"),
@@ -4439,8 +4487,18 @@ def _download_video_to_file(video_url: str):
         if YT_PROXY and is_youtube_url(video_url):
             ydl_opts["proxy"] = YT_PROXY
 
+        # Single call: fetches metadata AND downloads in one network session
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([video_url])
+            info = ydl.extract_info(video_url, download=True)
+
+        duration = info.get("duration")
+        title = info.get("title") or ""
+        extractor = info.get("extractor_key") or info.get("extractor") or ""
+        webpage_url = info.get("webpage_url") or video_url
+        thumbnail = info.get("thumbnail")
+
+        if duration and duration > MAX_VIDEO_SECONDS:
+            raise ValueError(f"Video too long ({duration}s). Max allowed is {MAX_VIDEO_SECONDS}s")
 
         candidates = [f for f in os.listdir(temp_dir) if f.endswith((".mp4", ".webm", ".mkv", ".mov"))]
         if not candidates:
@@ -4458,6 +4516,641 @@ def _download_video_to_file(video_url: str):
     except Exception:
         shutil.rmtree(temp_dir, ignore_errors=True)
         raise
+
+
+def _profile_discovery_opts(profile_url: str, limit: int) -> dict:
+    """yt-dlp opts for discovering video URLs from a profile/channel page."""
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        # Surface discovery failures so API can return actionable errors.
+        "ignoreerrors": False,
+        "noplaylist": False,
+        "extract_flat": "in_playlist",
+        "playlistend": max(1, min(limit * 4, 50)),
+        "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
+    }
+    if YTDLP_COOKIES_FILE and os.path.exists(YTDLP_COOKIES_FILE):
+        opts["cookiefile"] = YTDLP_COOKIES_FILE
+    if YT_PROXY and is_youtube_url(profile_url):
+        opts["proxy"] = YT_PROXY
+    elif not is_youtube_url(profile_url):
+        # Force direct connection for IG/TikTok discovery (avoid inherited HTTP(S)_PROXY).
+        opts["proxy"] = ""
+    return opts
+
+
+def _entry_to_video_url(entry: dict) -> str | None:
+    """Best-effort conversion from yt-dlp flat entry to a playable URL."""
+    if not isinstance(entry, dict):
+        return None
+    for key in ("webpage_url", "url", "original_url"):
+        val = entry.get(key)
+        if isinstance(val, str) and val.startswith(("http://", "https://")):
+            return val
+
+    extractor = str(entry.get("extractor_key") or entry.get("extractor") or "").lower()
+    vid = entry.get("id")
+    if isinstance(vid, str) and vid:
+        if "youtube" in extractor:
+            return f"https://www.youtube.com/watch?v={vid}"
+        if "instagram" in extractor:
+            return f"https://www.instagram.com/reel/{vid}/"
+        if "tiktok" in extractor:
+            uploader = entry.get("uploader_id") or entry.get("channel_id")
+            if uploader:
+                return f"https://www.tiktok.com/@{uploader}/video/{vid}"
+    return None
+
+
+def _probe_format_duration_sec(path: str) -> float | None:
+    """Best-effort container duration from ffprobe (seconds)."""
+    r = subprocess.run(
+        [
+            "ffprobe", "-v", "quiet",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            path,
+        ],
+        capture_output=True,
+        text=True,
+    )
+    s = (r.stdout or "").strip()
+    if not s:
+        return None
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def _normalize_for_concat(
+    input_path: str,
+    output_path: str,
+    *,
+    max_input_duration_sec: float | None = None,
+) -> None:
+    """
+    Re-encode a video to 1280x720 / 30fps / h264 / aac stereo 44100 Hz.
+    If the source has no audio track, a silent audio track is added automatically.
+    This ensures both clips are identical in format before FFmpeg concat.
+
+    If max_input_duration_sec is set, only the first N seconds of the input are read.
+    """
+    # Probe for audio streams — use a robust fallback so a bad ffprobe response
+    # never silently replaces real audio with silence.
+    probe_result = subprocess.run(
+        [
+            "ffprobe", "-v", "error",
+            "-select_streams", "a",
+            "-show_entries", "stream=codec_type",
+            "-print_format", "json",
+            input_path,
+        ],
+        capture_output=True, text=True,
+    )
+    try:
+        probe_data = json.loads(probe_result.stdout or "{}")
+        has_audio = bool(probe_data.get("streams"))
+    except (json.JSONDecodeError, ValueError):
+        has_audio = False
+
+    fmt_dur = _probe_format_duration_sec(input_path)
+    cap = float(max_input_duration_sec) if max_input_duration_sec and max_input_duration_sec > 0 else None
+    if cap and fmt_dur:
+        pad_target = min(fmt_dur, cap)
+    elif cap:
+        pad_target = cap
+    else:
+        pad_target = fmt_dur
+
+    scale_pad = (
+        "scale=1280:720:force_original_aspect_ratio=decrease,"
+        "pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30"
+    )
+
+    # When cap is set, trim video and audio to the same [0, cap] window so stitched
+    # output carries source audio for the prefix segment and CTA audio for the CTA segment.
+    if cap:
+        t = f"{cap:.6f}".rstrip("0").rstrip(".")
+        vchain = (
+            f"[0:v]trim=start=0:duration={t},setpts=PTS-STARTPTS,{scale_pad}[vout]"
+        )
+        if has_audio:
+            achain = (
+                f"[0:a]atrim=start=0:duration={t},asetpts=PTS-STARTPTS,"
+                "aresample=44100,aformat=channel_layouts=stereo[aout]"
+            )
+            filter_complex = f"{vchain};{achain}"
+            cmd_opts_tail: list[str] = []
+        else:
+            filter_complex = (
+                f"{vchain};"
+                f"aevalsrc=0|0:sample_rate=44100:channel_layout=stereo:duration={t}[aout]"
+            )
+            cmd_opts_tail = []
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", input_path,
+            "-filter_complex", filter_complex,
+            "-map", "[vout]",
+            "-map", "[aout]",
+            "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+            "-c:a", "aac", "-b:a", "128k",
+            "-movflags", "+faststart",
+            *cmd_opts_tail,
+            output_path,
+        ]
+    else:
+        video_filter = f"[0:v]{scale_pad}[vout]"
+        if has_audio:
+            # Simply resample + reformat the existing audio track.  Do NOT use
+            # apad=whole_dur here: that filter relies on the container-level
+            # duration probe which can differ slightly from the real audio stream
+            # duration, causing apad to produce misaligned timestamps that the
+            # concat filter then reads as empty/silent audio on the CTA segment.
+            filter_complex = (
+                f"{video_filter};"
+                "[0:a]aresample=44100,aformat=channel_layouts=stereo[aout]"
+            )
+            cmd_opts_tail = []
+        else:
+            filter_complex = (
+                f"{video_filter};"
+                "aevalsrc=0|0:sample_rate=44100:channel_layout=stereo[aout]"
+            )
+            cmd_opts_tail = ["-shortest"]
+
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", input_path,
+            "-filter_complex", filter_complex,
+            "-map", "[vout]",
+            "-map", "[aout]",
+            "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+            "-c:a", "aac", "-b:a", "128k",
+            "-movflags", "+faststart",
+            *cmd_opts_tail,
+            output_path,
+        ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"FFmpeg normalization failed:\n{result.stderr[-800:]}")
+
+
+def _black_silent_gap_for_concat(output_path: str, duration_sec: float) -> None:
+    """
+    Black video + silent stereo AAC, same nominal format as _normalize_for_concat
+    (1280x720, 30fps, h264, aac 128k) for concat demuxer compatibility.
+    """
+    if duration_sec <= 0:
+        raise ValueError("gap duration must be positive")
+    cmd = [
+        "ffmpeg", "-y",
+        "-f", "lavfi", "-i", "color=black:s=1280x720:r=30",
+        "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
+        "-t", str(duration_sec),
+        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "128k",
+        "-movflags", "+faststart",
+        output_path,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"FFmpeg gap generation failed:\n{result.stderr[-800:]}")
+
+
+def _stitch_videos_ffmpeg(
+    video1_path: str,
+    video2_path: str,
+    output_path: str,
+    *,
+    gap_seconds: float = 0,
+    source_prefix_seconds: float | None = None,
+) -> str:
+    """
+    Stitch [video1 (or its first source_prefix_seconds)] then [video2].
+
+    Audio for the ENTIRE output comes from video1 (the source) only.
+    video1's audio plays continuously through both the source-prefix segment
+    AND the CTA segment — the CTA's own audio track is ignored entirely.
+
+    The source input is looped (-stream_loop -1) so that its audio always
+    covers the full stitched duration even when the source file is shorter
+    than source_prefix_seconds + CTA duration.  The audio is then trimmed
+    with atrim to exactly total_dur so there is no overhang.
+
+    If video1 has no audio, a silent track of the appropriate length is used.
+
+    Both clips are scaled to 1280×720 / 30fps / H.264 + AAC 128k in a single pass.
+    """
+    scale_pad = (
+        "scale=1280:720:force_original_aspect_ratio=decrease,"
+        "pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30"
+    )
+
+    # ── Probe whether video1 has an audio stream ──────────────────────────────
+    _pr = subprocess.run(
+        [
+            "ffprobe", "-v", "error",
+            "-select_streams", "a",
+            "-show_entries", "stream=codec_type",
+            "-print_format", "json",
+            video1_path,
+        ],
+        capture_output=True, text=True,
+    )
+    try:
+        src_has_audio = bool(json.loads(_pr.stdout or "{}").get("streams"))
+    except (json.JSONDecodeError, ValueError):
+        src_has_audio = False
+
+    src_sec = (
+        float(source_prefix_seconds)
+        if source_prefix_seconds and source_prefix_seconds > 0
+        else None
+    )
+    gap_sec = float(gap_seconds) if gap_seconds and gap_seconds > 0 else 0.0
+
+    # Compute total output duration for precise audio trimming.
+    # With -stream_loop -1 the source loops, so v1_dur only matters for the
+    # no-src_sec case where we must bound the video to one natural play-through.
+    v1_dur = _probe_format_duration_sec(video1_path) or 0.0
+    v2_dur = _probe_format_duration_sec(video2_path) or 0.0
+    # When src_sec is set, the source video is always trimmed to exactly src_sec
+    # (looping fills any gap if v1_dur < src_sec).
+    used_v1_dur = float(src_sec) if src_sec else v1_dur
+    total_dur = used_v1_dur + gap_sec + v2_dur  # seconds
+
+    # ── Build filter_complex ──────────────────────────────────────────────────
+    parts: list[str] = []
+
+    # Video 1: always trim — either to src_sec (explicit prefix) or to the
+    # file's natural duration (no prefix).  This prevents infinite looping of
+    # the source video when -stream_loop -1 is active.
+    if src_sec:
+        t = f"{src_sec:.6f}".rstrip("0").rstrip(".")
+    elif v1_dur > 0:
+        t = f"{v1_dur:.3f}"
+    else:
+        t = None
+
+    if t:
+        parts.append(
+            f"[0:v]trim=start=0:duration={t},setpts=PTS-STARTPTS,{scale_pad}[vA]"
+        )
+    else:
+        parts.append(f"[0:v]{scale_pad}[vA]")
+
+    # Video 2 (CTA): scale only — audio is NOT taken from this input
+    parts.append(f"[1:v]{scale_pad}[vB]")
+
+    # Video-only concat
+    if gap_sec > 0:
+        gap_t = f"{gap_sec:.3f}"
+        # Inline black-frame source via lavfi color filter
+        parts.append(
+            f"color=c=black:size=1280x720:rate=30:duration={gap_t},format=yuv420p[gv]"
+        )
+        parts.append("[vA][gv][vB]concat=n=3:v=1:a=0[outv]")
+    else:
+        parts.append("[vA][vB]concat=n=2:v=1:a=0[outv]")
+
+    # Audio: source video1 only.
+    # Because the source input is looped (-stream_loop -1), the audio stream
+    # is effectively infinite — atrim simply cuts it at total_dur.
+    # No apad needed: looping always supplies enough samples.
+    extra_flags: list[str] = []
+    if src_has_audio:
+        if total_dur > 0:
+            t_total = f"{total_dur:.3f}"
+            parts.append(
+                f"[0:a]atrim=start=0:duration={t_total},asetpts=PTS-STARTPTS,"
+                f"aresample=44100,aformat=channel_layouts=stereo[outa]"
+            )
+        else:
+            # Duration unknown — resample; -shortest will stop at video end
+            parts.append(
+                "[0:a]aresample=44100,aformat=channel_layouts=stereo[outa]"
+            )
+            extra_flags = ["-shortest"]
+    else:
+        # No audio in source — generate silence for the full output
+        if total_dur > 0:
+            t_total = f"{total_dur:.3f}"
+            parts.append(
+                f"aevalsrc=0|0:sample_rate=44100:channel_layout=stereo"
+                f":duration={t_total}[outa]"
+            )
+        else:
+            parts.append(
+                "aevalsrc=0|0:sample_rate=44100:channel_layout=stereo[outa]"
+            )
+            extra_flags = ["-shortest"]
+
+    filter_complex = ";".join(parts)
+
+    result = subprocess.run(
+        [
+            "ffmpeg", "-y",
+            # Loop the source so its audio repeats to cover the full output.
+            # The video trim filter above bounds how many frames are used.
+            "-stream_loop", "-1", "-i", video1_path,
+            "-i", video2_path,
+            "-filter_complex", filter_complex,
+            "-map", "[outv]",
+            "-map", "[outa]",
+            "-c:v", "libx264",
+            "-preset", "fast",
+            "-crf", "23",
+            "-c:a", "aac",
+            "-b:a", "128k",
+            "-movflags", "+faststart",
+            *extra_flags,
+            output_path,
+        ],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"FFmpeg stitch failed:\n{result.stderr[-800:]}")
+
+    return output_path
+
+
+def _stitch_downloaded_with_cta(download_item: dict, cta_video_path: str, stitch_output_dir: str) -> dict:
+    """Stitch one downloaded video with CTA (downloaded clip first, CTA second)."""
+    source_url = download_item.get("source_url", "")
+    downloaded_path = download_item.get("filepath", "")
+    if not downloaded_path or not os.path.exists(downloaded_path):
+        return {
+            "source_url": source_url,
+            "error": "Downloaded file missing; skipping stitch",
+        }
+
+    stitched_filename = f"stitched_{os.path.basename(downloaded_path)}"
+    stitched_path = os.path.join(stitch_output_dir, stitched_filename)
+    try:
+        _stitch_videos_ffmpeg(downloaded_path, cta_video_path, stitched_path)
+        return {
+            "source_url": source_url,
+            "downloaded_filepath": downloaded_path,
+            "stitched_filepath": stitched_path,
+        }
+    except Exception as stitch_err:
+        return {
+            "source_url": source_url,
+            "downloaded_filepath": downloaded_path,
+            "error": str(stitch_err),
+        }
+
+
+def _download_and_stitch_video(
+    video_url: str,
+    download_dir: str,
+    idx: int,
+    uploaded_video_path: str | None,
+    stitch_output_dir: str | None,
+) -> dict:
+    """
+    Worker that runs the full pipeline for a single video:
+      1. Download the video to download_dir.
+      2. If an uploaded_video_path is provided, wait 5 seconds after the download
+         completes, then stitch [uploaded video] → [downloaded video] using FFmpeg.
+      3. Return a combined result dict with keys:
+           download  – the download manifest (filepath, source_url, …)
+           stitch    – stitched_filepath or error (None if stitching not requested)
+    This function is meant to be submitted to a ThreadPoolExecutor so that every
+    video runs its download + 5s wait + stitch in parallel with the others.
+    """
+    # Step 1 – download
+    download_result = _download_single_profile_video(video_url, download_dir)
+    download_result["index"] = idx
+
+    stitch_result = None
+
+    # Step 2 – stitch (only if a video was uploaded and download succeeded)
+    if uploaded_video_path and stitch_output_dir:
+        downloaded_path = download_result.get("filepath", "")
+        if downloaded_path and os.path.exists(downloaded_path):
+            # Wait 5 seconds after THIS video finished downloading before stitching
+            time.sleep(5)
+
+            stitched_filename = f"stitched_{os.path.basename(downloaded_path)}"
+            stitched_path = os.path.join(stitch_output_dir, stitched_filename)
+            try:
+                _stitch_videos_ffmpeg(uploaded_video_path, downloaded_path, stitched_path)
+                stitch_result = {
+                    "source_url": video_url,
+                    "downloaded_filepath": downloaded_path,
+                    "stitched_filepath": stitched_path,
+                }
+            except Exception as stitch_err:
+                stitch_result = {
+                    "source_url": video_url,
+                    "downloaded_filepath": downloaded_path,
+                    "error": str(stitch_err),
+                }
+        else:
+            stitch_result = {
+                "source_url": video_url,
+                "error": "Download did not produce a file; skipping stitch",
+            }
+
+    return {"download": download_result, "stitch": stitch_result}
+
+
+def _collect_instagram_video_urls(profile_url: str, limit: int) -> list[str]:
+    """
+    Collect up to `limit` video post URLs from an Instagram profile using instaloader.
+    instaloader uses Instagram's mobile API and is far more reliable than yt-dlp's
+    instagram:user extractor for profile-level discovery.
+
+    Auth: loads a session file from INSTALOADER_SESSION_FILE env var (created by running
+      `instaloader --login=<username>` once on your machine).
+    Falls back to an anonymous (rate-limited) request if no session is configured.
+
+    Returns a list of individual reel/post URLs that yt-dlp can then download.
+    """
+    ig_username = os.getenv("INSTAGRAM_USERNAME", "")
+    session_file = os.getenv("INSTALOADER_SESSION_FILE", "")
+
+    L = instaloader.Instaloader(
+        quiet=True,
+        download_videos=False,
+        download_video_thumbnails=False,
+        download_geotags=False,
+        download_comments=False,
+        save_metadata=False,
+        post_metadata_txt_pattern="",
+    )
+
+    # Load saved session so we're authenticated
+    if ig_username and session_file and os.path.exists(session_file):
+        try:
+            L.load_session_from_file(ig_username, session_file)
+        except Exception as sess_err:
+            print(f"⚠️  instaloader: could not load session ({sess_err}); trying anonymously")
+
+    # Extract the username from the profile URL
+    # Handles: https://instagram.com/username, https://instagram.com/username/, etc.
+    parsed_path = urlparse(profile_url).path.strip("/")
+    insta_user = parsed_path.split("/")[0].lstrip("@")
+    if not insta_user:
+        raise ValueError(f"Could not extract Instagram username from URL: {profile_url}")
+
+    try:
+        profile = instaloader.Profile.from_username(L.context, insta_user)
+    except instaloader.exceptions.ProfileNotExistsException:
+        raise RuntimeError(f"Instagram profile @{insta_user} does not exist or is not accessible")
+    except instaloader.exceptions.LoginRequiredException:
+        raise RuntimeError(
+            f"Instagram profile @{insta_user} requires authentication. "
+            "Set INSTAGRAM_USERNAME and INSTALOADER_SESSION_FILE env vars. "
+            "Create the session with: instaloader --login=<your_username>"
+        )
+
+    video_urls = []
+    for post in profile.get_posts():
+        if post.is_video:
+            # Use the reel/post page URL so yt-dlp can resolve and download it
+            video_urls.append(f"https://www.instagram.com/p/{post.shortcode}/")
+            if len(video_urls) >= limit:
+                break
+
+    return video_urls
+
+
+def _collect_profile_video_urls(profile_url: str, limit: int) -> list[str]:
+    """Resolve up to `limit` supported video URLs from a profile/channel URL."""
+    # Instagram's yt-dlp user extractor is frequently broken; use instaloader instead
+    if "instagram.com" in (urlparse(profile_url).hostname or ""):
+        return _collect_instagram_video_urls(profile_url, limit)
+
+    opts = _profile_discovery_opts(profile_url, limit)
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(profile_url, download=False)
+
+    if not info:
+        raise RuntimeError("yt-dlp returned no metadata for this profile URL")
+
+    entries = info.get("entries") if isinstance(info, dict) else None
+    if not isinstance(entries, list):
+        single = _entry_to_video_url(info if isinstance(info, dict) else {})
+        if single and is_video_url(single):
+            return [single]
+        raise RuntimeError("yt-dlp did not return playable video entries for this profile URL")
+
+    urls = []
+    seen = set()
+    for entry in entries:
+        video_url = _entry_to_video_url(entry)
+        if not video_url or not is_video_url(video_url) or video_url in seen:
+            continue
+        seen.add(video_url)
+        urls.append(video_url)
+        if len(urls) >= limit:
+            break
+    if not urls:
+        raise RuntimeError("yt-dlp resolved profile metadata but returned zero video entries")
+    return urls
+
+
+def _profile_storage_paths(profile_url: str) -> tuple[str, str]:
+    profile_key = hashlib.sha256(profile_url.encode("utf-8")).hexdigest()[:16]
+    profile_dir = os.path.join(PROFILE_VIDEO_DOWNLOADS_DIR, profile_key)
+    index_path = os.path.join(profile_dir, "index.json")
+    return profile_dir, index_path
+
+
+def _load_profile_index(index_path: str) -> dict:
+    if not os.path.exists(index_path):
+        return {"downloaded_urls": {}, "last_updated": None}
+    try:
+        with open(index_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return {"downloaded_urls": {}, "last_updated": None}
+        if not isinstance(data.get("downloaded_urls"), dict):
+            data["downloaded_urls"] = {}
+        return data
+    except Exception:
+        return {"downloaded_urls": {}, "last_updated": None}
+
+
+def _save_profile_index(index_path: str, index_data: dict) -> None:
+    index_data["last_updated"] = datetime.utcnow().isoformat() + "Z"
+    tmp_path = f"{index_path}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(index_data, f, ensure_ascii=True, indent=2)
+    os.replace(tmp_path, index_path)
+
+
+def _download_single_profile_video(video_url: str, output_dir: str) -> dict:
+    """Download one video URL to output_dir and return manifest info."""
+    temp_cookies_path = None
+    ydl_opts = {
+        "format": "best[height<=720]/best",
+        "outtmpl": os.path.join(output_dir, "%(extractor)s_%(id)s.%(ext)s"),
+        "restrictfilenames": True,
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+        "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
+    }
+    if YTDLP_COOKIES_FILE and os.path.exists(YTDLP_COOKIES_FILE):
+        ydl_opts["cookiefile"] = YTDLP_COOKIES_FILE
+    elif YTDLP_COOKIES_B64:
+        temp_cookies_path = os.path.join(output_dir, f"cookies_{uuid.uuid4().hex}.txt")
+        try:
+            cookies_content = base64.b64decode(YTDLP_COOKIES_B64).decode("utf-8")
+            with open(temp_cookies_path, "w") as f:
+                f.write(cookies_content)
+            ydl_opts["cookiefile"] = temp_cookies_path
+        except Exception:
+            pass
+
+    if "instagram.com" in video_url.lower() and ydl_opts.get("cookiefile"):
+        ydl_opts.setdefault("extractor_args", {})["instagram"] = {"webpage_display": ["Desktop"]}
+    if YT_PROXY and is_youtube_url(video_url):
+        ydl_opts["proxy"] = YT_PROXY
+
+    filepath = ""
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(video_url, download=True)
+            info = info or {}
+            if isinstance(info, dict):
+                try:
+                    filepath = ydl.prepare_filename(info)
+                except Exception:
+                    filepath = ""
+            if isinstance(info, dict):
+                requested = info.get("requested_downloads") or []
+                if requested and isinstance(requested[0], dict):
+                    filepath = requested[0].get("filepath") or filepath
+            if not filepath and isinstance(info, dict):
+                maybe_name = info.get("_filename")
+                if isinstance(maybe_name, str):
+                    filepath = maybe_name
+    finally:
+        if temp_cookies_path and os.path.exists(temp_cookies_path):
+            try:
+                os.unlink(temp_cookies_path)
+            except Exception:
+                pass
+
+    if not filepath and isinstance(info, dict):
+        requested = info.get("requested_downloads") or []
+        if requested and isinstance(requested[0], dict):
+            filepath = requested[0].get("filepath") or ""
+
+    return {
+        "source_url": video_url,
+        "title": (info.get("title") if isinstance(info, dict) else "") or "",
+        "duration": (info.get("duration") if isinstance(info, dict) else None),
+        "filepath": filepath,
+    }
 
 
 def _extract_one_frame(video_path: str, timestamp: float, out_path: str) -> str | None:
@@ -4643,6 +5336,14 @@ def extract_recipe_from_video_internal(video_url: str):
     if not ok:
         return jsonify({"error": err}), 400
 
+    # ── Cache check ──────────────────────────────────────────────────────────
+    url_key = hashlib.sha256(video_url.encode()).hexdigest()
+    with _recipe_cache_lock:
+        if url_key in _recipe_cache:
+            print(f"⚡ Cache hit for video URL: {video_url}")
+            return jsonify({**_recipe_cache[url_key], "cached": True}), 200
+    # ─────────────────────────────────────────────────────────────────────────
+
     temp_dir = None
     try:
         print(f"🎥 Processing video URL: {video_url}")
@@ -4681,77 +5382,94 @@ def extract_recipe_from_video_internal(video_url: str):
 
         print(f"✅ Video downloaded in {time.time() - t0:.2f}s")
 
-        # 2) Extract audio from the downloaded video (no second download)
-        audio_bytes = _extract_audio_from_video_file(video_path)
-        if not audio_bytes:
-            print("⚠️ Could not extract audio from video; using frame+vision fallback...")
-            recipe, source, extraction_method = _run_frame_vision_fallback_from_path(video_path, video_url, meta)
+        # 2+3) Transcription + optional parallel frame+vision.
+        # YouTube videos almost always have clear speech, so vision is wasteful there —
+        # run it only as a sequential fallback if transcription fails.
+        # Instagram/TikTok are often music-only, so run both in parallel upfront.
+        run_vision_in_parallel = not is_youtube_url(video_url)
+        print(f"🎤 Transcribing audio{'and extracting frames in parallel' if run_vision_in_parallel else '(YouTube: vision on-demand only)'}...")
+
+        transcript_result = {}
+        vision_result = {}
+
+        def _run_transcription():
+            try:
+                audio_bytes = _extract_audio_from_video_file(video_path)
+                if not audio_bytes:
+                    transcript_result["error"] = "no_audio"
+                    return
+                audio_file_obj = io.BytesIO(audio_bytes)
+                audio_file_obj.name = "audio.mp3"
+                t = client.audio.transcriptions.create(
+                    model="gpt-4o-mini-transcribe",
+                    file=audio_file_obj,
+                    response_format="text",
+                )
+                transcript_result["text"] = t.strip() if isinstance(t, str) else str(t).strip()
+            except Exception as e:
+                transcript_result["error"] = str(e)
+
+        def _run_vision():
+            try:
+                recipe, source, method = _run_frame_vision_fallback_from_path(video_path, video_url, meta)
+                vision_result["recipe"] = recipe
+                vision_result["source"] = source
+                vision_result["method"] = method
+            except Exception as e:
+                vision_result["error"] = str(e)
+
+        if run_vision_in_parallel:
+            # Instagram/TikTok: run both concurrently — vision result ready the moment transcription fails
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                t_future = executor.submit(_run_transcription)
+                v_future = executor.submit(_run_vision)
+                t_future.result()
+                v_future.result()
+        else:
+            # YouTube: transcribe first; only fall back to vision if speech is unusable
+            _run_transcription()
+
+        transcript_text = transcript_result.get("text", "")
+        has_usable_transcript = transcript_text and not _is_likely_non_speech(transcript_text)
+
+        # If transcription failed or produced no usable speech, use/run vision fallback
+        if not has_usable_transcript:
+            if not vision_result:
+                # YouTube path: vision wasn't pre-run, trigger it now
+                print("🎬 No usable transcript; running frame+vision fallback...")
+                _run_vision()
+            recipe = vision_result.get("recipe")
+            source = vision_result.get("source")
+            extraction_method = vision_result.get("method")
             if recipe and source:
                 _enrich_recipe_response(recipe)
                 tags = extract_recipe_tags(recipe)
-                return jsonify({
-                    "source": source,
-                    "recipe": recipe,
-                    "tags": tags,
-                    "transcript": None,
-                    "extraction": {"method": extraction_method, "confidence": 0.5},
-                    "meta": meta,
-                }), 200
+                _result = {"source": source, "recipe": recipe, "tags": tags, "transcript": None, "extraction": {"method": extraction_method, "confidence": 0.5}, "meta": meta}
+                with _recipe_cache_lock:
+                    _recipe_cache[url_key] = _result
+                return jsonify(_result), 200
             return jsonify({
                 "error": "Failed to extract recipe from video",
                 "user_message": "We couldn't extract a recipe from this link. Please try another or add the recipe manually.",
-                "message": "Could not extract audio and frame+vision fallback failed. Ensure ffmpeg is installed.",
-            }), 500
-
-        # 3) Whisper transcription
-        print("🎤 Transcribing audio...")
-        audio_file_obj = io.BytesIO(audio_bytes)
-        audio_file_obj.name = "audio.mp3"
-        transcript = client.audio.transcriptions.create(
-            model="whisper-1",
-            file=audio_file_obj,
-            response_format="text",
-        )
-        transcript_text = transcript.strip() if isinstance(transcript, str) else str(transcript).strip()
-
-        # If no usable transcript (empty or just music/noise), use frame+vision fallback (reuse same video)
-        if not transcript_text or _is_likely_non_speech(transcript_text):
-            print("🎬 No usable recipe instructions from audio; using frame+vision fallback (reusing video)...")
-            recipe, source, extraction_method = _run_frame_vision_fallback_from_path(video_path, video_url, meta)
-            if recipe and source:
-                _enrich_recipe_response(recipe)
-                tags = extract_recipe_tags(recipe)
-                return jsonify({
-                    "source": source,
-                    "recipe": recipe,
-                    "tags": tags,
-                    "transcript": None,
-                    "extraction": {"method": extraction_method, "confidence": 0.5},
-                    "meta": meta,
-                }), 200
-            return jsonify({
-                "error": "Failed to extract recipe from video",
-                "user_message": "We couldn't extract a recipe from this link. Please try another or add the recipe manually.",
-                "message": "No transcript from audio and frame+vision fallback failed. Ensure ffmpeg is installed.",
+                "message": "No usable transcript and frame+vision fallback failed.",
             }), 500
 
         # 4) LLM extraction from transcript (chunking + merge)
+        # 80 000 chars ≈ 20 000 tokens — fits in gpt-4o-mini's 128k window, eliminating the merge step for most videos
         print("🍳 Extracting recipe information from transcript...")
-        chunks = _chunk_text(transcript_text, max_chars=6000)
+        chunks = _chunk_text(transcript_text, max_chars=80000)
         if not chunks:
-            print("🎬 No chunks from transcript; using frame+vision fallback (reusing video)...")
-            recipe, source, extraction_method = _run_frame_vision_fallback_from_path(video_path, video_url, meta)
+            print("🎬 No chunks from transcript; using already-computed frame+vision result...")
+            recipe = vision_result.get("recipe")
+            source = vision_result.get("source")
+            extraction_method = vision_result.get("method")
             if recipe and source:
                 _enrich_recipe_response(recipe)
                 tags = extract_recipe_tags(recipe)
-                return jsonify({
-                    "source": source,
-                    "recipe": recipe,
-                    "tags": tags,
-                    "transcript": None,
-                    "extraction": {"method": extraction_method, "confidence": 0.5},
-                    "meta": meta,
-                }), 200
+                _result = {"source": source, "recipe": recipe, "tags": tags, "transcript": None, "extraction": {"method": extraction_method, "confidence": 0.5}, "meta": meta}
+                with _recipe_cache_lock:
+                    _recipe_cache[url_key] = _result
+                return jsonify(_result), 200
             return jsonify({
                 "error": "Transcript is empty after cleanup",
                 "user_message": "We couldn't extract a recipe from this link. Please try another or add the recipe manually.",
@@ -4772,19 +5490,17 @@ def extract_recipe_from_video_internal(video_url: str):
                     chunk_failed["error"] = e
                     break
         if chunk_failed["idx"] is not None:
-            print(f"⚠️ Transcript chunk extraction failed (chunk {chunk_failed['idx']}); using frame+vision fallback (reusing video)...")
-            recipe, source, extraction_method = _run_frame_vision_fallback_from_path(video_path, video_url, meta)
+            print(f"⚠️ Transcript chunk extraction failed (chunk {chunk_failed['idx']}); using already-computed frame+vision result...")
+            recipe = vision_result.get("recipe")
+            source = vision_result.get("source")
+            extraction_method = vision_result.get("method")
             if recipe and source:
                 _enrich_recipe_response(recipe)
                 tags = extract_recipe_tags(recipe)
-                return jsonify({
-                    "source": source,
-                    "recipe": recipe,
-                    "tags": tags,
-                    "transcript": None,
-                    "extraction": {"method": extraction_method, "confidence": 0.5},
-                    "meta": meta,
-                }), 200
+                _result = {"source": source, "recipe": recipe, "tags": tags, "transcript": None, "extraction": {"method": extraction_method, "confidence": 0.5}, "meta": meta}
+                with _recipe_cache_lock:
+                    _recipe_cache[url_key] = _result
+                return jsonify(_result), 200
             return jsonify({
                 "error": "Failed to extract recipe from transcript chunk",
                 "user_message": "We couldn't extract a recipe from this link. Please try another or add the recipe manually.",
@@ -4809,41 +5525,33 @@ def extract_recipe_from_video_internal(video_url: str):
         recipe["ingredients"] = ingredients
         recipe["instructions"] = instructions
 
-        # If transcript yielded empty instructions, use frame+vision fallback (reuse same video)
+        # If transcript yielded empty instructions/ingredients, use already-computed vision result
         if not instructions:
-            print("🎬 Instructions empty from transcript; using frame+vision fallback (reusing video)...")
-            fallback_recipe, fallback_source, extraction_method = _run_frame_vision_fallback_from_path(
-                video_path, video_url, meta
-            )
+            print("🎬 Instructions empty from transcript; using already-computed frame+vision result...")
+            fallback_recipe = vision_result.get("recipe")
+            fallback_source = vision_result.get("source")
+            extraction_method = vision_result.get("method")
             if fallback_recipe and fallback_source and (
                 fallback_recipe.get("instructions") or fallback_recipe.get("ingredients")
             ):
                 _enrich_recipe_response(fallback_recipe)
                 tags = extract_recipe_tags(fallback_recipe)
-                return jsonify({
-                    "source": fallback_source,
-                    "recipe": fallback_recipe,
-                    "tags": tags,
-                    "transcript": None,
-                    "extraction": {"method": extraction_method, "confidence": 0.5},
-                    "meta": meta,
-                }), 200
+                _result = {"source": fallback_source, "recipe": fallback_recipe, "tags": tags, "transcript": None, "extraction": {"method": extraction_method, "confidence": 0.5}, "meta": meta}
+                with _recipe_cache_lock:
+                    _recipe_cache[url_key] = _result
+                return jsonify(_result), 200
         elif not ingredients:
-            print("🎬 Ingredients empty from transcript; using frame+vision fallback (reusing video)...")
-            fallback_recipe, fallback_source, extraction_method = _run_frame_vision_fallback_from_path(
-                video_path, video_url, meta
-            )
+            print("🎬 Ingredients empty from transcript; using already-computed frame+vision result...")
+            fallback_recipe = vision_result.get("recipe")
+            fallback_source = vision_result.get("source")
+            extraction_method = vision_result.get("method")
             if fallback_recipe and fallback_source:
                 _enrich_recipe_response(fallback_recipe)
                 tags = extract_recipe_tags(fallback_recipe)
-                return jsonify({
-                    "source": fallback_source,
-                    "recipe": fallback_recipe,
-                    "tags": tags,
-                    "transcript": None,
-                    "extraction": {"method": extraction_method, "confidence": 0.5},
-                    "meta": meta,
-                }), 200
+                _result = {"source": fallback_source, "recipe": fallback_recipe, "tags": tags, "transcript": None, "extraction": {"method": extraction_method, "confidence": 0.5}, "meta": meta}
+                with _recipe_cache_lock:
+                    _recipe_cache[url_key] = _result
+                return jsonify(_result), 200
 
         source_type = determine_source_type(video_url)
         _enrich_recipe_response(recipe)
@@ -4856,14 +5564,17 @@ def extract_recipe_from_video_internal(video_url: str):
             "image": meta.get("thumbnail"),
             "source_type": source_type,
         }
-        return jsonify({
+        _result = {
             "source": source,
             "recipe": recipe,
             "tags": tags,
             "transcript": transcript_text,
             "extraction": {"method": "transcript_llm", "confidence": 0.55},
             "meta": meta,
-        }), 200
+        }
+        with _recipe_cache_lock:
+            _recipe_cache[url_key] = _result
+        return jsonify(_result), 200
 
     except Exception as e:
         print(f"💥 Critical error in extract_recipe_from_video_internal: {str(e)}")
@@ -4886,4 +5597,4 @@ if __name__ == "__main__":
     # Set FLASK_DEBUG environment variable to enable Flask debug mode separately
     import os
     flask_debug = os.environ.get('FLASK_DEBUG', '0') == '1'
-    app.run(debug=flask_debug, host='0.0.0.0', port=5002, use_reloader=False)
+    app.run(debug=flask_debug, host='0.0.0.0', port=5003, use_reloader=False)

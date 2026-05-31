@@ -4,6 +4,7 @@ from langchain_openai import ChatOpenAI
 from langchain_openai import OpenAIEmbeddings
 from langchain.chains import RetrievalQA
 from firebase_utils import (
+    init_mealmap_firestore,
     get_user_context,
     get_user_chat_history,
     save_user_chat,
@@ -11,6 +12,7 @@ from firebase_utils import (
     try_persist_meal_image_from_openai_url,
     upload_meal_image_bytes_to_storage,
     save_recommend_meal_image_record,
+    recommend_meal_image_storage_path,
 )
 from dotenv import load_dotenv
 import os
@@ -790,18 +792,37 @@ def _dietary_restrictions_plant_based_prompt_block(restrictions: list) -> str:
     return ""
 
 
+def _recommend_meals_image_model() -> str:
+    """Image model: set RECOMMEND_MEALS_IMAGE_MODEL env var to override. Defaults to dall-e-3."""
+    return (os.getenv("RECOMMEND_MEALS_IMAGE_MODEL") or "dall-e-3").strip()
+
+
 def _recommend_meals_dalle_size(*, image_quality: str | None = None) -> str:
     """
-    DALL·E 2 only supports 256 / 512 / 1024. Default `image_quality` is low (256x256) for speed.
-    Legacy: unknown `image_quality` falls back to RECOMMEND_MEALS_DALLE_SIZE env then 256x256.
+    Size selection based on model:
+      dall-e-3  → 1024x1024 (low/medium) | 1792x1024 (high)
+      gpt-image-1 → 1024x1024 (low/medium) | 1536x1024 (high)
+      dall-e-2  → 256x256 (low) | 512x512 (medium) | 1024x1024 (high)
+    Override with RECOMMEND_MEALS_DALLE_SIZE env var.
     """
+    model = _recommend_meals_image_model()
     q = (image_quality or "low").strip().lower()
-    tier = {"low": "256x256", "medium": "512x512", "high": "1024x1024"}
-    if q in tier:
-        return tier[q]
-    allowed = {"256x256", "512x512", "1024x1024"}
-    s = (os.getenv("RECOMMEND_MEALS_DALLE_SIZE") or "256x256").strip()
-    return s if s in allowed else "256x256"
+    if "dall-e-3" in model:
+        tier = {"low": "1024x1024", "medium": "1024x1024", "high": "1792x1024"}
+        allowed = {"1024x1024", "1792x1024", "1024x1792"}
+        default = "1024x1024"
+    elif "gpt-image-1" in model:
+        tier = {"low": "1024x1024", "medium": "1024x1024", "high": "1536x1024"}
+        allowed = {"1024x1024", "1536x1024", "1024x1536"}
+        default = "1024x1024"
+    else:  # dall-e-2 or unknown
+        tier = {"low": "256x256", "medium": "512x512", "high": "1024x1024"}
+        allowed = {"256x256", "512x512", "1024x1024"}
+        default = "256x256"
+    override = (os.getenv("RECOMMEND_MEALS_DALLE_SIZE") or "").strip()
+    if override in allowed:
+        return override
+    return tier.get(q, default)
 
 
 def _recommend_meals_image_pool_size(num_images: int) -> int:
@@ -825,14 +846,8 @@ def _meal_image_prompt_for_recommend(name: str, desc: str, *, fast_mode: bool) -
 
 
 def _food_logging_dalle_size() -> str:
-    """Default smallest for speed; FOOD_LOGGING_DALLE_SIZE overrides RECOMMEND_MEALS_DALLE_SIZE."""
-    allowed = {"256x256", "512x512", "1024x1024"}
-    s = (
-        os.getenv("FOOD_LOGGING_DALLE_SIZE")
-        or os.getenv("RECOMMEND_MEALS_DALLE_SIZE")
-        or "256x256"
-    ).strip()
-    return s if s in allowed else "256x256"
+    """Size for food-logging images; falls back to recommend-meals size logic."""
+    return _recommend_meals_dalle_size(image_quality="low")
 
 
 def _food_logging_image_pool_size(num_images: int) -> int:
@@ -848,7 +863,7 @@ def _food_logging_image_pool_size(num_images: int) -> int:
 
 
 def _generate_food_log_meal_image_b64(meal: dict, *, size: str) -> str | None:
-    """DALL·E 2 with b64_json — avoids temporary CDN URLs, decode + upload directly to Firebase."""
+    """DALL·E 2 — generates image URL, downloads bytes, returns base64 for Firebase upload."""
     try:
         prompt = _meal_image_prompt_for_recommend(
             meal.get("name", "Meal"),
@@ -856,16 +871,19 @@ def _generate_food_log_meal_image_b64(meal: dict, *, size: str) -> str | None:
             fast_mode=True,
         )
         img = client.images.generate(
-            model="dall-e-2",
+            model=_recommend_meals_image_model(),
             prompt=prompt,
             size=size,
             n=1,
-            response_format="b64_json",
         )
-        if img and img.data and img.data[0].b64_json:
-            return img.data[0].b64_json
-        return None
-    except Exception:
+        img_url = img.data[0].url if (img and img.data) else None
+        if not img_url:
+            return None
+        r = requests.get(img_url, timeout=30)
+        r.raise_for_status()
+        return base64.b64encode(r.content).decode("utf-8")
+    except Exception as e:
+        print(f"[food-logging] DALL-E error: {type(e).__name__}: {e}")
         return None
 
 
@@ -878,7 +896,7 @@ def _generate_food_log_meal_image_url(meal: dict, *, size: str) -> str | None:
             fast_mode=True,
         )
         img = client.images.generate(
-            model="dall-e-2",
+            model=_recommend_meals_image_model(),
             prompt=prompt,
             size=size,
             n=1,
@@ -930,10 +948,15 @@ def _recommend_meals_finalize_image_from_b64(
     except Exception as e:
         print(f"[recommend-meals] image b64 decode failed: {e}")
         return default_image_url
-    url = upload_meal_image_bytes_to_storage(raw, "image/png")
+    storage_path = recommend_meal_image_storage_path(plan_id, day_index, meal_key)
+    url = upload_meal_image_bytes_to_storage(raw, "image/png", storage_path=storage_path)
     if url:
         save_recommend_meal_image_record(plan_id, day_index, meal_key, url)
         return url
+    print(
+        f"[recommend-meals] Firebase upload failed for plan={plan_id} "
+        f"day={day_index} meal={meal_key} path={storage_path}"
+    )
     return default_image_url
 
 
@@ -1118,8 +1141,10 @@ def recommend_meals():
         bmr = 10 * weight_kg + 6.25 * height_cm - 5 * age + s
 
         activity_multipliers = {
+            "sedentary": 1.2,
             "not_active": 1.2,
             "lightly_active": 1.375,
+            "moderately_active": 1.55,
             "active": 1.55,
             "very_active": 1.725,
         }
@@ -1423,25 +1448,44 @@ def recommend_meals():
             _img_workers = _recommend_meals_image_pool_size(len(meal_jobs))
             _img_prompt_fast = bool(fast_mode) or (_img_quality == "low")
 
+            _image_errors: list[str] = []
+
             def _generate_meal_image_b64(job: tuple[int, str, dict]) -> str | None:
-                _, _, meal_obj = job
+                day_i, mk, meal_obj = job
                 try:
                     meal_name = meal_obj.get("name", "Meal")
                     meal_desc = meal_obj.get("description", "")
                     prompt = _meal_image_prompt_for_recommend(
                         meal_name, meal_desc, fast_mode=_img_prompt_fast
                     )
+                    print(f"[recommend-meals] generating image day={day_i} meal={mk} prompt={prompt!r}")
                     img = client.images.generate(
-                        model="dall-e-2",
+                        model="gpt-image-1",
                         prompt=prompt,
-                        size=_dalle_sz,
+                        size="1024x1024",
+                        quality="low",
                         n=1,
-                        response_format="b64_json",
                     )
-                    if img and img.data and img.data[0].b64_json:
-                        return img.data[0].b64_json
+                    if not (img and img.data):
+                        print(f"[recommend-meals] empty response day={day_i} meal={mk}")
+                        return None
+                    # gpt-image-1 returns b64_json directly; dall-e-3 returns a URL
+                    b64 = getattr(img.data[0], "b64_json", None)
+                    if b64:
+                        print(f"[recommend-meals] success (b64) day={day_i} meal={mk}")
+                        return b64
+                    img_url = getattr(img.data[0], "url", None)
+                    if img_url:
+                        print(f"[recommend-meals] success (url) day={day_i} meal={mk}, downloading")
+                        r = requests.get(img_url, timeout=30)
+                        r.raise_for_status()
+                        return base64.b64encode(r.content).decode("utf-8")
+                    print(f"[recommend-meals] no b64 or url day={day_i} meal={mk}")
                     return None
-                except Exception:
+                except Exception as e:
+                    err_msg = f"day={day_i} meal={mk}: {type(e).__name__}: {e}"
+                    print(f"[recommend-meals] image error {err_msg}")
+                    _image_errors.append(err_msg)
                     return None
 
             with ThreadPoolExecutor(max_workers=_img_workers) as img_executor:
@@ -1451,7 +1495,8 @@ def recommend_meals():
                     day_i, mk, meal_obj = job
                     try:
                         raw_quads.append((day_i, mk, meal_obj, fut.result()))
-                    except Exception:
+                    except Exception as e:
+                        print(f"[recommend-meals] future error day={day_i} meal={mk}: {e}")
                         raw_quads.append((day_i, mk, meal_obj, None))
             persist_workers = min(max(1, len(raw_quads)), _img_workers)
 
@@ -1465,8 +1510,17 @@ def recommend_meals():
 
             with ThreadPoolExecutor(max_workers=persist_workers) as ex_persist:
                 finals = list(ex_persist.map(_persist_recommend_image, raw_quads))
+            image_success_count = 0
             for (_day_i, _mk, meal_obj, _b64), final_u in zip(raw_quads, finals):
                 meal_obj["imageUrl"] = final_u
+                if final_u and final_u != default_image_url:
+                    image_success_count += 1
+            plan["image_generation_summary"] = {
+                "requested": len(meal_jobs),
+                "succeeded": image_success_count,
+                "failed": len(meal_jobs) - image_success_count,
+                "errors": _image_errors[:10],  # cap to avoid huge responses
+            }
 
         def _sum_plan_macros():
             total_cal = total_pro = total_carb = total_fat = 0.0
@@ -1630,8 +1684,10 @@ def recommend_meals_day():
         s = 5 if gender == "male" else (-161 if gender == "female" else -78)
         bmr = 10 * weight_kg + 6.25 * height_cm - 5 * age + s
         activity_multipliers = {
+            "sedentary": 1.2,
             "not_active": 1.2,
             "lightly_active": 1.375,
+            "moderately_active": 1.55,
             "active": 1.55,
             "very_active": 1.725,
         }
@@ -1860,16 +1916,19 @@ Keep compact: max 8 ingredients per meal.
                         fast_mode=_img_prompt_fast,
                     )
                     img = client.images.generate(
-                        model="dall-e-2",
+                        model=_recommend_meals_image_model(),
                         prompt=prompt,
                         size=_dalle_sz,
                         n=1,
-                        response_format="b64_json",
                     )
-                    if img and img.data and img.data[0].b64_json:
-                        return img.data[0].b64_json
-                    return None
-                except Exception:
+                    img_url = img.data[0].url if (img and img.data) else None
+                    if not img_url:
+                        return None
+                    r = requests.get(img_url, timeout=30)
+                    r.raise_for_status()
+                    return base64.b64encode(r.content).decode("utf-8")
+                except Exception as e:
+                    print(f"[recommend-meals/day] DALL-E error: {type(e).__name__}: {e}")
                     return None
 
             with ThreadPoolExecutor(max_workers=_img_workers) as ex:
@@ -3894,7 +3953,7 @@ def bulk_import_recipes():
     action = (request.form.get("action") or "").strip().lower()
     created_date_str = (request.form.get("createdDate") or "").strip()
 
-    db = init_firestore()
+    db = init_mealmap_firestore()
     collection = db.collection("recipe-log")
 
     # If action=delete, delete all entries for that created date and return.

@@ -56,6 +56,13 @@ _plan_meal_history_lock = Lock()
 _recipe_cache: dict = {}
 _recipe_cache_lock = Lock()
 
+# Hardcoded video URL used by /recipeVaultHealth.
+# Override via HEALTH_CHECK_RECIPE_URL env var.
+HEALTH_CHECK_RECIPE_URL = os.getenv(
+    "HEALTH_CHECK_RECIPE_URL",
+    "https://www.instagram.com/p/DXtUwz_DCiQ/",
+)
+
 # Initialize once
 # ---------- Config ----------
 MAX_VIDEO_SECONDS = int(os.getenv("MAX_VIDEO_SECONDS", "900"))  # 15 min default
@@ -86,6 +93,100 @@ llm = ChatOpenAI(
 
 # User-friendly message for any 500 (client can show this when status is 500)
 DEFAULT_500_USER_MESSAGE = "We ran into a problem. Please try again in a moment."
+
+
+@app.route("/health", methods=["GET"])
+def health():
+    """
+    Lightweight dependency check — no video downloads, no expensive API calls.
+    Verifies OpenAI reachability and Chroma vector DB. Returns 200 or 503.
+    """
+    checks = {}
+    try:
+        client.models.list()
+        checks["openai"] = "ok"
+    except Exception as e:
+        checks["openai"] = f"error: {str(e)[:120]}"
+    try:
+        vector_db.similarity_search("health check", k=1)
+        checks["vector_db"] = "ok"
+    except Exception as e:
+        checks["vector_db"] = f"error: {str(e)[:120]}"
+
+    status = "healthy" if all(v == "ok" for v in checks.values()) else "degraded"
+    return jsonify({"status": status, "checks": checks}), (200 if status == "healthy" else 503)
+
+
+@app.route("/recipeVaultHealth", methods=["GET"])
+def recipe_vault_health():
+    """
+    End-to-end health check for the recipe extraction pipeline.
+
+    Routes to the video or webpage pipeline depending on HEALTH_CHECK_RECIPE_URL.
+    Cache is bypassed entirely — result is never read from or written to _recipe_cache.
+    Returns 200 { status: healthy, recipe_name, method, elapsed_s }
+         or 503 { status: unhealthy, error, elapsed_s }.
+
+    Override the URL via HEALTH_CHECK_RECIPE_URL env var.
+    """
+    start = time.time()
+    url   = HEALTH_CHECK_RECIPE_URL
+
+    try:
+        if is_video_url(url):
+            # ── Video pipeline ────────────────────────────────────────────────
+            # extract_recipe_from_video_internal returns a (Response, status) tuple.
+            # bypass_cache=True ensures every health check runs the real pipeline,
+            # not a stale cached result from a previous successful extraction.
+            response, status_code = extract_recipe_from_video_internal(url, bypass_cache=True)
+            data = response.get_json()
+
+            if status_code != 200 or not data:
+                error = (data or {}).get("error") or (data or {}).get("user_message") or "Unknown error"
+                raise ValueError(f"Video pipeline returned {status_code}: {error}")
+
+            # Pull recipe name from the nested recipe dict
+            recipe_obj  = data.get("recipe") or {}
+            name        = recipe_obj.get("name", "").strip()
+            method      = (data.get("extraction") or {}).get("method", "video")
+
+            if not name:
+                raise ValueError("Video pipeline succeeded but recipe name is empty")
+
+        else:
+            # ── Webpage pipeline ──────────────────────────────────────────────
+            html          = fetch_html(url)
+            recipes, soup = extract_jsonld_recipes(html)
+
+            if recipes:
+                recipe, _ = normalize_recipe_from_jsonld(recipes[0], soup)
+                method    = "jsonld"
+            else:
+                page_text = clean_page_text(html)
+                recipe    = extract_recipe_from_webpage_llm(page_text)
+                method    = "html_llm"
+
+            name = (recipe or {}).get("name", "").strip()
+            if not name:
+                raise ValueError("Webpage pipeline succeeded but recipe name is empty")
+
+        elapsed = round(time.time() - start, 2)
+        return jsonify({
+            "status":      "healthy",
+            "recipe_name": name,
+            "method":      method,
+            "elapsed_s":   elapsed,
+            "url":         url,
+        }), 200
+
+    except Exception as e:
+        elapsed = round(time.time() - start, 2)
+        return jsonify({
+            "status":    "unhealthy",
+            "error":     str(e)[:300],
+            "elapsed_s": elapsed,
+            "url":       url,
+        }), 503
 
 
 @app.errorhandler(500)
@@ -5326,11 +5427,14 @@ def _run_frame_vision_fallback_from_path(
         return None, None, None
 
 
-def extract_recipe_from_video_internal(video_url: str):
+def extract_recipe_from_video_internal(video_url: str, bypass_cache: bool = False):
     """
     Internal helper used by unified /extract-recipe endpoint.
     Downloads video once; extracts audio for Whisper and reuses same file for frame+vision fallback.
     Returns a Flask response: jsonify({...}), status_code
+
+    bypass_cache=True  → skip both cache read and cache write (used by /recipeVaultHealth
+                         so every health check exercises the real pipeline).
     """
     ok, err = validate_video_url(video_url)
     if not ok:
@@ -5338,10 +5442,13 @@ def extract_recipe_from_video_internal(video_url: str):
 
     # ── Cache check ──────────────────────────────────────────────────────────
     url_key = hashlib.sha256(video_url.encode()).hexdigest()
-    with _recipe_cache_lock:
-        if url_key in _recipe_cache:
-            print(f"⚡ Cache hit for video URL: {video_url}")
-            return jsonify({**_recipe_cache[url_key], "cached": True}), 200
+    if not bypass_cache:
+        with _recipe_cache_lock:
+            if url_key in _recipe_cache:
+                print(f"⚡ Cache hit for video URL: {video_url}")
+                return jsonify({**_recipe_cache[url_key], "cached": True}), 200
+    else:
+        print(f"🔓 Cache bypass active — running full pipeline for: {video_url}")
     # ─────────────────────────────────────────────────────────────────────────
 
     temp_dir = None
@@ -5445,8 +5552,9 @@ def extract_recipe_from_video_internal(video_url: str):
                 _enrich_recipe_response(recipe)
                 tags = extract_recipe_tags(recipe)
                 _result = {"source": source, "recipe": recipe, "tags": tags, "transcript": None, "extraction": {"method": extraction_method, "confidence": 0.5}, "meta": meta}
-                with _recipe_cache_lock:
-                    _recipe_cache[url_key] = _result
+                if not bypass_cache:
+                    with _recipe_cache_lock:
+                        _recipe_cache[url_key] = _result
                 return jsonify(_result), 200
             return jsonify({
                 "error": "Failed to extract recipe from video",
@@ -5467,8 +5575,9 @@ def extract_recipe_from_video_internal(video_url: str):
                 _enrich_recipe_response(recipe)
                 tags = extract_recipe_tags(recipe)
                 _result = {"source": source, "recipe": recipe, "tags": tags, "transcript": None, "extraction": {"method": extraction_method, "confidence": 0.5}, "meta": meta}
-                with _recipe_cache_lock:
-                    _recipe_cache[url_key] = _result
+                if not bypass_cache:
+                    with _recipe_cache_lock:
+                        _recipe_cache[url_key] = _result
                 return jsonify(_result), 200
             return jsonify({
                 "error": "Transcript is empty after cleanup",
@@ -5498,8 +5607,9 @@ def extract_recipe_from_video_internal(video_url: str):
                 _enrich_recipe_response(recipe)
                 tags = extract_recipe_tags(recipe)
                 _result = {"source": source, "recipe": recipe, "tags": tags, "transcript": None, "extraction": {"method": extraction_method, "confidence": 0.5}, "meta": meta}
-                with _recipe_cache_lock:
-                    _recipe_cache[url_key] = _result
+                if not bypass_cache:
+                    with _recipe_cache_lock:
+                        _recipe_cache[url_key] = _result
                 return jsonify(_result), 200
             return jsonify({
                 "error": "Failed to extract recipe from transcript chunk",
@@ -5537,8 +5647,9 @@ def extract_recipe_from_video_internal(video_url: str):
                 _enrich_recipe_response(fallback_recipe)
                 tags = extract_recipe_tags(fallback_recipe)
                 _result = {"source": fallback_source, "recipe": fallback_recipe, "tags": tags, "transcript": None, "extraction": {"method": extraction_method, "confidence": 0.5}, "meta": meta}
-                with _recipe_cache_lock:
-                    _recipe_cache[url_key] = _result
+                if not bypass_cache:
+                    with _recipe_cache_lock:
+                        _recipe_cache[url_key] = _result
                 return jsonify(_result), 200
         elif not ingredients:
             print("🎬 Ingredients empty from transcript; using already-computed frame+vision result...")
@@ -5549,8 +5660,9 @@ def extract_recipe_from_video_internal(video_url: str):
                 _enrich_recipe_response(fallback_recipe)
                 tags = extract_recipe_tags(fallback_recipe)
                 _result = {"source": fallback_source, "recipe": fallback_recipe, "tags": tags, "transcript": None, "extraction": {"method": extraction_method, "confidence": 0.5}, "meta": meta}
-                with _recipe_cache_lock:
-                    _recipe_cache[url_key] = _result
+                if not bypass_cache:
+                    with _recipe_cache_lock:
+                        _recipe_cache[url_key] = _result
                 return jsonify(_result), 200
 
         source_type = determine_source_type(video_url)
@@ -5572,8 +5684,9 @@ def extract_recipe_from_video_internal(video_url: str):
             "extraction": {"method": "transcript_llm", "confidence": 0.55},
             "meta": meta,
         }
-        with _recipe_cache_lock:
-            _recipe_cache[url_key] = _result
+        if not bypass_cache:
+            with _recipe_cache_lock:
+                _recipe_cache[url_key] = _result
         return jsonify(_result), 200
 
     except Exception as e:

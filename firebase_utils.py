@@ -3,47 +3,169 @@ from firebase_admin import credentials, firestore, storage
 from datetime import datetime
 import json
 import os
+import re
+import tempfile
 import threading
 import uuid
 
 import requests
 
+# ── NutriLens app (nutrilensai-77be2) ─────────────────────────────────────────
+# Used by: /recommend-meals, /food-logging, and all meal image storage.
+# Env vars: FIREBASE_SERVICE_ACCOUNT_JSON, FIREBASE_PROJECT_ID,
+#           FIREBASE_STORAGE_BUCKET
+# ── MealMap app ───────────────────────────────────────────────────────────────
+# Used by: /extract-recipe, /bulk-import-recipes (recipe-log collection).
+# Env vars: MEALMAP_SERVICE_ACCOUNT_JSON, MEALMAP_PROJECT_ID,
+#           MEALMAP_STORAGE_BUCKET
+# ─────────────────────────────────────────────────────────────────────────────
+# Both env vars accept EITHER a file path OR raw JSON content (for Render /
+# cloud deployments where you paste the service-account JSON directly into the
+# env var value).
+
+_NUTRILENS_APP_NAME = firebase_admin.DEFAULT_APP_NAME   # "[DEFAULT]"
+_MEALMAP_APP_NAME   = "mealmap"
+
 _firestore_client = None
 _firestore_lock = threading.Lock()
 
-_FIREBASE_CREDENTIALS_PATH = os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON", "firebase_service_account.json")
+_mealmap_firestore_client = None
+_mealmap_lock = threading.Lock()
+
+_NUTRILENS_PROJECT_ID = "nutrilensai-77be2"
+_NUTRILENS_CRED_CANDIDATES = (
+    "nutrilens_firebase_service_account.json",
+    "firebase_service_account.json",
+)
+_MEALMAP_CRED_CANDIDATES = (
+    "mealmap_firebase_service_account.json",
+    "firebase_service_account.json",
+)
 _MEAL_IMAGE_MAX_BYTES = int(os.getenv("MEAL_IMAGE_MAX_DOWNLOAD_BYTES", str(12 * 1024 * 1024)))
 
 
-def _firebase_default_bucket_name() -> str:
-    explicit = (os.getenv("FIREBASE_STORAGE_BUCKET") or "").strip()
+def _load_credentials(env_var: str, file_candidates: tuple) -> credentials.Certificate:
+    """
+    Build a firebase_admin Certificate from either:
+      1. env_var containing raw JSON  (paste JSON directly → works on Render)
+      2. env_var containing a file path
+      3. first matching file from file_candidates
+    """
+    raw = (os.getenv(env_var) or "").strip()
+
+    # Case 1: env var holds JSON content directly
+    if raw.startswith("{"):
+        try:
+            parsed = json.loads(raw)
+            # Write to a temp file because Certificate() needs a file or dict
+            return credentials.Certificate(parsed)
+        except Exception as e:
+            raise ValueError(f"[firebase] {env_var} looks like JSON but failed to parse: {e}")
+
+    # Case 2: env var holds a file path
+    if raw and os.path.isfile(raw):
+        return credentials.Certificate(raw)
+
+    # Case 3: search candidate file names
+    for name in file_candidates:
+        if os.path.isfile(name):
+            return credentials.Certificate(name)
+
+    raise FileNotFoundError(
+        f"Firebase credentials not found. Set {env_var} to the service-account "
+        f"JSON content (on Render: paste the full JSON) or a valid file path. "
+        f"Tried candidates: {file_candidates}"
+    )
+
+
+def _project_id_from_env_or_cred(env_var: str, cred: credentials.Certificate) -> str:
+    explicit = (os.getenv(env_var) or "").strip()
     if explicit:
         return explicit
     try:
-        with open(_FIREBASE_CREDENTIALS_PATH, encoding="utf-8") as f:
-            pid = json.load(f).get("project_id")
-        return f"{pid}.appspot.com" if pid else ""
+        return (cred.service_account_email or "").split("@")[1].split(".")[0]
     except Exception:
-        return ""
+        pass
+    return ""
 
+
+def _sanitize_storage_segment(value: str, *, max_len: int = 180) -> str:
+    cleaned = re.sub(r"[^\w\-.]", "_", (value or "").strip())
+    return cleaned[:max_len] or "unknown"
+
+
+# ── NutriLens (default) app ───────────────────────────────────────────────────
 
 def init_firestore():
+    """Return Firestore client for the NutriLens project (nutrilensai-77be2)."""
     global _firestore_client
     if _firestore_client:
         return _firestore_client
 
     with _firestore_lock:
-        if not firebase_admin._apps:
-            cred = credentials.Certificate(_FIREBASE_CREDENTIALS_PATH)
-            bucket_name = _firebase_default_bucket_name()
-            opts = {"storageBucket": bucket_name} if bucket_name else {}
-            firebase_admin.initialize_app(cred, opts)
-        if _firestore_client is None:
-            _firestore_client = firestore.client()
+        if _firestore_client:
+            return _firestore_client
+
+        if firebase_admin.DEFAULT_APP_NAME not in firebase_admin._apps:
+            cred = _load_credentials("FIREBASE_SERVICE_ACCOUNT_JSON", _NUTRILENS_CRED_CANDIDATES)
+            bucket_name = (os.getenv("FIREBASE_STORAGE_BUCKET") or "").strip()
+            if not bucket_name:
+                pid = (os.getenv("FIREBASE_PROJECT_ID") or _NUTRILENS_PROJECT_ID).strip()
+                bucket_name = f"{pid}.appspot.com"
+            print(f"[firebase/nutrilens] initializing default app, bucket={bucket_name}")
+            firebase_admin.initialize_app(cred, {"storageBucket": bucket_name})
+
+        _firestore_client = firestore.client()
     return _firestore_client
 
 
-def upload_meal_image_bytes_to_storage(data: bytes, content_type: str = "image/png") -> str | None:
+# ── MealMap app ───────────────────────────────────────────────────────────────
+
+def init_mealmap_firestore():
+    """Return Firestore client for the MealMap project (extract-recipe / recipe-log)."""
+    global _mealmap_firestore_client
+    if _mealmap_firestore_client:
+        return _mealmap_firestore_client
+
+    with _mealmap_lock:
+        if _mealmap_firestore_client:
+            return _mealmap_firestore_client
+
+        if _MEALMAP_APP_NAME not in firebase_admin._apps:
+            cred = _load_credentials("MEALMAP_SERVICE_ACCOUNT_JSON", _MEALMAP_CRED_CANDIDATES)
+            bucket_name = (os.getenv("MEALMAP_STORAGE_BUCKET") or "").strip()
+            if not bucket_name:
+                try:
+                    pid = (os.getenv("MEALMAP_PROJECT_ID") or "").strip()
+                    if not pid:
+                        # derive from service account email: name@project-id.iam...
+                        pid = cred.service_account_email.split("@")[1].split(".iam")[0]
+                    bucket_name = f"{pid}.appspot.com"
+                except Exception:
+                    bucket_name = ""
+            opts = {"storageBucket": bucket_name} if bucket_name else {}
+            print(f"[firebase/mealmap] initializing named app '{_MEALMAP_APP_NAME}', bucket={bucket_name or '(none)'}")
+            firebase_admin.initialize_app(cred, opts, name=_MEALMAP_APP_NAME)
+
+        mealmap_app = firebase_admin.get_app(_MEALMAP_APP_NAME)
+        _mealmap_firestore_client = firestore.client(app=mealmap_app)
+    return _mealmap_firestore_client
+
+
+def recommend_meal_image_storage_path(plan_id: str, day_index: int, meal_key: str) -> str:
+    """gs://nutrilensai-77be2.appspot.com/generated-meals/{plan_id}/day-{n}/{meal}.png"""
+    prefix = (os.getenv("FIREBASE_MEAL_IMAGE_PREFIX") or "generated-meals").strip().strip("/")
+    safe_plan = _sanitize_storage_segment(plan_id)
+    safe_meal = _sanitize_storage_segment(meal_key, max_len=80)
+    return f"{prefix}/{safe_plan}/day-{day_index}/{safe_meal}.png"
+
+
+def upload_meal_image_bytes_to_storage(
+    data: bytes,
+    content_type: str = "image/png",
+    *,
+    storage_path: str | None = None,
+) -> str | None:
     """
     Upload raw image bytes to Firebase Storage and return a public HTTPS URL, or None on failure/skip.
     """
@@ -70,7 +192,7 @@ def upload_meal_image_bytes_to_storage(data: bytes, content_type: str = "image/p
         print(f"[meal-image] storage bucket unavailable: {e}")
         return None
 
-    object_name = f"generated-meals/{uuid.uuid4().hex}{ext}"
+    object_name = storage_path or f"generated-meals/{uuid.uuid4().hex}{ext}"
     blob = bucket.blob(object_name)
     try:
         blob.upload_from_string(data, content_type=ct)

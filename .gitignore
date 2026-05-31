@@ -5,6 +5,11 @@
 
 # Firebase service account (contains sensitive credentials)
 firebase_service_account.json
+nutrilens_firebase_service_account.json
+mealmap_firebase_service_account.json
+*firebase*service_account*.json
+*.json.bak
+*service_account*.bak
 
 # Python
 __pycache__/

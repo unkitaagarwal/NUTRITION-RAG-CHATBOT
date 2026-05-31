@@ -1462,7 +1462,8 @@ def recommend_meals():
                     img = client.images.generate(
                         model="gpt-image-1",
                         prompt=prompt,
-                        size=_dalle_sz,
+                        size="1024x1024",
+                        quality="low",
                         n=1,
                     )
                     if not (img and img.data):

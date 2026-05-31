@@ -23,7 +23,7 @@ import requests
 # cloud deployments where you paste the service-account JSON directly into the
 # env var value).
 
-_NUTRILENS_APP_NAME = firebase_admin.DEFAULT_APP_NAME   # "[DEFAULT]"
+_NUTRILENS_APP_NAME = "[DEFAULT]"
 _MEALMAP_APP_NAME   = "mealmap"
 
 _firestore_client = None
@@ -106,7 +106,7 @@ def init_firestore():
         if _firestore_client:
             return _firestore_client
 
-        if firebase_admin.DEFAULT_APP_NAME not in firebase_admin._apps:
+        if _NUTRILENS_APP_NAME not in firebase_admin._apps:
             cred = _load_credentials("FIREBASE_SERVICE_ACCOUNT_JSON", _NUTRILENS_CRED_CANDIDATES)
             bucket_name = (os.getenv("FIREBASE_STORAGE_BUCKET") or "").strip()
             if not bucket_name:

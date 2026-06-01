@@ -618,11 +618,10 @@ Rules: Use required ingredients. Step-by-step instructions.{macro_summary} Valid
         # Generate images for meals if requested (b64_json → Firebase Storage, same as /food-logging)
         if include_images:
             default_image_url = os.getenv("DEFAULT_MEAL_IMAGE_URL", "")
-            dalle_sz = _food_logging_dalle_size()
             workers = _food_logging_image_pool_size(len(validated_meals))
 
             def _generate_and_persist(m: dict) -> str:
-                b64 = _generate_food_log_meal_image_b64(m, size=dalle_sz)
+                b64 = _generate_food_log_meal_image_b64(m)
                 return _food_logging_finalize_image_from_b64(b64, default_image_url)
 
             with ThreadPoolExecutor(max_workers=workers) as ex:
@@ -845,11 +844,6 @@ def _meal_image_prompt_for_recommend(name: str, desc: str, *, fast_mode: bool) -
     return f"Food photo: {n}"
 
 
-def _food_logging_dalle_size() -> str:
-    """Size for food-logging images; falls back to recommend-meals size logic."""
-    return _recommend_meals_dalle_size(image_quality="low")
-
-
 def _food_logging_image_pool_size(num_images: int) -> int:
     try:
         w = int(
@@ -862,50 +856,77 @@ def _food_logging_image_pool_size(num_images: int) -> int:
     return min(w, max(1, num_images))
 
 
-def _generate_food_log_meal_image_b64(meal: dict, *, size: str) -> str | None:
-    """DALL·E 2 — generates image URL, downloads bytes, returns base64 for Firebase upload."""
+def _generate_meal_image_b64(
+    name: str,
+    description: str,
+    *,
+    fast_mode: bool = True,
+    log_prefix: str = "meal-image",
+    log_context: str = "",
+) -> str | None:
+    """
+    Shared meal image generation (same as /recommend-meals):
+    gpt-image-1, 1024x1024, quality=low; returns base64 for Firebase upload.
+    """
+    ctx = f" {log_context}" if log_context else ""
     try:
-        prompt = _meal_image_prompt_for_recommend(
-            meal.get("name", "Meal"),
-            meal.get("description", ""),
-            fast_mode=True,
-        )
+        prompt = _meal_image_prompt_for_recommend(name, description, fast_mode=fast_mode)
+        print(f"[{log_prefix}] generating image{ctx} prompt={prompt!r}")
         img = client.images.generate(
-            model=_recommend_meals_image_model(),
+            model="gpt-image-1",
             prompt=prompt,
-            size=size,
+            size="1024x1024",
+            quality="low",
             n=1,
         )
-        img_url = img.data[0].url if (img and img.data) else None
-        if not img_url:
+        if not (img and img.data):
+            print(f"[{log_prefix}] empty response{ctx}")
             return None
-        r = requests.get(img_url, timeout=30)
-        r.raise_for_status()
-        return base64.b64encode(r.content).decode("utf-8")
+        b64 = getattr(img.data[0], "b64_json", None)
+        if b64:
+            print(f"[{log_prefix}] success (b64){ctx}")
+            return b64
+        img_url = getattr(img.data[0], "url", None)
+        if img_url:
+            print(f"[{log_prefix}] success (url){ctx}, downloading")
+            r = requests.get(img_url, timeout=30)
+            r.raise_for_status()
+            return base64.b64encode(r.content).decode("utf-8")
+        print(f"[{log_prefix}] no b64 or url{ctx}")
+        return None
     except Exception as e:
-        print(f"[food-logging] DALL-E error: {type(e).__name__}: {e}")
+        print(f"[{log_prefix}] image error{ctx}: {type(e).__name__}: {e}")
         return None
 
 
-def _generate_food_log_meal_image_url(meal: dict, *, size: str) -> str | None:
-    """DALL·E 2 URL fallback when b64_json path fails."""
+def _generate_food_log_meal_image_b64(meal: dict, *, fast_mode: bool = True) -> str | None:
+    """Food-logging wrapper around shared recommend-meals image generation."""
+    return _generate_meal_image_b64(
+        meal.get("name", "Meal"),
+        meal.get("description", ""),
+        fast_mode=fast_mode,
+        log_prefix="food-logging",
+    )
+
+
+def _food_log_photo_to_storage_url(photo_data_url: str, default_image_url: str) -> str:
+    """Upload submitted photo bytes to Firebase; avoid returning huge data: URLs in JSON."""
+    if not photo_data_url or not str(photo_data_url).startswith("data:"):
+        return default_image_url
     try:
-        prompt = _meal_image_prompt_for_recommend(
-            meal.get("name", "Meal"),
-            meal.get("description", ""),
-            fast_mode=True,
-        )
-        img = client.images.generate(
-            model=_recommend_meals_image_model(),
-            prompt=prompt,
-            size=size,
-            n=1,
-        )
-        if img and img.data and getattr(img.data[0], "url", None):
-            return img.data[0].url
-        return None
-    except Exception:
-        return None
+        header, b64_part = str(photo_data_url).split(",", 1)
+        content_type = "image/jpeg"
+        if "image/png" in header:
+            content_type = "image/png"
+        elif "image/webp" in header:
+            content_type = "image/webp"
+        raw = base64.b64decode(b64_part)
+        path = f"food-log-photos/{uuid.uuid4().hex}.jpg"
+        url = upload_meal_image_bytes_to_storage(raw, content_type, storage_path=path)
+        return url if url else default_image_url
+    except Exception as e:
+        print(f"[food-logging] photo upload failed: {e}")
+        return default_image_url
 
 
 def _food_logging_finalize_image_from_b64(b64_json: str | None, default_image_url: str) -> str:
@@ -1444,52 +1465,26 @@ def recommend_meals():
                 for mk in required_meal_keys:
                     meal_jobs.append((day_i, mk, day_obj.get(mk, {})))
 
-            _dalle_sz = _recommend_meals_dalle_size(image_quality=_img_quality)
             _img_workers = _recommend_meals_image_pool_size(len(meal_jobs))
             _img_prompt_fast = bool(fast_mode) or (_img_quality == "low")
 
             _image_errors: list[str] = []
 
-            def _generate_meal_image_b64(job: tuple[int, str, dict]) -> str | None:
+            def _generate_job_image_b64(job: tuple[int, str, dict]) -> str | None:
                 day_i, mk, meal_obj = job
-                try:
-                    meal_name = meal_obj.get("name", "Meal")
-                    meal_desc = meal_obj.get("description", "")
-                    prompt = _meal_image_prompt_for_recommend(
-                        meal_name, meal_desc, fast_mode=_img_prompt_fast
-                    )
-                    print(f"[recommend-meals] generating image day={day_i} meal={mk} prompt={prompt!r}")
-                    img = client.images.generate(
-                        model="gpt-image-1",
-                        prompt=prompt,
-                        size="1024x1024",
-                        quality="low",
-                        n=1,
-                    )
-                    if not (img and img.data):
-                        print(f"[recommend-meals] empty response day={day_i} meal={mk}")
-                        return None
-                    # gpt-image-1 returns b64_json directly; dall-e-3 returns a URL
-                    b64 = getattr(img.data[0], "b64_json", None)
-                    if b64:
-                        print(f"[recommend-meals] success (b64) day={day_i} meal={mk}")
-                        return b64
-                    img_url = getattr(img.data[0], "url", None)
-                    if img_url:
-                        print(f"[recommend-meals] success (url) day={day_i} meal={mk}, downloading")
-                        r = requests.get(img_url, timeout=30)
-                        r.raise_for_status()
-                        return base64.b64encode(r.content).decode("utf-8")
-                    print(f"[recommend-meals] no b64 or url day={day_i} meal={mk}")
-                    return None
-                except Exception as e:
-                    err_msg = f"day={day_i} meal={mk}: {type(e).__name__}: {e}"
-                    print(f"[recommend-meals] image error {err_msg}")
-                    _image_errors.append(err_msg)
-                    return None
+                b64 = _generate_meal_image_b64(
+                    meal_obj.get("name", "Meal"),
+                    meal_obj.get("description", ""),
+                    fast_mode=_img_prompt_fast,
+                    log_prefix="recommend-meals",
+                    log_context=f"day={day_i} meal={mk}",
+                )
+                if b64 is None:
+                    _image_errors.append(f"day={day_i} meal={mk}: generation failed")
+                return b64
 
             with ThreadPoolExecutor(max_workers=_img_workers) as img_executor:
-                futures = {img_executor.submit(_generate_meal_image_b64, job): job for job in meal_jobs}
+                futures = {img_executor.submit(_generate_job_image_b64, job): job for job in meal_jobs}
                 raw_quads: list[tuple[int, str, dict, str | None]] = []
                 for fut, job in futures.items():
                     day_i, mk, meal_obj = job
@@ -1904,36 +1899,20 @@ Keep compact: max 8 ingredients per meal.
                 _plan_meal_name_history[plan_id].update(generated_names)
 
         if include_images:
-            _dalle_sz = _recommend_meals_dalle_size(image_quality=_img_quality)
             _img_workers = _recommend_meals_image_pool_size(len(required_meal_keys))
             _img_prompt_fast = bool(fast_mode) or (_img_quality == "low")
 
-            def _generate_meal_image_b64(meal_obj: dict) -> str | None:
-                try:
-                    prompt = _meal_image_prompt_for_recommend(
-                        meal_obj.get("name", "Meal"),
-                        meal_obj.get("description", ""),
-                        fast_mode=_img_prompt_fast,
-                    )
-                    img = client.images.generate(
-                        model=_recommend_meals_image_model(),
-                        prompt=prompt,
-                        size=_dalle_sz,
-                        n=1,
-                    )
-                    img_url = img.data[0].url if (img and img.data) else None
-                    if not img_url:
-                        return None
-                    r = requests.get(img_url, timeout=30)
-                    r.raise_for_status()
-                    return base64.b64encode(r.content).decode("utf-8")
-                except Exception as e:
-                    print(f"[recommend-meals/day] DALL-E error: {type(e).__name__}: {e}")
-                    return None
+            def _generate_day_meal_image_b64(meal_obj: dict) -> str | None:
+                return _generate_meal_image_b64(
+                    meal_obj.get("name", "Meal"),
+                    meal_obj.get("description", ""),
+                    fast_mode=_img_prompt_fast,
+                    log_prefix="recommend-meals/day",
+                )
 
             with ThreadPoolExecutor(max_workers=_img_workers) as ex:
                 futs = {
-                    k: ex.submit(_generate_meal_image_b64, day_obj.get(k, {}))
+                    k: ex.submit(_generate_day_meal_image_b64, day_obj.get(k, {}))
                     for k in required_meal_keys
                 }
                 raws: list[tuple[str, str | None]] = []
@@ -2396,8 +2375,8 @@ def food_logging():
     - fast (optional): 1/true — smaller LLM completion budget for meal extraction only.
     - include_image (optional): true/false across form fields, query, or JSON (default true).
       When false, skip all meal image generation/attachment.
-    Each meal in the response includes imageUrl: for action=photo this is always the same image sent in the
-    request (data URL); for voice/text, DALL·E then upload to Firebase Storage when configured (stable URL),
+    Each meal in the response includes imageUrl: for action=photo the submitted image is uploaded to Firebase
+    (short HTTPS URL); for voice/text, gpt-image-1 then Firebase when configured (stable URL),
     otherwise the temporary OpenAI CDN URL or DEFAULT_MEAL_IMAGE_URL fallback.
     Whisper: optional env FOOD_LOGGING_WHISPER_LANGUAGE (e.g. en) can reduce latency.
     Photo: optional FOOD_LOGGING_PHOTO_MODEL (defaults to VOICE_LOGGING_MODEL / gpt-4o-mini).
@@ -2479,8 +2458,13 @@ def food_logging():
                     "action": "photo",
                 })
 
+            photo_image_url = (
+                _food_log_photo_to_storage_url(photo_data_url, default_image_url)
+                if include_image
+                else None
+            )
             for m in meals:
-                m["imageUrl"] = photo_data_url if include_image else None
+                m["imageUrl"] = photo_image_url
 
             return jsonify({
                 "transcript": transcript,
@@ -2500,19 +2484,11 @@ def food_logging():
         meals = extract_meals_from_voice_log_transcript(transcript, fast=fast_flag)
 
         if meals and include_image:
-            dalle_sz = _food_logging_dalle_size()
             workers = _food_logging_image_pool_size(len(meals))
 
-            # Generate b64_json and upload to Firebase in a single parallel pass.
-            # This avoids the two-pool pattern (generate URL → download → re-upload)
-            # and always returns a stable firebasestorage.googleapis.com URL.
             def _generate_and_persist(m: dict) -> str:
-                b64 = _generate_food_log_meal_image_b64(m, size=dalle_sz)
-                url = _food_logging_finalize_image_from_b64(b64, default_image_url)
-                if url:
-                    return url
-                openai_url = _generate_food_log_meal_image_url(m, size=dalle_sz)
-                return _finalize_meal_image_url(openai_url, default_image_url)
+                b64 = _generate_food_log_meal_image_b64(m, fast_mode=fast_flag)
+                return _food_logging_finalize_image_from_b64(b64, default_image_url)
 
             with ThreadPoolExecutor(max_workers=workers) as ex:
                 finalized = list(ex.map(_generate_and_persist, meals))

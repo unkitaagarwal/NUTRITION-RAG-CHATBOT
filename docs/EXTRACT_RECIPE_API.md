@@ -7,7 +7,7 @@
 | **API** | Flask (Python) |
 | **Recipe LLM (text/images)** | OpenAI API — `gpt-4o-mini` (vision for images; chat for transcript/webpage) |
 | **Transcription** | OpenAI Whisper (`whisper-1`) |
-| **Video download** | yt-dlp (YouTube, TikTok, Instagram, etc.) |
+| **Video download** | yt-dlp (YouTube, TikTok, Instagram, Facebook, etc.) |
 | **Audio extraction from video** | ffmpeg (libmp3lame) |
 | **Frame extraction from video** | ffmpeg (JPEG frames at timestamps) |
 | **Webpage fetch** | `requests` + `BeautifulSoup` (lxml) |
@@ -88,6 +88,8 @@
 ---
 
 ## Flow 3: Video URL (single download, then audio or frame+vision)
+
+**Supported video hosts:** YouTube, TikTok, Instagram, and Facebook (`facebook.com`, `www/m/web.facebook.com`, `fb.watch`, `fb.com`). A URL is routed into this flow when its host matches `VIDEO_DOMAINS` (or when `mode: "video"` is passed). Facebook (like TikTok/Instagram) often needs `YTDLP_COOKIES_FILE` / `YTDLP_COOKIES_B64` for private or login-gated posts. `source.source_type` will be `"Facebook"` for these links.
 
 **Principle:** Download the **video file once**; use it for both audio extraction and, when needed, frame+vision fallback.
 

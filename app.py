@@ -62,8 +62,54 @@ _recipe_cache_lock = Lock()
 # ---------- Config ----------
 MAX_VIDEO_SECONDS = int(os.getenv("MAX_VIDEO_SECONDS", "900"))  # 15 min default
 # Cookies can be provided as: 1) file path, or 2) base64-encoded content in YTDLP_COOKIES_B64 env var
-YTDLP_COOKIES_FILE = os.path.expanduser(os.path.expandvars(os.getenv("YTDLP_COOKIES_FILE", ""))) or None  # optional, helps IG/TikTok
+YTDLP_COOKIES_FILE = os.path.expanduser(os.path.expandvars(os.getenv("YTDLP_COOKIES_FILE", ""))) or None  # optional, helps IG/TikTok/Facebook
 YTDLP_COOKIES_B64 = os.getenv("YTDLP_COOKIES_B64")  # alternative: base64-encoded cookies content (for Render/cloud)
+
+# Startup diagnostic: confirm whether yt-dlp cookies are actually available on this instance.
+# Facebook/IG/TikTok return "302 redirect loop" when cookies are missing/expired (bounced to login).
+try:
+    _cookie_status = "NONE"
+    if YTDLP_COOKIES_FILE and os.path.exists(YTDLP_COOKIES_FILE):
+        _cookie_status = f"FILE ({YTDLP_COOKIES_FILE}, {os.path.getsize(YTDLP_COOKIES_FILE)} bytes)"
+    elif YTDLP_COOKIES_FILE:
+        _cookie_status = f"FILE SET BUT MISSING ON DISK ({YTDLP_COOKIES_FILE})"
+    elif YTDLP_COOKIES_B64:
+        _cookie_status = "B64"
+    print(f"[startup] yt-dlp cookies: {_cookie_status}")
+except Exception as _e:
+    print(f"[startup] cookie check failed: {_e}")
+
+
+def _prepare_cookiefile(temp_dir: str | None = None) -> str | None:
+    """Return a WRITABLE cookies.txt path for yt-dlp, or None if no cookies configured.
+
+    IMPORTANT: yt-dlp writes the (refreshed) cookie jar BACK to `cookiefile`
+    after a download. Render secret files are mounted read-only at /etc/secrets,
+    so pointing yt-dlp directly at YTDLP_COOKIES_FILE raises
+    "[Errno 30] Read-only file system". We therefore always copy the cookies
+    into a writable location and hand yt-dlp the copy.
+
+    Pass `temp_dir` (the per-download temp dir) when available so the copy is
+    cleaned up automatically; otherwise a standalone temp file is created.
+    """
+    if not (YTDLP_COOKIES_FILE or YTDLP_COOKIES_B64):
+        return None
+    try:
+        if temp_dir:
+            dest = os.path.join(temp_dir, "cookies.txt")
+        else:
+            fd, dest = tempfile.mkstemp(suffix="_cookies.txt")
+            os.close(fd)
+        if YTDLP_COOKIES_FILE and os.path.exists(YTDLP_COOKIES_FILE):
+            shutil.copyfile(YTDLP_COOKIES_FILE, dest)
+            return dest
+        if YTDLP_COOKIES_B64:
+            with open(dest, "w") as f:
+                f.write(base64.b64decode(YTDLP_COOKIES_B64).decode("utf-8"))
+            return dest
+    except Exception as e:
+        print(f"[cookies] failed to prepare writable cookie file: {e}")
+    return None
 LLM_MODEL = os.getenv("RECIPE_LLM_MODEL", "gpt-4o-mini")  # change if needed
 RECIPE_LLM_MODEL = os.getenv("RECIPE_LLM_MODEL", "gpt-4o-mini")
 
@@ -2605,10 +2651,11 @@ def ytdlp_base_opts(temp_dir: str, video_url: str = None):
         }],
     }
 
-    # Cookies greatly improve TikTok/Instagram reliability (and some YouTube cases)
-    if YTDLP_COOKIES_FILE and os.path.exists(YTDLP_COOKIES_FILE):
-        opts["cookiefile"] = YTDLP_COOKIES_FILE
-    
+    # Cookies greatly improve TikTok/Instagram/Facebook reliability (and some YouTube cases)
+    _cf = _prepare_cookiefile(temp_dir)
+    if _cf:
+        opts["cookiefile"] = _cf
+
     # Add proxy ONLY for YouTube URLs (not for TikTok/Instagram/webpages)
     if YT_PROXY and video_url and is_youtube_url(video_url):
         opts["proxy"] = YT_PROXY
@@ -4377,20 +4424,25 @@ Rules:
 def _yt_meta(video_url: str) -> dict:
     """Extract metadata without downloading. Uses cookies if available."""
     opts = {"quiet": True, "no_warnings": True, "noplaylist": True}
-    
-    # Add cookies if available (needed for Instagram/TikTok)
-    if YTDLP_COOKIES_FILE and os.path.exists(YTDLP_COOKIES_FILE):
-        opts["cookiefile"] = YTDLP_COOKIES_FILE
-        print(f"🍪 Using cookies file for metadata: {YTDLP_COOKIES_FILE}")
-    
-    # Add proxy ONLY for YouTube URLs (not for TikTok/Instagram)
-    if YT_PROXY and is_youtube_url(video_url):
-        opts["proxy"] = YT_PROXY
-        print(f"🌐 Using proxy for YouTube metadata: {YT_PROXY}")
-    
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(video_url, download=False)
-    return info or {}
+    cookie_temp_dir = tempfile.mkdtemp()
+    try:
+        # Add cookies if available (needed for Instagram/TikTok/Facebook).
+        # Copied to a writable path because yt-dlp writes the cookie jar back.
+        _cf = _prepare_cookiefile(cookie_temp_dir)
+        if _cf:
+            opts["cookiefile"] = _cf
+            print("🍪 Using cookies file for metadata")
+
+        # Add proxy ONLY for YouTube URLs (not for TikTok/Instagram)
+        if YT_PROXY and is_youtube_url(video_url):
+            opts["proxy"] = YT_PROXY
+            print(f"🌐 Using proxy for YouTube metadata: {YT_PROXY}")
+
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(video_url, download=False)
+        return info or {}
+    finally:
+        shutil.rmtree(cookie_temp_dir, ignore_errors=True)
 
 
 def _download_audio_mp3(video_url: str):
@@ -4431,25 +4483,16 @@ def _download_audio_mp3(video_url: str):
             }],
         }
 
-        # Cookies (very helpful for TikTok/IG + some YouTube)
+        # Cookies (very helpful for TikTok/IG/Facebook + some YouTube).
+        # Copied to a writable path because yt-dlp writes the cookie jar back
+        # (Render secret files are read-only → would raise Errno 30).
         cookies_used = False
-        if YTDLP_COOKIES_FILE and os.path.exists(YTDLP_COOKIES_FILE):
-            ydl_opts["cookiefile"] = YTDLP_COOKIES_FILE
+        _cf = _prepare_cookiefile(temp_dir)
+        if _cf:
+            ydl_opts["cookiefile"] = _cf
             cookies_used = True
-            print(f"🍪 Using cookies file: {YTDLP_COOKIES_FILE}")
-        elif YTDLP_COOKIES_B64:
-            # Create temp cookies file from base64 (for Render/cloud deployment)
-            temp_cookies_path = os.path.join(temp_dir, 'cookies.txt')
-            try:
-                cookies_content = base64.b64decode(YTDLP_COOKIES_B64).decode('utf-8')
-                with open(temp_cookies_path, 'w') as f:
-                    f.write(cookies_content)
-                ydl_opts["cookiefile"] = temp_cookies_path
-                cookies_used = True
-                print("🍪 Using cookies from environment variable (base64)")
-            except Exception as e:
-                print(f"⚠️ Failed to decode cookies from YTDLP_COOKIES_B64: {str(e)}")
-        
+            print("🍪 Using cookies file")
+
         # For Instagram, add additional extractor args if cookies are available
         if "instagram.com" in video_url.lower() and cookies_used:
             ydl_opts.setdefault("extractor_args", {})["instagram"] = {
@@ -4515,17 +4558,11 @@ def _download_video_to_file(video_url: str):
             "no_warnings": True,
             "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
         }
-        if YTDLP_COOKIES_FILE and os.path.exists(YTDLP_COOKIES_FILE):
-            ydl_opts["cookiefile"] = YTDLP_COOKIES_FILE
-        elif YTDLP_COOKIES_B64:
-            temp_cookies_path = os.path.join(temp_dir, "cookies.txt")
-            try:
-                cookies_content = base64.b64decode(YTDLP_COOKIES_B64).decode("utf-8")
-                with open(temp_cookies_path, "w") as f:
-                    f.write(cookies_content)
-                ydl_opts["cookiefile"] = temp_cookies_path
-            except Exception:
-                pass
+        # Copy cookies to a writable path (yt-dlp writes the jar back; Render
+        # secret files are read-only → would raise Errno 30).
+        _cf = _prepare_cookiefile(temp_dir)
+        if _cf:
+            ydl_opts["cookiefile"] = _cf
         if "instagram.com" in video_url.lower() and ydl_opts.get("cookiefile"):
             ydl_opts.setdefault("extractor_args", {})["instagram"] = {"webpage_display": ["Desktop"]}
         if YT_PROXY and is_youtube_url(video_url):
@@ -4574,8 +4611,9 @@ def _profile_discovery_opts(profile_url: str, limit: int) -> dict:
         "playlistend": max(1, min(limit * 4, 50)),
         "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
     }
-    if YTDLP_COOKIES_FILE and os.path.exists(YTDLP_COOKIES_FILE):
-        opts["cookiefile"] = YTDLP_COOKIES_FILE
+    _cf = _prepare_cookiefile()
+    if _cf:
+        opts["cookiefile"] = _cf
     if YT_PROXY and is_youtube_url(profile_url):
         opts["proxy"] = YT_PROXY
     elif not is_youtube_url(profile_url):
@@ -5142,17 +5180,11 @@ def _download_single_profile_video(video_url: str, output_dir: str) -> dict:
         "no_warnings": True,
         "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
     }
-    if YTDLP_COOKIES_FILE and os.path.exists(YTDLP_COOKIES_FILE):
-        ydl_opts["cookiefile"] = YTDLP_COOKIES_FILE
-    elif YTDLP_COOKIES_B64:
-        temp_cookies_path = os.path.join(output_dir, f"cookies_{uuid.uuid4().hex}.txt")
-        try:
-            cookies_content = base64.b64decode(YTDLP_COOKIES_B64).decode("utf-8")
-            with open(temp_cookies_path, "w") as f:
-                f.write(cookies_content)
-            ydl_opts["cookiefile"] = temp_cookies_path
-        except Exception:
-            pass
+    # Copy cookies to a writable path (yt-dlp writes the jar back; Render
+    # secret files are read-only → would raise Errno 30).
+    temp_cookies_path = _prepare_cookiefile(output_dir)
+    if temp_cookies_path:
+        ydl_opts["cookiefile"] = temp_cookies_path
 
     if "instagram.com" in video_url.lower() and ydl_opts.get("cookiefile"):
         ydl_opts.setdefault("extractor_args", {})["instagram"] = {"webpage_display": ["Desktop"]}

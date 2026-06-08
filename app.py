@@ -3137,7 +3137,14 @@ CRITICAL INSTRUCTIONS:
 
     
 
-VIDEO_DOMAINS = {"youtube.com", "www.youtube.com", "youtu.be", "tiktok.com", "www.tiktok.com", "instagram.com", "www.instagram.com"}
+VIDEO_DOMAINS = {
+    "youtube.com", "www.youtube.com", "youtu.be",
+    "tiktok.com", "www.tiktok.com",
+    "instagram.com", "www.instagram.com",
+    # Facebook (videos/reels/watch) — all natively supported by yt-dlp
+    "facebook.com", "www.facebook.com", "m.facebook.com", "web.facebook.com",
+    "fb.watch", "fb.com",
+}
 
 def is_video_url(url: str) -> bool:
     host = (urlparse(url).hostname or "").lower()
@@ -3154,19 +3161,21 @@ def is_youtube_url(url: str) -> bool:
 def determine_source_type(url: str) -> str:
     """
     Determines the source type based on URL.
-    Returns: "TikTok", "YouTube", "Instagram", "Photos", or "Manual"
+    Returns: "TikTok", "YouTube", "Instagram", "Facebook", "Photos", or "Manual"
     """
     if not url:
         return "Manual"
-    
+
     host = (urlparse(url).hostname or "").lower()
-    
+
     if "tiktok.com" in host or "tiktok" in host:
         return "TikTok"
     elif "youtube.com" in host or "youtu.be" in host:
         return "YouTube"
     elif "instagram.com" in host or "instagram" in host:
         return "Instagram"
+    elif "facebook.com" in host or "fb.watch" in host or "fb.com" in host:
+        return "Facebook"
     elif any(ext in url.lower() for ext in [".jpg", ".jpeg", ".png", ".gif", ".webp"]):
         return "Photos"
     else:
@@ -5391,7 +5400,9 @@ def extract_recipe_from_video_internal(video_url: str):
             return jsonify({"error": str(ve)}), 413
         except yt_dlp.utils.DownloadError as de:
             error_str = str(de)
-            is_instagram = "instagram.com" in video_url.lower()
+            lowered_url = video_url.lower()
+            is_instagram = "instagram.com" in lowered_url
+            is_facebook = ("facebook.com" in lowered_url) or ("fb.watch" in lowered_url) or ("fb.com" in lowered_url)
             cookies_configured = (YTDLP_COOKIES_FILE and os.path.exists(YTDLP_COOKIES_FILE)) or YTDLP_COOKIES_B64
             if is_instagram:
                 if not cookies_configured:
@@ -5400,8 +5411,15 @@ def extract_recipe_from_video_internal(video_url: str):
                     hint = "Instagram post may be private or cookies may be expired."
                 else:
                     hint = "Instagram extraction failed. The post may be private or require fresh cookies."
+            elif is_facebook:
+                if not cookies_configured:
+                    hint = "Facebook often requires authentication. Please set YTDLP_COOKIES_FILE or YTDLP_COOKIES_B64."
+                elif "private" in error_str.lower() or "unavailable" in error_str.lower() or "login" in error_str.lower():
+                    hint = "Facebook post may be private/restricted or cookies may be expired."
+                else:
+                    hint = "Facebook extraction failed. The post may be private or require fresh cookies."
             else:
-                hint = "For TikTok/Instagram (and some YouTube), set YTDLP_COOKIES_FILE."
+                hint = "For TikTok/Instagram/Facebook (and some YouTube), set YTDLP_COOKIES_FILE."
             return jsonify({
                 "error": "Failed to download video",
                 "details": error_str,

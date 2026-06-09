@@ -148,7 +148,10 @@ def _resolve_share_url(url: str) -> str:
             ),
             "Accept-Language": "en-US,en;q=0.9",
         }
-        resp = sess.get(url, headers=headers, allow_redirects=True, timeout=15)
+        proxies = None
+        if SOCIAL_PROXY:
+            proxies = {"http": SOCIAL_PROXY, "https": SOCIAL_PROXY}
+        resp = sess.get(url, headers=headers, allow_redirects=True, timeout=15, proxies=proxies)
         final = resp.url or url
         p = urlparse(final)
         fhost = (p.hostname or "").lower()
@@ -169,12 +172,36 @@ LLM_MODEL = os.getenv("RECIPE_LLM_MODEL", "gpt-4o-mini")  # change if needed
 RECIPE_LLM_MODEL = os.getenv("RECIPE_LLM_MODEL", "gpt-4o-mini")
 
 YT_PROXY = os.getenv("YT_PROXY")
+# Proxy for Facebook/Instagram/TikTok. Cloud/datacenter IPs (e.g. Render) get
+# challenged/redirect-looped by these sites even with valid cookies, so a
+# residential/mobile proxy is usually required to extract from a deployed server.
+# Falls back to YT_PROXY if SOCIAL_PROXY is not set, so a single proxy can serve both.
+SOCIAL_PROXY = os.getenv("SOCIAL_PROXY") or os.getenv("YTDLP_PROXY")
+print(f"[startup] proxies: YT_PROXY={'set' if YT_PROXY else 'none'}, SOCIAL_PROXY={'set' if SOCIAL_PROXY else 'none'}")
 PROFILE_VIDEO_DOWNLOADS_DIR = os.getenv("PROFILE_VIDEO_DOWNLOADS_DIR", "./downloads/profile_videos")
 PROFILE_VIDEO_PARALLEL_DOWNLOADS = max(1, min(int(os.getenv("PROFILE_VIDEO_PARALLEL_DOWNLOADS", "4")), 10))
 
 # Note: Global ydl_opts is not used - proxy is conditionally applied in individual functions
-# Proxy is ONLY used for YouTube URLs, not for TikTok/Instagram/webpages
-# See ytdlp_base_opts(), _yt_meta(), get_video_metadata(), and _download_audio_mp3() functions
+# Proxy: YT_PROXY for YouTube; SOCIAL_PROXY for Facebook/Instagram/TikTok.
+# See _ytdlp_proxy(), ytdlp_base_opts(), _yt_meta(), _download_audio_mp3(), _download_video_to_file().
+
+
+def _ytdlp_proxy(url: str) -> str | None:
+    """Return the proxy to use for a given URL, or None.
+
+    YouTube uses YT_PROXY; Facebook/Instagram/TikTok use SOCIAL_PROXY. Datacenter
+    IPs are frequently blocked by the social sites, so routing those requests
+    through a residential proxy is what makes extraction work from a cloud host.
+    """
+    try:
+        if is_youtube_url(url):
+            return YT_PROXY or None
+        host = (urlparse(url).hostname or "").lower()
+        if any(s in host for s in ("facebook.com", "fb.watch", "fb.com", "instagram.com", "tiktok.com")):
+            return SOCIAL_PROXY or None
+    except Exception:
+        pass
+    return None
 
 vector_db = Chroma(persist_directory="./vector_store", embedding_function=OpenAIEmbeddings())
 retriever = vector_db.as_retriever(search_kwargs={"k": 3})  # Reduced from 5 to 3 for faster retrieval
@@ -2711,10 +2738,11 @@ def ytdlp_base_opts(temp_dir: str, video_url: str = None):
     if _cf:
         opts["cookiefile"] = _cf
 
-    # Add proxy ONLY for YouTube URLs (not for TikTok/Instagram/webpages)
-    if YT_PROXY and video_url and is_youtube_url(video_url):
-        opts["proxy"] = YT_PROXY
-        print(f"🌐 Using proxy for YouTube: {YT_PROXY}")
+    # Proxy: YouTube via YT_PROXY, social (FB/IG/TikTok) via SOCIAL_PROXY
+    _proxy = _ytdlp_proxy(video_url) if video_url else None
+    if _proxy:
+        opts["proxy"] = _proxy
+        print(f"🌐 Using proxy: {_proxy}")
 
     return opts
 
@@ -2724,10 +2752,10 @@ def get_video_metadata(video_url: str):
     Uses yt-dlp to fetch metadata without downloading.
     """
     opts = {"quiet": True, "no_warnings": True, "noplaylist": True}
-    # Add proxy ONLY for YouTube URLs
-    if YT_PROXY and is_youtube_url(video_url):
-        opts["proxy"] = YT_PROXY
-        print(f"🌐 Using proxy for YouTube metadata: {YT_PROXY}")
+    _proxy = _ytdlp_proxy(video_url)
+    if _proxy:
+        opts["proxy"] = _proxy
+        print(f"🌐 Using proxy for metadata: {_proxy}")
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(video_url, download=False)
     return info
@@ -4488,10 +4516,11 @@ def _yt_meta(video_url: str) -> dict:
             opts["cookiefile"] = _cf
             print("🍪 Using cookies file for metadata")
 
-        # Add proxy ONLY for YouTube URLs (not for TikTok/Instagram)
-        if YT_PROXY and is_youtube_url(video_url):
-            opts["proxy"] = YT_PROXY
-            print(f"🌐 Using proxy for YouTube metadata: {YT_PROXY}")
+        # Proxy: YouTube via YT_PROXY, social (FB/IG/TikTok) via SOCIAL_PROXY
+        _proxy = _ytdlp_proxy(video_url)
+        if _proxy:
+            opts["proxy"] = _proxy
+            print(f"🌐 Using proxy for metadata: {_proxy}")
 
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(video_url, download=False)
@@ -4554,10 +4583,11 @@ def _download_audio_mp3(video_url: str):
                 "webpage_display": ["Desktop"]
             }
         
-        # Add proxy ONLY for YouTube URLs (not for TikTok/Instagram/webpages)
-        if YT_PROXY and is_youtube_url(video_url):
-            ydl_opts["proxy"] = YT_PROXY
-            print(f"🌐 Using proxy for YouTube: {YT_PROXY}")
+        # Proxy: YouTube via YT_PROXY, social (FB/IG/TikTok) via SOCIAL_PROXY
+        _proxy = _ytdlp_proxy(video_url)
+        if _proxy:
+            ydl_opts["proxy"] = _proxy
+            print(f"🌐 Using proxy: {_proxy}")
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([video_url])
@@ -4620,8 +4650,9 @@ def _download_video_to_file(video_url: str):
             ydl_opts["cookiefile"] = _cf
         if "instagram.com" in video_url.lower() and ydl_opts.get("cookiefile"):
             ydl_opts.setdefault("extractor_args", {})["instagram"] = {"webpage_display": ["Desktop"]}
-        if YT_PROXY and is_youtube_url(video_url):
-            ydl_opts["proxy"] = YT_PROXY
+        _proxy = _ytdlp_proxy(video_url)
+        if _proxy:
+            ydl_opts["proxy"] = _proxy
 
         # Single call: fetches metadata AND downloads in one network session
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -4669,10 +4700,12 @@ def _profile_discovery_opts(profile_url: str, limit: int) -> dict:
     _cf = _prepare_cookiefile()
     if _cf:
         opts["cookiefile"] = _cf
-    if YT_PROXY and is_youtube_url(profile_url):
-        opts["proxy"] = YT_PROXY
+    _proxy = _ytdlp_proxy(profile_url)
+    if _proxy:
+        opts["proxy"] = _proxy
     elif not is_youtube_url(profile_url):
-        # Force direct connection for IG/TikTok discovery (avoid inherited HTTP(S)_PROXY).
+        # No social proxy configured: force direct connection for IG/TikTok
+        # discovery (avoid inheriting an unrelated HTTP(S)_PROXY from the env).
         opts["proxy"] = ""
     return opts
 
@@ -5243,8 +5276,9 @@ def _download_single_profile_video(video_url: str, output_dir: str) -> dict:
 
     if "instagram.com" in video_url.lower() and ydl_opts.get("cookiefile"):
         ydl_opts.setdefault("extractor_args", {})["instagram"] = {"webpage_display": ["Desktop"]}
-    if YT_PROXY and is_youtube_url(video_url):
-        ydl_opts["proxy"] = YT_PROXY
+    _proxy = _ytdlp_proxy(video_url)
+    if _proxy:
+        ydl_opts["proxy"] = _proxy
 
     filepath = ""
     try:

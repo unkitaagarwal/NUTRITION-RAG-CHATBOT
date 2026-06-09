@@ -33,7 +33,8 @@ import shutil
 import time
 import socket
 import ipaddress
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
+import http.cookiejar
 import requests
 from bs4 import BeautifulSoup
 import subprocess
@@ -110,6 +111,60 @@ def _prepare_cookiefile(temp_dir: str | None = None) -> str | None:
     except Exception as e:
         print(f"[cookies] failed to prepare writable cookie file: {e}")
     return None
+
+
+# Hosts whose share/short links must be resolved to a canonical URL before yt-dlp.
+# yt-dlp's generic extractor loops on fb.watch redirects ("302 redirect loop"),
+# but the canonical facebook.com/watch?v=... / /reel/<id>/ URL extracts fine.
+_SHARE_LINK_HOSTS = {"fb.watch", "www.fb.watch", "fb.com", "www.fb.com"}
+
+
+def _resolve_share_url(url: str) -> str:
+    """Resolve a short/share link (e.g. fb.watch) to its canonical URL.
+
+    Returns the original URL unchanged on any failure or for non-share hosts.
+    """
+    try:
+        host = (urlparse(url).hostname or "").lower()
+        if host not in _SHARE_LINK_HOSTS:
+            return url
+
+        sess = requests.Session()
+        # Attach cookies so Facebook resolves the video instead of bouncing to
+        # a login/consent interstitial (which is what causes the redirect loop).
+        cf = _prepare_cookiefile()
+        if cf:
+            try:
+                cj = http.cookiejar.MozillaCookieJar(cf)
+                cj.load(ignore_discard=True, ignore_expires=True)
+                sess.cookies = cj
+            except Exception:
+                pass
+
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+            ),
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+        resp = sess.get(url, headers=headers, allow_redirects=True, timeout=15)
+        final = resp.url or url
+        p = urlparse(final)
+        fhost = (p.hostname or "").lower()
+        if "facebook.com" not in fhost:
+            # Landed somewhere unexpected (e.g. login). Keep original for yt-dlp.
+            return url
+
+        # Build a clean canonical URL, dropping tracking params (mibextid, etc.)
+        qs = parse_qs(p.query)
+        vid = (qs.get("v") or [None])[0]
+        if vid:
+            return f"https://www.facebook.com/watch/?v={vid}"
+        return f"https://www.facebook.com{p.path}"
+    except Exception as e:
+        print(f"[resolve] share-url resolution failed for {url}: {e}")
+        return url
 LLM_MODEL = os.getenv("RECIPE_LLM_MODEL", "gpt-4o-mini")  # change if needed
 RECIPE_LLM_MODEL = os.getenv("RECIPE_LLM_MODEL", "gpt-4o-mini")
 
@@ -5411,6 +5466,13 @@ def extract_recipe_from_video_internal(video_url: str):
     ok, err = validate_video_url(video_url)
     if not ok:
         return jsonify({"error": err}), 400
+
+    # Resolve share/short links (e.g. fb.watch) to a canonical URL so yt-dlp's
+    # generic extractor doesn't loop on the redirect.
+    resolved = _resolve_share_url(video_url)
+    if resolved != video_url:
+        print(f"🔗 Resolved share link {video_url} -> {resolved}")
+        video_url = resolved
 
     # ── Cache check ──────────────────────────────────────────────────────────
     url_key = hashlib.sha256(video_url.encode()).hexdigest()

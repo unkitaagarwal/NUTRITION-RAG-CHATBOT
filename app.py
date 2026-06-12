@@ -3809,6 +3809,38 @@ def extract_recipe_from_image_llm(image_data_url: str):
     return extract_recipe_from_images_llm([image_data_url])
 
 
+def extract_recipe_from_video_frames_llm(image_data_urls: list) -> dict:
+    """Fast vision path for video frame(s): low detail, compact prompt, smaller token budget."""
+    if not image_data_urls:
+        raise ValueError("At least one image is required")
+    system = (
+        "Extract recipe from cooking video frame(s). Return ONLY JSON: "
+        '{"name":"","ingredients":[{"name":"","quantity":""}],'
+        '"instructions":["..."],"servings":"","prep_time":"","cook_time":"","total_time":"",'
+        '"notes":[],"meal_type":"","cuisine":"","nutrition":{"calories":"","protein_g":"","carbs_g":"","fat_g":""}}. '
+        "Read on-screen text and visible food. meal_type: Breakfast|Lunch|Dinner|Snack. "
+        "Estimate nutrition per serving when possible. JSON only."
+    )
+    content = [{"type": "text", "text": "Extract the recipe JSON from this video frame."}]
+    for url in image_data_urls:
+        content.append({
+            "type": "image_url",
+            "image_url": {"url": url, "detail": "low"},
+        })
+    completion = client.chat.completions.create(
+        model=os.getenv("RECIPE_VISION_FAST_MODEL") or os.getenv("RECIPE_LLM_MODEL", "gpt-4o-mini"),
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": content},
+        ],
+        temperature=0.1,
+        max_tokens=900,
+        response_format={"type": "json_object"},
+        timeout=min(RECIPE_LLM_TIMEOUT, 45),
+    )
+    return json.loads(completion.choices[0].message.content)
+
+
 def extract_recipe_from_images_llm(image_data_urls: list):
     """Extract one combined recipe from one or more images (e.g. multi-page recipe). Uses vision LLM."""
     if not image_data_urls:
@@ -4620,22 +4652,114 @@ def _download_audio_mp3(video_url: str):
 # When transcript is shorter than this (chars), treat as no speech and use frame+vision fallback
 MIN_TRANSCRIPT_LENGTH_FOR_VIDEO = int(os.getenv("MIN_TRANSCRIPT_LENGTH_VIDEO", "80"))
 # Fewer frames = faster (set NUM_VIDEO_FRAMES_RECIPE=8 for more accuracy)
-NUM_VIDEO_FRAMES_FOR_RECIPE = min(int(os.getenv("NUM_VIDEO_FRAMES_RECIPE", "5")), MAX_EXTRACT_RECIPE_IMAGES)
+NUM_VIDEO_FRAMES_FOR_RECIPE = min(int(os.getenv("NUM_VIDEO_FRAMES_RECIPE", "3")), MAX_EXTRACT_RECIPE_IMAGES)
 # Timeout for OpenAI recipe/vision calls (seconds)
 RECIPE_LLM_TIMEOUT = int(os.getenv("RECIPE_LLM_TIMEOUT", "120"))
 
 
-def _download_video_to_file(video_url: str):
+def _video_frames_for_duration(duration_sec: float | None) -> int:
+    """Use fewer frames on short reels — 1 middle frame is enough for on-screen recipe text."""
+    cap = NUM_VIDEO_FRAMES_FOR_RECIPE
+    if not duration_sec or duration_sec <= 0:
+        return min(1, cap)
+    if duration_sec <= 20:
+        return 1
+    if duration_sec <= 45:
+        return min(2, cap)
+    return cap
+
+
+def _prefer_vision_first_for_video_url(url: str) -> bool:
+    """IG/TikTok reels are usually music + on-screen text — skip slow transcribe path."""
+    if (os.getenv("EXTRACT_RECIPE_SOCIAL_VISION_FIRST") or "1").strip().lower() in ("0", "false", "no"):
+        return False
+    lowered = (url or "").lower()
+    return (
+        "instagram.com/reel" in lowered
+        or "instagram.com/p/" in lowered
+        or "tiktok.com/" in lowered
+    )
+
+
+def _frame_jpeg_max_width() -> int:
+    try:
+        return max(256, min(int(os.getenv("EXTRACT_RECIPE_FRAME_MAX_WIDTH", "512")), 1024))
+    except ValueError:
+        return 512
+
+
+def _extract_middle_frame_data_url(video_path: str, duration_sec: float | None) -> str | None:
+    """One small JPEG at mid-reel — fastest path for short social recipe videos."""
+    out_dir = tempfile.mkdtemp()
+    out_path = os.path.join(out_dir, "frame.jpg")
+    ts = max(0.5, (duration_sec or 10.0) / 2.0)
+    w = _frame_jpeg_max_width()
+    try:
+        result = subprocess.run(
+            [
+                "ffmpeg", "-y", "-ss", str(ts), "-i", video_path,
+                "-vframes", "1", "-vf", f"scale={w}:-1", "-q:v", "7",
+                out_path,
+            ],
+            capture_output=True,
+            timeout=20,
+        )
+        if result.returncode != 0 or not os.path.exists(out_path):
+            return None
+        with open(out_path, "rb") as f:
+            b64 = base64.b64encode(f.read()).decode("utf-8")
+        return f"data:image/jpeg;base64,{b64}"
+    except Exception:
+        return None
+    finally:
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+
+def _transcribe_audio_bytes(audio_bytes: bytes) -> str:
+    """Transcribe mp3/audio bytes for the video recipe pipeline."""
+    if not audio_bytes:
+        return ""
+    model = (os.getenv("VIDEO_TRANSCRIBE_MODEL") or "gpt-4o-mini-transcribe").strip()
+    audio_file_obj = io.BytesIO(audio_bytes)
+    audio_file_obj.name = "audio.mp3"
+    t = client.audio.transcriptions.create(
+        model=model,
+        file=audio_file_obj,
+        response_format="text",
+    )
+    return t.strip() if isinstance(t, str) else str(t).strip()
+
+
+def _merge_video_download_meta(video_url: str, video_meta: dict | None, audio_meta: dict | None) -> dict:
+    """Combine metadata from parallel audio + video yt-dlp calls."""
+    meta = dict(video_meta or {})
+    audio_meta = audio_meta or {}
+    if not meta.get("duration") and audio_meta.get("duration"):
+        meta["duration"] = audio_meta["duration"]
+    if not meta.get("title") and audio_meta.get("title"):
+        meta["title"] = audio_meta["title"]
+    meta.setdefault("provider", urlparse(video_url).hostname or "")
+    if not meta.get("extractor") and audio_meta.get("source"):
+        meta["extractor"] = audio_meta["source"]
+    return meta
+
+
+def _download_video_to_file(video_url: str, *, fast: bool = False):
     """
     Download video (not just audio) to a temp file for frame extraction.
     Uses a single yt-dlp call (extract_info + download=True) to avoid the
     redundant separate metadata round-trip from _yt_meta().
+    fast=True prefers ≤480p for quicker social-reel downloads (vision only needs rough frames).
     Returns: (temp_dir, video_path, meta_dict). Caller must shutil.rmtree(temp_dir) when done.
     """
     temp_dir = tempfile.mkdtemp()
     try:
+        if fast:
+            fmt = "best[height<=480]/best[height<=720]/best"
+        else:
+            fmt = "best[height<=720]/best"
         ydl_opts = {
-            "format": "best[height<=720]/best",
+            "format": fmt,
             "outtmpl": os.path.join(temp_dir, "%(id)s.%(ext)s"),
             "restrictfilenames": True,
             "noplaylist": True,
@@ -5338,22 +5462,60 @@ def _extract_one_frame(video_path: str, timestamp: float, out_path: str) -> str 
         return None
 
 
+def _extract_frames_batch_ffmpeg(
+    video_path: str, duration_sec: float | None, num_frames: int, out_dir: str
+) -> list[str]:
+    """Single ffmpeg pass — faster than N separate subprocess calls on short reels."""
+    pattern = os.path.join(out_dir, "frame_%02d.jpg")
+    if duration_sec and duration_sec > 0:
+        vf = f"fps={num_frames / duration_sec}"
+    else:
+        vf = "fps=1/5"
+    result = subprocess.run(
+        [
+            "ffmpeg", "-y", "-i", video_path,
+            "-vf", vf, "-frames:v", str(num_frames),
+            "-q:v", "4", pattern,
+        ],
+        capture_output=True,
+        timeout=45,
+    )
+    if result.returncode != 0:
+        return []
+    urls = []
+    for name in sorted(f for f in os.listdir(out_dir) if f.endswith(".jpg")):
+        path = os.path.join(out_dir, name)
+        with open(path, "rb") as f:
+            b64 = base64.b64encode(f.read()).decode("utf-8")
+        urls.append(f"data:image/jpeg;base64,{b64}")
+    return urls
+
+
 def _extract_frame_data_urls_from_video(video_path: str, duration_sec: float | None, num_frames: int = 8) -> list:
     """
-    Extract evenly spaced frames from video as JPEG data URLs (parallel ffmpeg for speed).
+    Extract evenly spaced frames from video as JPEG data URLs.
+    Tries one ffmpeg pass first; falls back to parallel single-frame extraction.
     """
     num_frames = min(max(1, num_frames), MAX_EXTRACT_RECIPE_IMAGES)
+    if num_frames == 1:
+        single = _extract_middle_frame_data_url(video_path, duration_sec)
+        if single:
+            return [single]
+
     out_dir = tempfile.mkdtemp()
     try:
+        batch = _extract_frames_batch_ffmpeg(video_path, duration_sec, num_frames, out_dir)
+        if batch:
+            return batch
+
         if duration_sec and duration_sec > 0:
             interval = duration_sec / (num_frames + 1)
             timestamps = [interval * (i + 1) for i in range(num_frames)]
         else:
             timestamps = [float(i * 10) for i in range(num_frames)]
 
-        # Extract frames in parallel for faster response
         results = [None] * len(timestamps)
-        max_workers = min(4, len(timestamps))  # cap parallelism
+        max_workers = min(4, len(timestamps))
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {
                 executor.submit(
@@ -5417,14 +5579,15 @@ def _run_frame_vision_fallback(video_url: str, meta: dict) -> tuple[dict | None,
     """
     temp_dir = None
     try:
-        temp_dir, video_path, video_meta = _download_video_to_file(video_url)
+        temp_dir, video_path, video_meta = _download_video_to_file(video_url, fast=True)
         duration = video_meta.get("duration") or 0
+        n_frames = _video_frames_for_duration(duration)
         frame_urls = _extract_frame_data_urls_from_video(
-            video_path, duration, num_frames=NUM_VIDEO_FRAMES_FOR_RECIPE
+            video_path, duration, num_frames=n_frames
         )
         if not frame_urls:
             return None, None, None
-        recipe = extract_recipe_from_images_llm(frame_urls)
+        recipe = extract_recipe_from_video_frames_llm(frame_urls)
         if not recipe:
             return None, None, None
         ingredients = recipe.get("ingredients") or []
@@ -5461,12 +5624,16 @@ def _run_frame_vision_fallback_from_path(
     """
     try:
         duration = meta.get("duration") or 0
+        n_frames = _video_frames_for_duration(duration)
+        print(f"🎬 Vision fallback: extracting {n_frames} frame(s) from {duration}s video")
         frame_urls = _extract_frame_data_urls_from_video(
-            video_path, duration, num_frames=NUM_VIDEO_FRAMES_FOR_RECIPE
+            video_path, duration, num_frames=n_frames
         )
         if not frame_urls:
             return None, None, None
-        recipe = extract_recipe_from_images_llm(frame_urls)
+        t_llm = time.time()
+        recipe = extract_recipe_from_video_frames_llm(frame_urls)
+        print(f"🎬 Vision LLM finished in {time.time() - t_llm:.2f}s ({len(frame_urls)} frame(s))")
         if not recipe:
             return None, None, None
         ingredients = recipe.get("ingredients") or []
@@ -5494,7 +5661,7 @@ def _run_frame_vision_fallback_from_path(
 def extract_recipe_from_video_internal(video_url: str):
     """
     Internal helper used by unified /extract-recipe endpoint.
-    Downloads video once; extracts audio for Whisper and reuses same file for frame+vision fallback.
+    Parallel audio + low-res video download → transcribe → LLM, or on-demand frame+vision fallback.
     Returns a Flask response: jsonify({...}), status_code
     """
     ok, err = validate_video_url(video_url)
@@ -5517,108 +5684,171 @@ def extract_recipe_from_video_internal(video_url: str):
     # ─────────────────────────────────────────────────────────────────────────
 
     temp_dir = None
+    video_path = None
+    meta: dict = {}
+    vision_result: dict = {}
     try:
         print(f"🎥 Processing video URL: {video_url}")
 
-        # 1) Download video once (reused for audio extraction and for frame+vision fallback)
-        t0 = time.time()
-        try:
-            temp_dir, video_path, meta = _download_video_to_file(video_url)
-        except ValueError as ve:
-            return jsonify({"error": str(ve)}), 413
-        except yt_dlp.utils.DownloadError as de:
-            error_str = str(de)
-            lowered_url = video_url.lower()
-            is_instagram = "instagram.com" in lowered_url
-            is_facebook = ("facebook.com" in lowered_url) or ("fb.watch" in lowered_url) or ("fb.com" in lowered_url)
-            cookies_configured = (YTDLP_COOKIES_FILE and os.path.exists(YTDLP_COOKIES_FILE)) or YTDLP_COOKIES_B64
-            if is_instagram:
-                if not cookies_configured:
-                    hint = "Instagram requires authentication. Please set YTDLP_COOKIES_FILE or YTDLP_COOKIES_B64."
-                elif "empty media response" in error_str.lower() or "unavailable" in error_str.lower():
-                    hint = "Instagram post may be private or cookies may be expired."
-                else:
-                    hint = "Instagram extraction failed. The post may be private or require fresh cookies."
-            elif is_facebook:
-                if not cookies_configured:
-                    hint = "Facebook often requires authentication. Please set YTDLP_COOKIES_FILE or YTDLP_COOKIES_B64."
-                elif "private" in error_str.lower() or "unavailable" in error_str.lower() or "login" in error_str.lower():
-                    hint = "Facebook post may be private/restricted or cookies may be expired."
-                else:
-                    hint = "Facebook extraction failed. The post may be private or require fresh cookies."
-            else:
-                hint = "For TikTok/Instagram/Facebook (and some YouTube), set YTDLP_COOKIES_FILE."
-            return jsonify({
-                "error": "Failed to download video",
-                "details": error_str,
-                "hint": hint,
-                "cookies_configured": cookies_configured,
-            }), 400
-        except Exception as e:
-            return jsonify({
-                "error": "Video download failed",
-                "user_message": "We couldn't download this video. Please try another link or add the recipe manually.",
-                "details": str(e),
-            }), 500
-
-        print(f"✅ Video downloaded in {time.time() - t0:.2f}s")
-
-        # 2+3) Transcription + optional parallel frame+vision.
-        # YouTube videos almost always have clear speech, so vision is wasteful there —
-        # run it only as a sequential fallback if transcription fails.
-        # Instagram/TikTok are often music-only, so run both in parallel upfront.
-        run_vision_in_parallel = not is_youtube_url(video_url)
-        print(f"🎤 Transcribing audio{'and extracting frames in parallel' if run_vision_in_parallel else '(YouTube: vision on-demand only)'}...")
-
-        transcript_result = {}
-        vision_result = {}
-
-        def _run_transcription():
-            try:
-                audio_bytes = _extract_audio_from_video_file(video_path)
-                if not audio_bytes:
-                    transcript_result["error"] = "no_audio"
-                    return
-                audio_file_obj = io.BytesIO(audio_bytes)
-                audio_file_obj.name = "audio.mp3"
-                t = client.audio.transcriptions.create(
-                    model="gpt-4o-mini-transcribe",
-                    file=audio_file_obj,
-                    response_format="text",
-                )
-                transcript_result["text"] = t.strip() if isinstance(t, str) else str(t).strip()
-            except Exception as e:
-                transcript_result["error"] = str(e)
-
         def _run_vision():
+            if vision_result.get("done"):
+                return
+            if not video_path:
+                print("🎬 Vision fallback skipped: no video file")
+                return
             try:
+                t_v = time.time()
                 recipe, source, method = _run_frame_vision_fallback_from_path(video_path, video_url, meta)
+                print(f"🎬 Vision fallback finished in {time.time() - t_v:.2f}s")
                 vision_result["recipe"] = recipe
                 vision_result["source"] = source
                 vision_result["method"] = method
             except Exception as e:
                 vision_result["error"] = str(e)
+            vision_result["done"] = True
 
-        if run_vision_in_parallel:
-            # Instagram/TikTok: run both concurrently — vision result ready the moment transcription fails
-            with ThreadPoolExecutor(max_workers=2) as executor:
-                t_future = executor.submit(_run_transcription)
-                v_future = executor.submit(_run_vision)
-                t_future.result()
-                v_future.result()
-        else:
-            # YouTube: transcribe first; only fall back to vision if speech is unusable
-            _run_transcription()
+        # IG/TikTok reels: skip audio download + transcribe (~3s) and go straight to vision
+        if _prefer_vision_first_for_video_url(video_url):
+            print("⚡ Vision-first mode (social reel)")
+            t0 = time.time()
+            try:
+                temp_dir, video_path, meta = _download_video_to_file(video_url, fast=True)
+            except ValueError as ve:
+                return jsonify({"error": str(ve)}), 413
+            except yt_dlp.utils.DownloadError as de:
+                return jsonify({
+                    "error": "Failed to download video",
+                    "details": str(de),
+                    "hint": "For Instagram/TikTok, set YTDLP_COOKIES_FILE or YTDLP_COOKIES_B64.",
+                }), 400
+            except Exception as e:
+                return jsonify({
+                    "error": "Video download failed",
+                    "user_message": "We couldn't download this video. Please try another link or add the recipe manually.",
+                    "details": str(e),
+                }), 500
+            print(f"✅ Video downloaded in {time.time() - t0:.2f}s (vision-first)")
+            _run_vision()
+            recipe = vision_result.get("recipe")
+            source = vision_result.get("source")
+            extraction_method = vision_result.get("method")
+            if recipe and source:
+                _enrich_recipe_response(recipe)
+                tags = extract_recipe_tags(recipe)
+                _result = {
+                    "source": source,
+                    "recipe": recipe,
+                    "tags": tags,
+                    "transcript": None,
+                    "extraction": {"method": extraction_method, "confidence": 0.5},
+                    "meta": meta,
+                }
+                with _recipe_cache_lock:
+                    _recipe_cache[url_key] = _result
+                return jsonify(_result), 200
+            return jsonify({
+                "error": "Failed to extract recipe from video",
+                "user_message": "We couldn't extract a recipe from this link. Please try another or add the recipe manually.",
+                "message": "Frame+vision extraction failed.",
+            }), 500
 
-        transcript_text = transcript_result.get("text", "")
+        # 1) Parallel: low-res video (for vision fallback) + audio-only (for fast transcription)
+        t0 = time.time()
+        audio_dl: dict = {}
+        video_dl: dict = {}
+
+        def _dl_audio():
+            try:
+                audio_dl["bytes"], audio_dl["meta"] = download_audio_mp3(video_url)
+            except Exception as e:
+                audio_dl["error"] = e
+
+        def _dl_video():
+            try:
+                video_dl["temp_dir"], video_dl["path"], video_dl["meta"] = _download_video_to_file(
+                    video_url, fast=True
+                )
+            except Exception as e:
+                video_dl["error"] = e
+
+        transcript_text = ""
+
+        def _transcribe_when_audio_ready():
+            nonlocal transcript_text
+            _dl_audio()
+            try:
+                audio_bytes = audio_dl.get("bytes")
+                if audio_bytes:
+                    transcript_text = _transcribe_audio_bytes(audio_bytes)
+            except Exception as e:
+                print(f"⚠️ Transcription failed: {e}")
+
+        t1 = time.time()
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            fv = executor.submit(_dl_video)
+            ft = executor.submit(_transcribe_when_audio_ready)
+            fv.result()
+            ft.result()
+        print(f"🎤 Transcription finished in {time.time() - t1:.2f}s")
+
+        if audio_dl.get("error") and video_dl.get("error"):
+            de = video_dl["error"]
+            if isinstance(de, yt_dlp.utils.DownloadError):
+                error_str = str(de)
+                lowered_url = video_url.lower()
+                is_instagram = "instagram.com" in lowered_url
+                is_facebook = ("facebook.com" in lowered_url) or ("fb.watch" in lowered_url) or ("fb.com" in lowered_url)
+                cookies_configured = (YTDLP_COOKIES_FILE and os.path.exists(YTDLP_COOKIES_FILE)) or YTDLP_COOKIES_B64
+                if is_instagram:
+                    if not cookies_configured:
+                        hint = "Instagram requires authentication. Please set YTDLP_COOKIES_FILE or YTDLP_COOKIES_B64."
+                    elif "empty media response" in error_str.lower() or "unavailable" in error_str.lower():
+                        hint = "Instagram post may be private or cookies may be expired."
+                    else:
+                        hint = "Instagram extraction failed. The post may be private or require fresh cookies."
+                elif is_facebook:
+                    if not cookies_configured:
+                        hint = "Facebook often requires authentication. Please set YTDLP_COOKIES_FILE or YTDLP_COOKIES_B64."
+                    elif "private" in error_str.lower() or "unavailable" in error_str.lower() or "login" in error_str.lower():
+                        hint = "Facebook post may be private/restricted or cookies may be expired."
+                    else:
+                        hint = "Facebook extraction failed. The post may be private or require fresh cookies."
+                else:
+                    hint = "For TikTok/Instagram/Facebook (and some YouTube), set YTDLP_COOKIES_FILE."
+                return jsonify({
+                    "error": "Failed to download video",
+                    "details": error_str,
+                    "hint": hint,
+                    "cookies_configured": cookies_configured,
+                }), 400
+            if isinstance(de, ValueError):
+                return jsonify({"error": str(de)}), 413
+            return jsonify({
+                "error": "Video download failed",
+                "user_message": "We couldn't download this video. Please try another link or add the recipe manually.",
+                "details": str(de),
+            }), 500
+
+        temp_dir = video_dl.get("temp_dir")
+        video_path = video_dl.get("path")
+        meta = _merge_video_download_meta(video_url, video_dl.get("meta"), audio_dl.get("meta"))
+        print(f"✅ Downloads finished in {time.time() - t0:.2f}s (audio={'ok' if audio_dl.get('bytes') else 'skip'}, video={'ok' if video_path else 'skip'})")
+
+        # 2) Fallback: extract audio from video file if audio-only download failed
+        if not transcript_text and video_path:
+            try:
+                audio_bytes = _extract_audio_from_video_file(video_path)
+                if audio_bytes:
+                    transcript_text = _transcribe_audio_bytes(audio_bytes)
+            except Exception as e:
+                print(f"⚠️ Transcription from video file failed: {e}")
+
         has_usable_transcript = transcript_text and not _is_likely_non_speech(transcript_text)
 
-        # If transcription failed or produced no usable speech, use/run vision fallback
+        # 3) Vision only when transcript is not usable (no upfront parallel vision)
         if not has_usable_transcript:
-            if not vision_result:
-                # YouTube path: vision wasn't pre-run, trigger it now
-                print("🎬 No usable transcript; running frame+vision fallback...")
-                _run_vision()
+            print("🎬 No usable transcript; running frame+vision fallback...")
+            _run_vision()
             recipe = vision_result.get("recipe")
             source = vision_result.get("source")
             extraction_method = vision_result.get("method")
@@ -5640,7 +5870,8 @@ def extract_recipe_from_video_internal(video_url: str):
         print("🍳 Extracting recipe information from transcript...")
         chunks = _chunk_text(transcript_text, max_chars=80000)
         if not chunks:
-            print("🎬 No chunks from transcript; using already-computed frame+vision result...")
+            print("🎬 No chunks from transcript; running frame+vision fallback...")
+            _run_vision()
             recipe = vision_result.get("recipe")
             source = vision_result.get("source")
             extraction_method = vision_result.get("method")
@@ -5671,7 +5902,8 @@ def extract_recipe_from_video_internal(video_url: str):
                     chunk_failed["error"] = e
                     break
         if chunk_failed["idx"] is not None:
-            print(f"⚠️ Transcript chunk extraction failed (chunk {chunk_failed['idx']}); using already-computed frame+vision result...")
+            print(f"⚠️ Transcript chunk extraction failed (chunk {chunk_failed['idx']}); running frame+vision fallback...")
+            _run_vision()
             recipe = vision_result.get("recipe")
             source = vision_result.get("source")
             extraction_method = vision_result.get("method")
@@ -5708,7 +5940,8 @@ def extract_recipe_from_video_internal(video_url: str):
 
         # If transcript yielded empty instructions/ingredients, use already-computed vision result
         if not instructions:
-            print("🎬 Instructions empty from transcript; using already-computed frame+vision result...")
+            print("🎬 Instructions empty from transcript; running frame+vision fallback...")
+            _run_vision()
             fallback_recipe = vision_result.get("recipe")
             fallback_source = vision_result.get("source")
             extraction_method = vision_result.get("method")
@@ -5722,7 +5955,8 @@ def extract_recipe_from_video_internal(video_url: str):
                     _recipe_cache[url_key] = _result
                 return jsonify(_result), 200
         elif not ingredients:
-            print("🎬 Ingredients empty from transcript; using already-computed frame+vision result...")
+            print("🎬 Ingredients empty from transcript; running frame+vision fallback...")
+            _run_vision()
             fallback_recipe = vision_result.get("recipe")
             fallback_source = vision_result.get("source")
             extraction_method = vision_result.get("method")

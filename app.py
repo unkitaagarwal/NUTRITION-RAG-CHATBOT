@@ -171,13 +171,34 @@ def _resolve_share_url(url: str) -> str:
 LLM_MODEL = os.getenv("RECIPE_LLM_MODEL", "gpt-4o-mini")  # change if needed
 RECIPE_LLM_MODEL = os.getenv("RECIPE_LLM_MODEL", "gpt-4o-mini")
 
+# YouTube proxy is now OPT-IN only (set YT_USE_PROXY=1 to re-enable).
+# YouTube is downloaded directly — no 3rd-party proxy — by impersonating the
+# ANDROID_VR (Oculus Quest) Innertube client, the same approach YoutubeExplode
+# uses. That client doesn't require Proof-of-Origin (PO) tokens or signature
+# deciphering, so direct connections from datacenter IPs (e.g. Render) work.
+# See https://github.com/Tyrrrz/YoutubeExplode/issues/933
 YT_PROXY = os.getenv("YT_PROXY")
+YT_USE_PROXY = os.getenv("YT_USE_PROXY", "0") == "1"  # opt-in escape hatch if direct ever breaks
+
+# Player clients to impersonate for YouTube, in priority order.
+# android_vr: PO-token-free, full format access (primary).
+# web_safari / web: fallbacks if android_vr is missing a format.
+YT_PLAYER_CLIENTS = ["android_vr", "web_safari", "web"]
+
+
+def _yt_extractor_args() -> dict:
+    """yt-dlp extractor_args for proxy-free YouTube extraction."""
+    return {"player_client": list(YT_PLAYER_CLIENTS)}
 # Proxy for Facebook/Instagram/TikTok. Cloud/datacenter IPs (e.g. Render) get
 # challenged/redirect-looped by these sites even with valid cookies, so a
 # residential/mobile proxy is usually required to extract from a deployed server.
 # Falls back to YT_PROXY if SOCIAL_PROXY is not set, so a single proxy can serve both.
 SOCIAL_PROXY = os.getenv("SOCIAL_PROXY") or os.getenv("YTDLP_PROXY")
-print(f"[startup] proxies: YT_PROXY={'set' if YT_PROXY else 'none'}, SOCIAL_PROXY={'set' if SOCIAL_PROXY else 'none'}")
+print(
+    f"[startup] proxies: YT_PROXY={'set' if YT_PROXY else 'none'} "
+    f"({'ENABLED via YT_USE_PROXY' if YT_USE_PROXY else 'NOT USED — YouTube goes direct via android_vr client'}), "
+    f"SOCIAL_PROXY={'set' if SOCIAL_PROXY else 'none'}"
+)
 PROFILE_VIDEO_DOWNLOADS_DIR = os.getenv("PROFILE_VIDEO_DOWNLOADS_DIR", "./downloads/profile_videos")
 PROFILE_VIDEO_PARALLEL_DOWNLOADS = max(1, min(int(os.getenv("PROFILE_VIDEO_PARALLEL_DOWNLOADS", "4")), 10))
 
@@ -189,13 +210,16 @@ PROFILE_VIDEO_PARALLEL_DOWNLOADS = max(1, min(int(os.getenv("PROFILE_VIDEO_PARAL
 def _ytdlp_proxy(url: str) -> str | None:
     """Return the proxy to use for a given URL, or None.
 
-    YouTube uses YT_PROXY; Facebook/Instagram/TikTok use SOCIAL_PROXY. Datacenter
-    IPs are frequently blocked by the social sites, so routing those requests
-    through a residential proxy is what makes extraction work from a cloud host.
+    YouTube: direct connection (no proxy) — the ANDROID_VR client impersonation
+    in _yt_extractor_args() makes extraction work without a 3rd-party proxy.
+    YT_PROXY is only honored if YT_USE_PROXY=1 is explicitly set.
+    Facebook/Instagram/TikTok use SOCIAL_PROXY. Datacenter IPs are frequently
+    blocked by the social sites, so routing those requests through a
+    residential proxy is what makes extraction work from a cloud host.
     """
     try:
         if is_youtube_url(url):
-            return YT_PROXY or None
+            return (YT_PROXY or None) if YT_USE_PROXY else None
         host = (urlparse(url).hostname or "").lower()
         if any(s in host for s in ("facebook.com", "fb.watch", "fb.com", "instagram.com", "tiktok.com")):
             return SOCIAL_PROXY or None
@@ -2723,7 +2747,7 @@ def ytdlp_base_opts(temp_dir: str, video_url: str = None):
         "fragment_retries": 2,
         # Helps for YouTube signature issues & format availability
         "extractor_args": {
-            "youtube": {"player_client": ["android", "web"]}
+            "youtube": _yt_extractor_args()
         },
         # Convert to mp3 at low bitrate — Whisper transcription doesn't need high quality audio
         "postprocessors": [{
@@ -2751,7 +2775,12 @@ def get_video_metadata(video_url: str):
     """
     Uses yt-dlp to fetch metadata without downloading.
     """
-    opts = {"quiet": True, "no_warnings": True, "noplaylist": True}
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "extractor_args": {"youtube": _yt_extractor_args()},
+    }
     _proxy = _ytdlp_proxy(video_url)
     if _proxy:
         opts["proxy"] = _proxy
@@ -4538,7 +4567,12 @@ Rules:
 
 def _yt_meta(video_url: str) -> dict:
     """Extract metadata without downloading. Uses cookies if available."""
-    opts = {"quiet": True, "no_warnings": True, "noplaylist": True}
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "extractor_args": {"youtube": _yt_extractor_args()},
+    }
     cookie_temp_dir = tempfile.mkdtemp()
     try:
         # Add cookies if available (needed for Instagram/TikTok/Facebook).
@@ -4588,7 +4622,7 @@ def _download_audio_mp3(video_url: str):
 
             # Helps for YouTube signature issues & format availability
             "extractor_args": {
-                "youtube": {"player_client": ["android", "web"]}
+                "youtube": _yt_extractor_args()
             },
 
             # Convert to mp3
@@ -4765,7 +4799,7 @@ def _download_video_to_file(video_url: str, *, fast: bool = False):
             "noplaylist": True,
             "quiet": True,
             "no_warnings": True,
-            "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
+            "extractor_args": {"youtube": _yt_extractor_args()},
         }
         # Copy cookies to a writable path (yt-dlp writes the jar back; Render
         # secret files are read-only → would raise Errno 30).
@@ -4819,7 +4853,7 @@ def _profile_discovery_opts(profile_url: str, limit: int) -> dict:
         "noplaylist": False,
         "extract_flat": "in_playlist",
         "playlistend": max(1, min(limit * 4, 50)),
-        "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
+        "extractor_args": {"youtube": _yt_extractor_args()},
     }
     _cf = _prepare_cookiefile()
     if _cf:
@@ -5390,7 +5424,7 @@ def _download_single_profile_video(video_url: str, output_dir: str) -> dict:
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
-        "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
+        "extractor_args": {"youtube": _yt_extractor_args()},
     }
     # Copy cookies to a writable path (yt-dlp writes the jar back; Render
     # secret files are read-only → would raise Errno 30).

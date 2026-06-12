@@ -187,6 +187,7 @@ RECIPE_LLM_MODEL = os.getenv("RECIPE_LLM_MODEL", "gpt-4o-mini")
 # See https://github.com/Tyrrrz/YoutubeExplode/issues/933
 YT_PROXY = os.getenv("YT_PROXY")
 YT_USE_PROXY = os.getenv("YT_USE_PROXY", "0") == "1"  # opt-in escape hatch if direct ever breaks
+SOCIAL_USE_PROXY = os.getenv("SOCIAL_USE_PROXY", "0") == "1"  # same opt-in for FB/IG/TikTok
 
 # Player clients to impersonate for YouTube, in priority order.
 # android_vr: PO-token-free, full format access (primary).
@@ -201,7 +202,8 @@ def _yt_extractor_args() -> dict:
 # challenged/redirect-looped by these sites even with valid cookies, so a
 # residential/mobile proxy is usually required to extract from a deployed server.
 # Falls back to YT_PROXY if SOCIAL_PROXY is not set, so a single proxy can serve both.
-SOCIAL_PROXY = os.getenv("SOCIAL_PROXY") or os.getenv("YTDLP_PROXY")
+# Falls back to YT_PROXY so a single Decodo residential proxy serves all sites.
+SOCIAL_PROXY = os.getenv("SOCIAL_PROXY") or os.getenv("YTDLP_PROXY") or YT_PROXY
 print(f"[startup] yt-dlp version: {getattr(yt_dlp.version, '__version__', 'unknown')}")
 print(
     f"[startup] proxies: YT_PROXY={'set' if YT_PROXY else 'none'} "
@@ -219,56 +221,91 @@ PROFILE_VIDEO_PARALLEL_DOWNLOADS = max(1, min(int(os.getenv("PROFILE_VIDEO_PARAL
 def _ytdlp_proxy(url: str) -> str | None:
     """Return the proxy to use for a given URL, or None.
 
-    YouTube: direct connection (no proxy) — the ANDROID_VR client impersonation
-    in _yt_extractor_args() makes extraction work without a 3rd-party proxy.
-    YT_PROXY is only honored if YT_USE_PROXY=1 is explicitly set.
-    Facebook/Instagram/TikTok use SOCIAL_PROXY. Datacenter IPs are frequently
-    blocked by the social sites, so routing those requests through a
-    residential proxy is what makes extraction work from a cloud host.
+    Direct-first strategy: the 1st attempt is proxy-free, and _ydl_extract()
+    retries through the matching proxy only if the direct attempt is blocked.
+    Proxy fallback applies to YouTube and Facebook ONLY — Instagram/TikTok
+    work fine directly (with cookies) and never use a proxy.
+    Forcing the proxy on every request is opt-in:
+    YT_USE_PROXY=1 (YouTube) / SOCIAL_USE_PROXY=1 (Facebook).
     """
     try:
         if is_youtube_url(url):
             return (YT_PROXY or None) if YT_USE_PROXY else None
-        host = (urlparse(url).hostname or "").lower()
-        if any(s in host for s in ("facebook.com", "fb.watch", "fb.com", "instagram.com", "tiktok.com")):
+        if _is_facebook_url(url):
+            return (SOCIAL_PROXY or None) if SOCIAL_USE_PROXY else None
+    except Exception:
+        pass
+    return None
+
+
+def _is_facebook_url(url: str) -> bool:
+    host = (urlparse(url).hostname or "").lower()
+    return any(s in host for s in ("facebook.com", "fb.watch", "fb.com"))
+
+
+def _fallback_proxy(url: str) -> str | None:
+    """Proxy to retry through when a direct attempt is blocked, or None.
+
+    YouTube → YT_PROXY; Facebook → SOCIAL_PROXY (defaults to YT_PROXY).
+    Instagram/TikTok → no proxy ever (direct + cookies is sufficient).
+    """
+    try:
+        if is_youtube_url(url):
+            return YT_PROXY or None
+        if _is_facebook_url(url):
             return SOCIAL_PROXY or None
     except Exception:
         pass
     return None
 
 
-def _yt_bot_check_error(exc: Exception) -> bool:
-    """True if the yt-dlp error looks like YouTube IP-reputation blocking."""
+def _blocked_error(exc: Exception) -> bool:
+    """True if the yt-dlp error looks like IP-reputation blocking / anti-bot.
+
+    Covers YouTube (bot-check, 429), and Facebook/Instagram/TikTok
+    (login walls, rate limits, redirect loops on datacenter IPs).
+    """
     s = str(exc)
-    return (
-        "Sign in to confirm" in s
-        or "Too Many Requests" in s
-        or "HTTP Error 429" in s
-        or "LOGIN_REQUIRED" in s
+    return any(
+        marker in s
+        for marker in (
+            "Sign in to confirm",       # YouTube bot-check
+            "Too Many Requests",
+            "HTTP Error 429",
+            "HTTP Error 403",
+            "LOGIN_REQUIRED",
+            "login required",           # FB/IG login wall
+            "log in",
+            "Login Required",
+            "checkpoint",               # FB security checkpoint
+            "rate-limit",
+            "rate limit",
+            "redirect loop",
+            "Cannot parse data",        # FB serving an interstitial page
+            "Restricted Video",
+            "unable to extract",        # generic: site served a block page
+        )
     )
 
 
 def _ydl_extract(ydl_opts: dict, video_url: str, *, download: bool):
-    """Run yt-dlp extract_info with direct-first / proxy-fallback for YouTube.
+    """Run yt-dlp extract_info with direct-first / proxy-fallback.
 
-    1st attempt: direct connection via the android_vr client (proxy-free).
-    If YouTube bot-checks/rate-limits the host IP (common on cloud egress IPs)
-    and YT_PROXY is configured, retry ONCE through the proxy. This keeps proxy
-    bandwidth (and cost) at zero unless the direct path is actually blocked.
+    1st attempt: direct connection (proxy-free; YouTube uses the android_vr
+    client). If the site blocks the host IP (common on cloud egress IPs) and a
+    fallback proxy is configured for that site (YT_PROXY for YouTube,
+    SOCIAL_PROXY for FB/IG/TikTok), retry ONCE through the proxy. This keeps
+    proxy bandwidth (and cost) at zero unless the direct path is blocked.
     """
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             return ydl.extract_info(video_url, download=download)
     except Exception as e:
-        if (
-            is_youtube_url(video_url)
-            and YT_PROXY
-            and not ydl_opts.get("proxy")
-            and _yt_bot_check_error(e)
-        ):
-            print("⚠️ Direct YouTube attempt blocked (bot-check/429); retrying via YT_PROXY")
+        proxy = _fallback_proxy(video_url)
+        if proxy and not ydl_opts.get("proxy") and _blocked_error(e):
+            print(f"⚠️ Direct attempt blocked ({str(e)[:80]}...); retrying via proxy")
             opts = dict(ydl_opts)
-            opts["proxy"] = YT_PROXY
+            opts["proxy"] = proxy
             with yt_dlp.YoutubeDL(opts) as ydl:
                 return ydl.extract_info(video_url, download=download)
         raise

@@ -202,6 +202,7 @@ def _yt_extractor_args() -> dict:
 # residential/mobile proxy is usually required to extract from a deployed server.
 # Falls back to YT_PROXY if SOCIAL_PROXY is not set, so a single proxy can serve both.
 SOCIAL_PROXY = os.getenv("SOCIAL_PROXY") or os.getenv("YTDLP_PROXY")
+print(f"[startup] yt-dlp version: {getattr(yt_dlp.version, '__version__', 'unknown')}")
 print(
     f"[startup] proxies: YT_PROXY={'set' if YT_PROXY else 'none'} "
     f"({'ENABLED via YT_USE_PROXY' if YT_USE_PROXY else 'NOT USED — YouTube goes direct via android_vr client'}), "
@@ -234,6 +235,43 @@ def _ytdlp_proxy(url: str) -> str | None:
     except Exception:
         pass
     return None
+
+
+def _yt_bot_check_error(exc: Exception) -> bool:
+    """True if the yt-dlp error looks like YouTube IP-reputation blocking."""
+    s = str(exc)
+    return (
+        "Sign in to confirm" in s
+        or "Too Many Requests" in s
+        or "HTTP Error 429" in s
+        or "LOGIN_REQUIRED" in s
+    )
+
+
+def _ydl_extract(ydl_opts: dict, video_url: str, *, download: bool):
+    """Run yt-dlp extract_info with direct-first / proxy-fallback for YouTube.
+
+    1st attempt: direct connection via the android_vr client (proxy-free).
+    If YouTube bot-checks/rate-limits the host IP (common on cloud egress IPs)
+    and YT_PROXY is configured, retry ONCE through the proxy. This keeps proxy
+    bandwidth (and cost) at zero unless the direct path is actually blocked.
+    """
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            return ydl.extract_info(video_url, download=download)
+    except Exception as e:
+        if (
+            is_youtube_url(video_url)
+            and YT_PROXY
+            and not ydl_opts.get("proxy")
+            and _yt_bot_check_error(e)
+        ):
+            print("⚠️ Direct YouTube attempt blocked (bot-check/429); retrying via YT_PROXY")
+            opts = dict(ydl_opts)
+            opts["proxy"] = YT_PROXY
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                return ydl.extract_info(video_url, download=download)
+        raise
 
 vector_db = Chroma(persist_directory="./vector_store", embedding_function=OpenAIEmbeddings())
 retriever = vector_db.as_retriever(search_kwargs={"k": 3})  # Reduced from 5 to 3 for faster retrieval
@@ -2793,8 +2831,7 @@ def get_video_metadata(video_url: str):
     if _proxy:
         opts["proxy"] = _proxy
         print(f"🌐 Using proxy for metadata: {_proxy}")
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(video_url, download=False)
+    info = _ydl_extract(opts, video_url, download=False)
     return info
 
 
@@ -2808,9 +2845,8 @@ def download_audio_mp3(video_url: str):
     try:
         opts = ytdlp_base_opts(temp_dir, video_url)
 
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            # extract_info with download=True fetches metadata AND downloads in one call
-            info_dict = ydl.extract_info(video_url, download=True)
+        # extract_info with download=True fetches metadata AND downloads in one call
+        info_dict = _ydl_extract(opts, video_url, download=True)
 
         duration = info_dict.get("duration")
         title = info_dict.get("title") or ""
@@ -4596,8 +4632,7 @@ def _yt_meta(video_url: str) -> dict:
             opts["proxy"] = _proxy
             print(f"🌐 Using proxy for metadata: {_proxy}")
 
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(video_url, download=False)
+        info = _ydl_extract(opts, video_url, download=False)
         return info or {}
     finally:
         shutil.rmtree(cookie_temp_dir, ignore_errors=True)
@@ -4663,8 +4698,7 @@ def _download_audio_mp3(video_url: str):
             ydl_opts["proxy"] = _proxy
             print(f"🌐 Using proxy: {_proxy}")
 
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([video_url])
+        _ydl_extract(ydl_opts, video_url, download=True)
 
         mp3s = [f for f in os.listdir(temp_dir) if f.endswith(".mp3")]
         if not mp3s:
@@ -4821,8 +4855,7 @@ def _download_video_to_file(video_url: str, *, fast: bool = False):
             ydl_opts["proxy"] = _proxy
 
         # Single call: fetches metadata AND downloads in one network session
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(video_url, download=True)
+        info = _ydl_extract(ydl_opts, video_url, download=True)
 
         duration = info.get("duration")
         title = info.get("title") or ""
@@ -5364,8 +5397,7 @@ def _collect_profile_video_urls(profile_url: str, limit: int) -> list[str]:
         return _collect_instagram_video_urls(profile_url, limit)
 
     opts = _profile_discovery_opts(profile_url, limit)
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(profile_url, download=False)
+    info = _ydl_extract(opts, profile_url, download=False)
 
     if not info:
         raise RuntimeError("yt-dlp returned no metadata for this profile URL")
@@ -5448,19 +5480,17 @@ def _download_single_profile_video(video_url: str, output_dir: str) -> dict:
 
     filepath = ""
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(video_url, download=True)
-            info = info or {}
-            if isinstance(info, dict):
-                try:
-                    filepath = ydl.prepare_filename(info)
-                except Exception:
-                    filepath = ""
-            if isinstance(info, dict):
-                requested = info.get("requested_downloads") or []
-                if requested and isinstance(requested[0], dict):
-                    filepath = requested[0].get("filepath") or filepath
-            if not filepath and isinstance(info, dict):
+        info = _ydl_extract(ydl_opts, video_url, download=True) or {}
+        if isinstance(info, dict):
+            try:
+                with yt_dlp.YoutubeDL(ydl_opts) as _ydl:
+                    filepath = _ydl.prepare_filename(info)
+            except Exception:
+                filepath = ""
+            requested = info.get("requested_downloads") or []
+            if requested and isinstance(requested[0], dict):
+                filepath = requested[0].get("filepath") or filepath
+            if not filepath:
                 maybe_name = info.get("_filename")
                 if isinstance(maybe_name, str):
                     filepath = maybe_name

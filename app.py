@@ -81,8 +81,14 @@ except Exception as _e:
     print(f"[startup] cookie check failed: {_e}")
 
 
-def _prepare_cookiefile(temp_dir: str | None = None) -> str | None:
+def _prepare_cookiefile(temp_dir: str | None = None, video_url: str | None = None) -> str | None:
     """Return a WRITABLE cookies.txt path for yt-dlp, or None if no cookies configured.
+
+    NEVER passes cookies for YouTube URLs: when yt-dlp is given cookies, it
+    SKIPS player clients that don't support cookie auth (incl. android_vr) and
+    falls back to the web client, which triggers "Sign in to confirm you're
+    not a bot" from datacenter IPs. Cookie-free android_vr is what makes
+    proxy-free YouTube extraction work, so cookies stay IG/TikTok/FB-only.
 
     IMPORTANT: yt-dlp writes the (refreshed) cookie jar BACK to `cookiefile`
     after a download. Render secret files are mounted read-only at /etc/secrets,
@@ -94,6 +100,8 @@ def _prepare_cookiefile(temp_dir: str | None = None) -> str | None:
     cleaned up automatically; otherwise a standalone temp file is created.
     """
     if not (YTDLP_COOKIES_FILE or YTDLP_COOKIES_B64):
+        return None
+    if video_url and is_youtube_url(video_url):
         return None
     try:
         if temp_dir:
@@ -2757,8 +2765,8 @@ def ytdlp_base_opts(temp_dir: str, video_url: str = None):
         }],
     }
 
-    # Cookies greatly improve TikTok/Instagram/Facebook reliability (and some YouTube cases)
-    _cf = _prepare_cookiefile(temp_dir)
+    # Cookies improve TikTok/Instagram/Facebook reliability (never used for YouTube)
+    _cf = _prepare_cookiefile(temp_dir, video_url)
     if _cf:
         opts["cookiefile"] = _cf
 
@@ -4577,7 +4585,7 @@ def _yt_meta(video_url: str) -> dict:
     try:
         # Add cookies if available (needed for Instagram/TikTok/Facebook).
         # Copied to a writable path because yt-dlp writes the cookie jar back.
-        _cf = _prepare_cookiefile(cookie_temp_dir)
+        _cf = _prepare_cookiefile(cookie_temp_dir, video_url)
         if _cf:
             opts["cookiefile"] = _cf
             print("🍪 Using cookies file for metadata")
@@ -4637,7 +4645,7 @@ def _download_audio_mp3(video_url: str):
         # Copied to a writable path because yt-dlp writes the cookie jar back
         # (Render secret files are read-only → would raise Errno 30).
         cookies_used = False
-        _cf = _prepare_cookiefile(temp_dir)
+        _cf = _prepare_cookiefile(temp_dir, video_url)
         if _cf:
             ydl_opts["cookiefile"] = _cf
             cookies_used = True
@@ -4803,7 +4811,7 @@ def _download_video_to_file(video_url: str, *, fast: bool = False):
         }
         # Copy cookies to a writable path (yt-dlp writes the jar back; Render
         # secret files are read-only → would raise Errno 30).
-        _cf = _prepare_cookiefile(temp_dir)
+        _cf = _prepare_cookiefile(temp_dir, video_url)
         if _cf:
             ydl_opts["cookiefile"] = _cf
         if "instagram.com" in video_url.lower() and ydl_opts.get("cookiefile"):
@@ -4855,7 +4863,7 @@ def _profile_discovery_opts(profile_url: str, limit: int) -> dict:
         "playlistend": max(1, min(limit * 4, 50)),
         "extractor_args": {"youtube": _yt_extractor_args()},
     }
-    _cf = _prepare_cookiefile()
+    _cf = _prepare_cookiefile(video_url=profile_url)
     if _cf:
         opts["cookiefile"] = _cf
     _proxy = _ytdlp_proxy(profile_url)
@@ -5428,7 +5436,7 @@ def _download_single_profile_video(video_url: str, output_dir: str) -> dict:
     }
     # Copy cookies to a writable path (yt-dlp writes the jar back; Render
     # secret files are read-only → would raise Errno 30).
-    temp_cookies_path = _prepare_cookiefile(output_dir)
+    temp_cookies_path = _prepare_cookiefile(output_dir, video_url)
     if temp_cookies_path:
         ydl_opts["cookiefile"] = temp_cookies_path
 

@@ -127,40 +127,69 @@ def _prepare_cookiefile(temp_dir: str | None = None, video_url: str | None = Non
 _SHARE_LINK_HOSTS = {"fb.watch", "www.fb.watch", "fb.com", "www.fb.com"}
 
 
+def _social_request_headers() -> dict:
+    return {
+        "User-Agent": (
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) "
+            "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1"
+        ),
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
+
+def _social_proxies(url: str | None = None) -> dict | None:
+    """Proxy for social HTTP fetches. TikTok/Instagram go direct; Facebook may use SOCIAL_PROXY."""
+    if not url or not SOCIAL_PROXY:
+        return None
+    if _is_facebook_url(url):
+        return {"http": SOCIAL_PROXY, "https": SOCIAL_PROXY}
+    proxy = _ytdlp_proxy(url)
+    if proxy:
+        return {"http": proxy, "https": proxy}
+    return None
+
+
+def _social_requests_session() -> requests.Session:
+    sess = requests.Session()
+    cf = _prepare_cookiefile()
+    if cf:
+        try:
+            cj = http.cookiejar.MozillaCookieJar(cf)
+            cj.load(ignore_discard=True, ignore_expires=True)
+            sess.cookies = cj
+        except Exception:
+            pass
+    return sess
+
+
+def _follow_redirect_url(url: str) -> str:
+    """Follow HTTP redirects for a short/share link and return the final URL."""
+    sess = _social_requests_session()
+    resp = sess.get(
+        url,
+        headers=_social_request_headers(),
+        allow_redirects=True,
+        timeout=15,
+        proxies=_social_proxies(url),
+    )
+    return resp.url or url
+
+
 def _resolve_share_url(url: str) -> str:
-    """Resolve a short/share link (e.g. fb.watch) to its canonical URL.
+    """Resolve a short/share link (e.g. fb.watch, vt.tiktok.com) to its canonical URL.
 
     Returns the original URL unchanged on any failure or for non-share hosts.
     """
     try:
         host = (urlparse(url).hostname or "").lower()
+        if host in {"vt.tiktok.com", "vm.tiktok.com"}:
+            return _follow_redirect_url(url)
+        if host in {"tiktok.com", "www.tiktok.com"} and re.search(r"/t/", url):
+            return _follow_redirect_url(url)
         if host not in _SHARE_LINK_HOSTS:
             return url
 
-        sess = requests.Session()
-        # Attach cookies so Facebook resolves the video instead of bouncing to
-        # a login/consent interstitial (which is what causes the redirect loop).
-        cf = _prepare_cookiefile()
-        if cf:
-            try:
-                cj = http.cookiejar.MozillaCookieJar(cf)
-                cj.load(ignore_discard=True, ignore_expires=True)
-                sess.cookies = cj
-            except Exception:
-                pass
-
-        headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-            ),
-            "Accept-Language": "en-US,en;q=0.9",
-        }
-        proxies = None
-        if SOCIAL_PROXY:
-            proxies = {"http": SOCIAL_PROXY, "https": SOCIAL_PROXY}
-        resp = sess.get(url, headers=headers, allow_redirects=True, timeout=15, proxies=proxies)
-        final = resp.url or url
+        final = _follow_redirect_url(url)
         p = urlparse(final)
         fhost = (p.hostname or "").lower()
         if "facebook.com" not in fhost:
@@ -5767,6 +5796,231 @@ def _run_frame_vision_fallback_from_path(
         return None, None, None
 
 
+def _max_slideshow_images() -> int:
+    try:
+        return max(1, min(int(os.getenv("EXTRACT_RECIPE_SLIDESHOW_MAX_IMAGES", "12")), 20))
+    except ValueError:
+        return 12
+
+
+def _is_tiktok_photo_url(url: str) -> bool:
+    lowered = (url or "").lower()
+    return "tiktok.com" in lowered and "/photo/" in lowered
+
+
+def _is_instagram_post_url(url: str) -> bool:
+    lowered = (url or "").lower()
+    return "instagram.com/p/" in lowered
+
+
+def _instagram_post_shortcode(url: str) -> str | None:
+    match = re.search(r"instagram\.com/(?:p|reel|tv)/([^/?#]+)", url or "", re.I)
+    return match.group(1) if match else None
+
+
+def _make_instaloader() -> instaloader.Instaloader:
+    ig_username = os.getenv("INSTAGRAM_USERNAME", "")
+    session_file = os.getenv("INSTALOADER_SESSION_FILE", "")
+    L = instaloader.Instaloader(
+        quiet=True,
+        download_videos=False,
+        download_video_thumbnails=False,
+        download_geotags=False,
+        download_comments=False,
+        save_metadata=False,
+        post_metadata_txt_pattern="",
+    )
+    if ig_username and session_file and os.path.exists(session_file):
+        try:
+            L.load_session_from_file(ig_username, session_file)
+        except Exception as sess_err:
+            print(f"⚠️  instaloader: could not load session ({sess_err}); trying anonymously")
+    return L
+
+
+def _walk_tiktok_image_post(obj):
+    """Find TikTok photo-mode slideshow images inside embedded page JSON."""
+    if isinstance(obj, dict):
+        image_post = obj.get("imagePost")
+        if isinstance(image_post, dict):
+            images = image_post.get("images")
+            if isinstance(images, list) and images:
+                urls = []
+                for img in images:
+                    if not isinstance(img, dict):
+                        continue
+                    image_url = img.get("imageURL")
+                    if isinstance(image_url, dict):
+                        url_list = image_url.get("urlList") or []
+                        if url_list:
+                            urls.append(url_list[0])
+                if urls:
+                    title = image_post.get("title") or obj.get("desc") or obj.get("title") or ""
+                    return urls, {"title": title, "slide_count": len(urls)}
+        for value in obj.values():
+            found = _walk_tiktok_image_post(value)
+            if found:
+                return found
+    elif isinstance(obj, list):
+        for item in obj:
+            found = _walk_tiktok_image_post(item)
+            if found:
+                return found
+    return None
+
+
+def _fetch_tiktok_photo_slideshow(url: str) -> tuple[list[str], dict] | None:
+    """Download a TikTok /photo/ page and extract slideshow image CDN URLs."""
+    sess = _social_requests_session()
+    resp = sess.get(
+        url,
+        headers=_social_request_headers(),
+        allow_redirects=True,
+        timeout=20,
+        proxies=_social_proxies(url),
+    )
+    resp.raise_for_status()
+    html = resp.text
+    for pattern in (
+        r'<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>(.*?)</script>',
+        r'<script id="SIGI_STATE"[^>]*>(.*?)</script>',
+    ):
+        match = re.search(pattern, html, re.DOTALL)
+        if not match:
+            continue
+        try:
+            data = json.loads(match.group(1))
+        except json.JSONDecodeError:
+            continue
+        found = _walk_tiktok_image_post(data)
+        if found:
+            image_urls, meta = found
+            meta.setdefault("provider", "tiktok.com")
+            meta.setdefault("extractor", "tiktok_photo")
+            return image_urls, meta
+    return None
+
+
+def _fetch_instagram_carousel_slideshow(url: str) -> tuple[list[str], dict] | None:
+    """Use instaloader to collect image URLs from an Instagram carousel or photo post."""
+    if not _is_instagram_post_url(url):
+        return None
+    shortcode = _instagram_post_shortcode(url)
+    if not shortcode:
+        return None
+    L = _make_instaloader()
+    try:
+        post = instaloader.Post.from_shortcode(L.context, shortcode)
+    except instaloader.exceptions.InstaloaderException as e:
+        print(f"⚠️ instaloader carousel lookup failed for {url}: {e}")
+        return None
+
+    if post.is_video and post.typename != "GraphSidecar":
+        return None
+
+    image_urls: list[str] = []
+    if post.typename == "GraphSidecar":
+        for node in post.get_sidecar_nodes():
+            if node.is_video:
+                continue
+            if node.display_url:
+                image_urls.append(node.display_url)
+    elif not post.is_video and post.url:
+        image_urls = [post.url]
+
+    if not image_urls:
+        return None
+
+    return image_urls, {
+        "title": post.title or post.caption or "",
+        "provider": "instagram.com",
+        "extractor": "instagram_carousel",
+        "slide_count": len(image_urls),
+    }
+
+
+def _slideshow_image_urls(url: str) -> tuple[list[str], dict] | None:
+    """Return slideshow image URLs + metadata when the URL is a photo carousel."""
+    if _is_tiktok_photo_url(url):
+        return _fetch_tiktok_photo_slideshow(url)
+    if _is_instagram_post_url(url):
+        return _fetch_instagram_carousel_slideshow(url)
+    return None
+
+
+def _fetch_image_data_urls(image_urls: list[str]) -> list[str]:
+    """Download remote slide images and return base64 data URLs for vision LLM."""
+    urls = image_urls[: _max_slideshow_images()]
+    headers = _social_request_headers()
+    proxies = _social_proxies(image_urls[0] if image_urls else None)
+
+    def _download_one(remote_url: str) -> str:
+        resp = requests.get(remote_url, headers=headers, timeout=25, proxies=proxies)
+        resp.raise_for_status()
+        content_type = (resp.headers.get("Content-Type") or "image/jpeg").split(";")[0].strip()
+        if content_type not in ("image/jpeg", "image/png", "image/webp", "image/gif"):
+            content_type = "image/jpeg"
+        encoded = base64.b64encode(resp.content).decode("utf-8")
+        return f"data:{content_type};base64,{encoded}"
+
+    if len(urls) == 1:
+        return [_download_one(urls[0])]
+
+    data_urls = [None] * len(urls)
+    with ThreadPoolExecutor(max_workers=min(6, len(urls))) as executor:
+        futures = {executor.submit(_download_one, remote_url): idx for idx, remote_url in enumerate(urls)}
+        for future in as_completed(futures):
+            idx = futures[future]
+            data_urls[idx] = future.result()
+    return [u for u in data_urls if u]
+
+
+def _try_extract_recipe_from_slideshow(url: str, url_key: str):
+    """
+    Extract recipe from TikTok photo posts or Instagram carousels.
+    Returns a Flask (response, status) tuple on success/failure, or None if not a slideshow.
+    """
+    slideshow = _slideshow_image_urls(url)
+    if not slideshow:
+        return None
+
+    image_urls, meta = slideshow
+    print(f"📸 Slideshow detected ({meta.get('extractor', 'unknown')}): {len(image_urls)} slide(s)")
+    t0 = time.time()
+    try:
+        data_urls = _fetch_image_data_urls(image_urls)
+        recipe = extract_recipe_from_images_llm(data_urls)
+        _enrich_recipe_response(recipe)
+        tags = extract_recipe_tags(recipe)
+        source = {
+            "type": "slideshow",
+            "url": url,
+            "provider": meta.get("provider", ""),
+            "title": meta.get("title", "") or recipe.get("name", ""),
+            "image": image_urls[0] if image_urls else None,
+            "source_type": determine_source_type(url),
+        }
+        result = {
+            "source": source,
+            "recipe": recipe,
+            "tags": tags,
+            "transcript": None,
+            "extraction": {"method": "slideshow_vision", "confidence": 0.6},
+            "meta": meta,
+        }
+        with _recipe_cache_lock:
+            _recipe_cache[url_key] = result
+        print(f"✅ Slideshow recipe extracted in {time.time() - t0:.2f}s")
+        return jsonify(result), 200
+    except Exception as e:
+        print(f"⚠️ Slideshow extraction failed: {e}")
+        return jsonify({
+            "error": "Failed to extract recipe from slideshow",
+            "user_message": "We couldn't read this photo slideshow. Please try another link or add the recipe manually.",
+            "details": str(e),
+        }), 500
+
+
 def extract_recipe_from_video_internal(video_url: str):
     """
     Internal helper used by unified /extract-recipe endpoint.
@@ -5791,6 +6045,10 @@ def extract_recipe_from_video_internal(video_url: str):
             print(f"⚡ Cache hit for video URL: {video_url}")
             return jsonify({**_recipe_cache[url_key], "cached": True}), 200
     # ─────────────────────────────────────────────────────────────────────────
+
+    slideshow_resp = _try_extract_recipe_from_slideshow(video_url, url_key)
+    if slideshow_resp is not None:
+        return slideshow_resp
 
     temp_dir = None
     video_path = None
@@ -5825,6 +6083,9 @@ def extract_recipe_from_video_internal(video_url: str):
             except ValueError as ve:
                 return jsonify({"error": str(ve)}), 413
             except yt_dlp.utils.DownloadError as de:
+                slideshow_resp = _try_extract_recipe_from_slideshow(video_url, url_key)
+                if slideshow_resp is not None:
+                    return slideshow_resp
                 return jsonify({
                     "error": "Failed to download video",
                     "details": str(de),
@@ -5903,6 +6164,9 @@ def extract_recipe_from_video_internal(video_url: str):
         if audio_dl.get("error") and video_dl.get("error"):
             de = video_dl["error"]
             if isinstance(de, yt_dlp.utils.DownloadError):
+                slideshow_resp = _try_extract_recipe_from_slideshow(video_url, url_key)
+                if slideshow_resp is not None:
+                    return slideshow_resp
                 error_str = str(de)
                 lowered_url = video_url.lower()
                 is_instagram = "instagram.com" in lowered_url

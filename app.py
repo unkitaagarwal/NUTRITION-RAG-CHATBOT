@@ -3951,6 +3951,46 @@ def extract_recipe_from_video_frames_llm(image_data_urls: list) -> dict:
     return json.loads(completion.choices[0].message.content)
 
 
+def extract_recipe_from_slideshow_llm(image_data_urls: list, *, caption: str = "") -> dict:
+    """Fast vision path for social slideshows: low detail, compact prompt, fewer tokens."""
+    if not image_data_urls:
+        raise ValueError("At least one image is required")
+    caption_hint = f" Post caption/title: {caption.strip()}." if caption and caption.strip() else ""
+    system = (
+        "Extract a complete recipe from social-media slideshow slide(s) with on-screen text overlays."
+        " Combine all slides into ONE recipe. Return ONLY JSON: "
+        '{"name":"","ingredients":[{"name":"","quantity":""}],'
+        '"instructions":["..."],"servings":"","prep_time":"","cook_time":"","total_time":"",'
+        '"notes":[],"meal_type":"","cuisine":"","nutrition":{"calories":"","protein_g":"","carbs_g":"","fat_g":""}}. '
+        "Read every visible ingredient and cooking step across slides. "
+        "meal_type: Breakfast|Lunch|Dinner|Snack. Estimate nutrition per serving when possible. JSON only."
+    )
+    content = [{
+        "type": "text",
+        "text": (
+            f"These are {len(image_data_urls)} slide(s) from a recipe carousel (sampled from a longer slideshow)."
+            f"{caption_hint} Extract and merge the full recipe JSON."
+        ),
+    }]
+    for url in image_data_urls:
+        content.append({
+            "type": "image_url",
+            "image_url": {"url": url, "detail": "low"},
+        })
+    completion = client.chat.completions.create(
+        model=os.getenv("RECIPE_VISION_FAST_MODEL") or os.getenv("RECIPE_LLM_MODEL", "gpt-4o-mini"),
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": content},
+        ],
+        temperature=0.1,
+        max_tokens=900,
+        response_format={"type": "json_object"},
+        timeout=min(RECIPE_LLM_TIMEOUT, 45),
+    )
+    return json.loads(completion.choices[0].message.content)
+
+
 def extract_recipe_from_images_llm(image_data_urls: list):
     """Extract one combined recipe from one or more images (e.g. multi-page recipe). Uses vision LLM."""
     if not image_data_urls:
@@ -5769,9 +5809,61 @@ def _run_frame_vision_fallback_from_path(
 
 def _max_slideshow_images() -> int:
     try:
-        return max(1, min(int(os.getenv("EXTRACT_RECIPE_SLIDESHOW_MAX_IMAGES", "12")), 20))
+        return max(2, min(int(os.getenv("EXTRACT_RECIPE_SLIDESHOW_MAX_IMAGES", "6")), 12))
     except ValueError:
-        return 12
+        return 6
+
+
+def _slideshow_frame_max_width() -> int:
+    try:
+        return max(256, min(int(os.getenv("EXTRACT_RECIPE_SLIDESHOW_MAX_WIDTH", "512")), 768))
+    except ValueError:
+        return 512
+
+
+def _select_slideshow_slide_urls(image_urls: list[str]) -> list[str]:
+    """Evenly sample slides so long carousels stay fast without skipping first/last context."""
+    max_n = _max_slideshow_images()
+    n = len(image_urls)
+    if n <= max_n:
+        return image_urls
+    indices = [round(i * (n - 1) / (max_n - 1)) for i in range(max_n)]
+    seen: set[int] = set()
+    selected: list[str] = []
+    for idx in indices:
+        if idx in seen:
+            continue
+        seen.add(idx)
+        selected.append(image_urls[idx])
+    return selected
+
+
+def _resize_image_bytes_to_jpeg_data_url(image_bytes: bytes) -> str:
+    """Downscale slide bytes for faster vision LLM (same approach as video frame extraction)."""
+    out_dir = tempfile.mkdtemp()
+    in_path = os.path.join(out_dir, "slide_in")
+    out_path = os.path.join(out_dir, "slide.jpg")
+    w = _slideshow_frame_max_width()
+    try:
+        with open(in_path, "wb") as f:
+            f.write(image_bytes)
+        result = subprocess.run(
+            [
+                "ffmpeg", "-y", "-i", in_path,
+                "-vf", f"scale={w}:-1", "-q:v", "7",
+                out_path,
+            ],
+            capture_output=True,
+            timeout=12,
+        )
+        if result.returncode != 0 or not os.path.exists(out_path):
+            encoded = base64.b64encode(image_bytes).decode("utf-8")
+            return f"data:image/jpeg;base64,{encoded}"
+        with open(out_path, "rb") as f:
+            encoded = base64.b64encode(f.read()).decode("utf-8")
+        return f"data:image/jpeg;base64,{encoded}"
+    finally:
+        shutil.rmtree(out_dir, ignore_errors=True)
 
 
 def _slideshow_request_headers() -> dict:
@@ -5891,7 +5983,7 @@ def _fetch_tiktok_photo_slideshow(url: str) -> tuple[list[str], dict] | None:
         url,
         headers=_slideshow_request_headers(),
         allow_redirects=True,
-        timeout=20,
+        timeout=12,
     )
     resp.raise_for_status()
     html = resp.text
@@ -5958,24 +6050,20 @@ def _slideshow_image_urls(url: str) -> tuple[list[str], dict] | None:
 
 
 def _fetch_image_data_urls(image_urls: list[str]) -> list[str]:
-    """Download remote slide images and return base64 data URLs for vision LLM."""
-    urls = image_urls[: _max_slideshow_images()]
+    """Download sampled slide images, downscale, and return JPEG data URLs for vision LLM."""
+    urls = _select_slideshow_slide_urls(image_urls)
     headers = _slideshow_request_headers()
 
     def _download_one(remote_url: str) -> str:
-        resp = requests.get(remote_url, headers=headers, timeout=25)
+        resp = requests.get(remote_url, headers=headers, timeout=12)
         resp.raise_for_status()
-        content_type = (resp.headers.get("Content-Type") or "image/jpeg").split(";")[0].strip()
-        if content_type not in ("image/jpeg", "image/png", "image/webp", "image/gif"):
-            content_type = "image/jpeg"
-        encoded = base64.b64encode(resp.content).decode("utf-8")
-        return f"data:{content_type};base64,{encoded}"
+        return _resize_image_bytes_to_jpeg_data_url(resp.content)
 
     if len(urls) == 1:
         return [_download_one(urls[0])]
 
     data_urls = [None] * len(urls)
-    with ThreadPoolExecutor(max_workers=min(6, len(urls))) as executor:
+    with ThreadPoolExecutor(max_workers=min(8, len(urls))) as executor:
         futures = {executor.submit(_download_one, remote_url): idx for idx, remote_url in enumerate(urls)}
         for future in as_completed(futures):
             idx = futures[future]
@@ -5984,13 +6072,23 @@ def _fetch_image_data_urls(image_urls: list[str]) -> list[str]:
 
 
 def _extract_recipe_from_slideshow(url: str, url_key: str, slideshow: tuple[list[str], dict]):
-    """Run vision LLM on confirmed slideshow images. Returns Flask (response, status)."""
+    """Run fast vision LLM on confirmed slideshow images. Returns Flask (response, status)."""
     image_urls, meta = slideshow
-    print(f"📸 Slideshow fallback ({meta.get('extractor', 'unknown')}): {len(image_urls)} slide(s)")
+    selected = _select_slideshow_slide_urls(image_urls)
+    meta = dict(meta)
+    meta["slides_used"] = len(selected)
+    print(
+        f"📸 Slideshow ({meta.get('extractor', 'unknown')}): "
+        f"{len(selected)}/{len(image_urls)} slide(s) sampled"
+    )
     t0 = time.time()
     try:
+        t_dl = time.time()
         data_urls = _fetch_image_data_urls(image_urls)
-        recipe = extract_recipe_from_images_llm(data_urls)
+        print(f"📥 Slideshow images ready in {time.time() - t_dl:.2f}s")
+        t_llm = time.time()
+        recipe = extract_recipe_from_slideshow_llm(data_urls, caption=meta.get("title", ""))
+        print(f"🧠 Slideshow vision LLM finished in {time.time() - t_llm:.2f}s")
         _enrich_recipe_response(recipe)
         tags = extract_recipe_tags(recipe)
         source = {
@@ -6039,6 +6137,25 @@ def _try_slideshow_fallback_on_download_error(url: str, url_key: str):
     return _extract_recipe_from_slideshow(cache_url, cache_key, slideshow)
 
 
+def _try_tiktok_photo_slideshow_fast_path(url: str, url_key: str):
+    """
+    Skip yt-dlp for confirmed TikTok /photo/ posts — they always fail video download.
+    Only runs for TikTok URLs that resolve to /photo/; video/reel URLs are untouched.
+    """
+    lowered = (url or "").lower()
+    if "tiktok.com" not in lowered and "vt.tiktok.com" not in lowered and "vm.tiktok.com" not in lowered:
+        return None
+    resolved = _resolve_tiktok_short_url(url)
+    if not _is_tiktok_photo_url(resolved):
+        return None
+    slideshow = _slideshow_image_urls(resolved)
+    if not slideshow:
+        return None
+    cache_key = hashlib.sha256(resolved.encode()).hexdigest()
+    print(f"⚡ TikTok photo fast-path: {url} -> {resolved}")
+    return _extract_recipe_from_slideshow(resolved, url_key, slideshow)
+
+
 def extract_recipe_from_video_internal(video_url: str):
     """
     Internal helper used by unified /extract-recipe endpoint.
@@ -6063,6 +6180,10 @@ def extract_recipe_from_video_internal(video_url: str):
             print(f"⚡ Cache hit for video URL: {video_url}")
             return jsonify({**_recipe_cache[url_key], "cached": True}), 200
     # ─────────────────────────────────────────────────────────────────────────
+
+    tiktok_photo_resp = _try_tiktok_photo_slideshow_fast_path(video_url, url_key)
+    if tiktok_photo_resp is not None:
+        return tiktok_photo_resp
 
     temp_dir = None
     video_path = None

@@ -5767,6 +5767,278 @@ def _run_frame_vision_fallback_from_path(
         return None, None, None
 
 
+def _max_slideshow_images() -> int:
+    try:
+        return max(1, min(int(os.getenv("EXTRACT_RECIPE_SLIDESHOW_MAX_IMAGES", "12")), 20))
+    except ValueError:
+        return 12
+
+
+def _slideshow_request_headers() -> dict:
+    return {
+        "User-Agent": (
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) "
+            "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1"
+        ),
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
+
+def _slideshow_requests_session() -> requests.Session:
+    sess = requests.Session()
+    cf = _prepare_cookiefile()
+    if cf:
+        try:
+            cj = http.cookiejar.MozillaCookieJar(cf)
+            cj.load(ignore_discard=True, ignore_expires=True)
+            sess.cookies = cj
+        except Exception:
+            pass
+    return sess
+
+
+def _resolve_tiktok_short_url(url: str) -> str:
+    """Resolve TikTok short links only — used by slideshow fallback, not the main video pipeline."""
+    try:
+        host = (urlparse(url).hostname or "").lower()
+        if host not in {"vt.tiktok.com", "vm.tiktok.com", "tiktok.com", "www.tiktok.com"}:
+            return url
+        if host in {"tiktok.com", "www.tiktok.com"} and not re.search(r"/t/", url):
+            return url
+        sess = _slideshow_requests_session()
+        resp = sess.get(
+            url,
+            headers=_slideshow_request_headers(),
+            allow_redirects=True,
+            timeout=15,
+        )
+        return resp.url or url
+    except Exception as e:
+        print(f"[slideshow] TikTok short-url resolution failed for {url}: {e}")
+        return url
+
+
+def _is_tiktok_photo_url(url: str) -> bool:
+    lowered = (url or "").lower()
+    return "tiktok.com" in lowered and "/photo/" in lowered
+
+
+def _is_instagram_post_url(url: str) -> bool:
+    lowered = (url or "").lower()
+    return "instagram.com/p/" in lowered
+
+
+def _instagram_post_shortcode(url: str) -> str | None:
+    match = re.search(r"instagram\.com/(?:p|reel|tv)/([^/?#]+)", url or "", re.I)
+    return match.group(1) if match else None
+
+
+def _make_instaloader() -> instaloader.Instaloader:
+    ig_username = os.getenv("INSTAGRAM_USERNAME", "")
+    session_file = os.getenv("INSTALOADER_SESSION_FILE", "")
+    L = instaloader.Instaloader(
+        quiet=True,
+        download_videos=False,
+        download_video_thumbnails=False,
+        download_geotags=False,
+        download_comments=False,
+        save_metadata=False,
+        post_metadata_txt_pattern="",
+    )
+    if ig_username and session_file and os.path.exists(session_file):
+        try:
+            L.load_session_from_file(ig_username, session_file)
+        except Exception as sess_err:
+            print(f"⚠️  instaloader: could not load session ({sess_err}); trying anonymously")
+    return L
+
+
+def _walk_tiktok_image_post(obj):
+    """Find TikTok photo-mode slideshow images inside embedded page JSON."""
+    if isinstance(obj, dict):
+        image_post = obj.get("imagePost")
+        if isinstance(image_post, dict):
+            images = image_post.get("images")
+            if isinstance(images, list) and images:
+                urls = []
+                for img in images:
+                    if not isinstance(img, dict):
+                        continue
+                    image_url = img.get("imageURL")
+                    if isinstance(image_url, dict):
+                        url_list = image_url.get("urlList") or []
+                        if url_list:
+                            urls.append(url_list[0])
+                if urls:
+                    title = image_post.get("title") or obj.get("desc") or obj.get("title") or ""
+                    return urls, {"title": title, "slide_count": len(urls)}
+        for value in obj.values():
+            found = _walk_tiktok_image_post(value)
+            if found:
+                return found
+    elif isinstance(obj, list):
+        for item in obj:
+            found = _walk_tiktok_image_post(item)
+            if found:
+                return found
+    return None
+
+
+def _fetch_tiktok_photo_slideshow(url: str) -> tuple[list[str], dict] | None:
+    """Download a TikTok /photo/ page and extract slideshow image CDN URLs."""
+    sess = _slideshow_requests_session()
+    resp = sess.get(
+        url,
+        headers=_slideshow_request_headers(),
+        allow_redirects=True,
+        timeout=20,
+    )
+    resp.raise_for_status()
+    html = resp.text
+    for pattern in (
+        r'<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>(.*?)</script>',
+        r'<script id="SIGI_STATE"[^>]*>(.*?)</script>',
+    ):
+        match = re.search(pattern, html, re.DOTALL)
+        if not match:
+            continue
+        try:
+            data = json.loads(match.group(1))
+        except json.JSONDecodeError:
+            continue
+        found = _walk_tiktok_image_post(data)
+        if found:
+            image_urls, meta = found
+            meta.setdefault("provider", "tiktok.com")
+            meta.setdefault("extractor", "tiktok_photo")
+            return image_urls, meta
+    return None
+
+
+def _fetch_instagram_carousel_slideshow(url: str) -> tuple[list[str], dict] | None:
+    """Use instaloader to collect image URLs from a multi-image Instagram carousel."""
+    if not _is_instagram_post_url(url):
+        return None
+    shortcode = _instagram_post_shortcode(url)
+    if not shortcode:
+        return None
+    L = _make_instaloader()
+    try:
+        post = instaloader.Post.from_shortcode(L.context, shortcode)
+    except instaloader.exceptions.InstaloaderException as e:
+        print(f"⚠️ instaloader carousel lookup failed for {url}: {e}")
+        return None
+
+    if post.typename != "GraphSidecar":
+        return None
+
+    image_urls: list[str] = []
+    for node in post.get_sidecar_nodes():
+        if node.is_video:
+            continue
+        if node.display_url:
+            image_urls.append(node.display_url)
+
+    if len(image_urls) < 2:
+        return None
+
+    return image_urls, {
+        "title": post.title or post.caption or "",
+        "provider": "instagram.com",
+        "extractor": "instagram_carousel",
+        "slide_count": len(image_urls),
+    }
+
+
+def _slideshow_image_urls(url: str) -> tuple[list[str], dict] | None:
+    """Return TikTok photo-post slideshow image URLs. Does not probe Instagram (video pipeline first)."""
+    if _is_tiktok_photo_url(url):
+        return _fetch_tiktok_photo_slideshow(url)
+    return None
+
+
+def _fetch_image_data_urls(image_urls: list[str]) -> list[str]:
+    """Download remote slide images and return base64 data URLs for vision LLM."""
+    urls = image_urls[: _max_slideshow_images()]
+    headers = _slideshow_request_headers()
+
+    def _download_one(remote_url: str) -> str:
+        resp = requests.get(remote_url, headers=headers, timeout=25)
+        resp.raise_for_status()
+        content_type = (resp.headers.get("Content-Type") or "image/jpeg").split(";")[0].strip()
+        if content_type not in ("image/jpeg", "image/png", "image/webp", "image/gif"):
+            content_type = "image/jpeg"
+        encoded = base64.b64encode(resp.content).decode("utf-8")
+        return f"data:{content_type};base64,{encoded}"
+
+    if len(urls) == 1:
+        return [_download_one(urls[0])]
+
+    data_urls = [None] * len(urls)
+    with ThreadPoolExecutor(max_workers=min(6, len(urls))) as executor:
+        futures = {executor.submit(_download_one, remote_url): idx for idx, remote_url in enumerate(urls)}
+        for future in as_completed(futures):
+            idx = futures[future]
+            data_urls[idx] = future.result()
+    return [u for u in data_urls if u]
+
+
+def _extract_recipe_from_slideshow(url: str, url_key: str, slideshow: tuple[list[str], dict]):
+    """Run vision LLM on confirmed slideshow images. Returns Flask (response, status)."""
+    image_urls, meta = slideshow
+    print(f"📸 Slideshow fallback ({meta.get('extractor', 'unknown')}): {len(image_urls)} slide(s)")
+    t0 = time.time()
+    try:
+        data_urls = _fetch_image_data_urls(image_urls)
+        recipe = extract_recipe_from_images_llm(data_urls)
+        _enrich_recipe_response(recipe)
+        tags = extract_recipe_tags(recipe)
+        source = {
+            "type": "slideshow",
+            "url": url,
+            "provider": meta.get("provider", ""),
+            "title": meta.get("title", "") or recipe.get("name", ""),
+            "image": image_urls[0] if image_urls else None,
+            "source_type": determine_source_type(url),
+        }
+        result = {
+            "source": source,
+            "recipe": recipe,
+            "tags": tags,
+            "transcript": None,
+            "extraction": {"method": "slideshow_vision", "confidence": 0.6},
+            "meta": meta,
+        }
+        with _recipe_cache_lock:
+            _recipe_cache[url_key] = result
+        print(f"✅ Slideshow recipe extracted in {time.time() - t0:.2f}s")
+        return jsonify(result), 200
+    except Exception as e:
+        print(f"⚠️ Slideshow extraction failed: {e}")
+        return jsonify({
+            "error": "Failed to extract recipe from slideshow",
+            "user_message": "We couldn't read this photo slideshow. Please try another link or add the recipe manually.",
+            "details": str(e),
+        }), 500
+
+
+def _try_slideshow_fallback_on_download_error(url: str, url_key: str):
+    """
+    Only invoked after the normal video download path fails.
+    Does not run for URLs that the existing pipeline can still handle as video.
+    Returns a Flask (response, status) tuple on success/failure, or None to keep the original error.
+    """
+    resolved = _resolve_tiktok_short_url(url)
+    slideshow = _slideshow_image_urls(resolved)
+    if not slideshow and _is_instagram_post_url(url):
+        slideshow = _fetch_instagram_carousel_slideshow(url)
+    if not slideshow:
+        return None
+    cache_url = resolved if _is_tiktok_photo_url(resolved) else url
+    cache_key = hashlib.sha256(cache_url.encode()).hexdigest() if cache_url != url else url_key
+    return _extract_recipe_from_slideshow(cache_url, cache_key, slideshow)
+
+
 def extract_recipe_from_video_internal(video_url: str):
     """
     Internal helper used by unified /extract-recipe endpoint.
@@ -5825,6 +6097,9 @@ def extract_recipe_from_video_internal(video_url: str):
             except ValueError as ve:
                 return jsonify({"error": str(ve)}), 413
             except yt_dlp.utils.DownloadError as de:
+                slideshow_resp = _try_slideshow_fallback_on_download_error(video_url, url_key)
+                if slideshow_resp is not None:
+                    return slideshow_resp
                 return jsonify({
                     "error": "Failed to download video",
                     "details": str(de),
@@ -5903,6 +6178,9 @@ def extract_recipe_from_video_internal(video_url: str):
         if audio_dl.get("error") and video_dl.get("error"):
             de = video_dl["error"]
             if isinstance(de, yt_dlp.utils.DownloadError):
+                slideshow_resp = _try_slideshow_fallback_on_download_error(video_url, url_key)
+                if slideshow_resp is not None:
+                    return slideshow_resp
                 error_str = str(de)
                 lowered_url = video_url.lower()
                 is_instagram = "instagram.com" in lowered_url

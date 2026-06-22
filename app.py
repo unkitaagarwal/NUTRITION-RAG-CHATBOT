@@ -178,6 +178,8 @@ def _resolve_share_url(url: str) -> str:
         return url
 LLM_MODEL = os.getenv("RECIPE_LLM_MODEL", "gpt-4o-mini")  # change if needed
 RECIPE_LLM_MODEL = os.getenv("RECIPE_LLM_MODEL", "gpt-4o-mini")
+# LLM/ffmpeg timeout budget for /extract-recipe (seconds)
+EXTRACT_RECIPE_TIMEOUT = int(os.getenv("EXTRACT_RECIPE_TIMEOUT", "50"))
 
 # YouTube proxy is now OPT-IN only (set YT_USE_PROXY=1 to re-enable).
 # YouTube is downloaded directly — no 3rd-party proxy — by impersonating the
@@ -3540,11 +3542,11 @@ def extract_recipe_tags(recipe: dict) -> list[str]:
     
     return tags
 
-def fetch_html(url: str) -> str:
+def fetch_html(url: str, timeout: int | None = None) -> str:
     headers = {
         "User-Agent": "Mozilla/5.0 (RecipeBot/1.0)"
     }
-    r = requests.get(url, headers=headers, timeout=20)
+    r = requests.get(url, headers=headers, timeout=timeout or EXTRACT_RECIPE_TIMEOUT)
     r.raise_for_status()
     return r.text
 
@@ -3832,7 +3834,7 @@ Rules:
         temperature=0.2,
         max_tokens=1800,
         response_format={"type":"json_object"},
-        timeout=RECIPE_LLM_TIMEOUT,
+        timeout=EXTRACT_RECIPE_TIMEOUT,
     )
     return json.loads(completion.choices[0].message.content)
 
@@ -3946,7 +3948,7 @@ def extract_recipe_from_video_frames_llm(image_data_urls: list) -> dict:
         temperature=0.1,
         max_tokens=900,
         response_format={"type": "json_object"},
-        timeout=min(RECIPE_LLM_TIMEOUT, 45),
+        timeout=EXTRACT_RECIPE_TIMEOUT,
     )
     return json.loads(completion.choices[0].message.content)
 
@@ -3986,7 +3988,7 @@ def extract_recipe_from_slideshow_llm(image_data_urls: list, *, caption: str = "
         temperature=0.1,
         max_tokens=900,
         response_format={"type": "json_object"},
-        timeout=min(RECIPE_LLM_TIMEOUT, 45),
+        timeout=EXTRACT_RECIPE_TIMEOUT,
     )
     return json.loads(completion.choices[0].message.content)
 
@@ -4033,7 +4035,7 @@ Rules:
         temperature=0.2,
         max_tokens=1800,
         response_format={"type": "json_object"},
-        timeout=RECIPE_LLM_TIMEOUT,
+        timeout=EXTRACT_RECIPE_TIMEOUT,
     )
     return json.loads(completion.choices[0].message.content)
 
@@ -4610,7 +4612,7 @@ Rules:
             temperature=0.2,
             max_tokens=1400,
             response_format={"type": "json_object"},
-            timeout=RECIPE_LLM_TIMEOUT,
+            timeout=EXTRACT_RECIPE_TIMEOUT,
         )
     except Exception:
         completion = client.chat.completions.create(
@@ -4621,7 +4623,7 @@ Rules:
             ],
             temperature=0.2,
             max_tokens=1400,
-            timeout=RECIPE_LLM_TIMEOUT,
+            timeout=EXTRACT_RECIPE_TIMEOUT,
         )
 
     return _force_json(completion.choices[0].message.content.strip())
@@ -4669,7 +4671,7 @@ Rules:
             temperature=0.1,
             max_tokens=1800,
             response_format={"type": "json_object"},
-            timeout=RECIPE_LLM_TIMEOUT,
+            timeout=EXTRACT_RECIPE_TIMEOUT,
         )
     except Exception:
         completion = client.chat.completions.create(
@@ -4680,7 +4682,7 @@ Rules:
             ],
             temperature=0.1,
             max_tokens=1800,
-            timeout=RECIPE_LLM_TIMEOUT,
+            timeout=EXTRACT_RECIPE_TIMEOUT,
         )
 
     return _force_json(completion.choices[0].message.content.strip())
@@ -5112,7 +5114,7 @@ def _extract_middle_frame_data_url(video_path: str, duration_sec: float | None) 
                 out_path,
             ],
             capture_output=True,
-            timeout=20,
+            timeout=EXTRACT_RECIPE_TIMEOUT,
         )
         if result.returncode != 0 or not os.path.exists(out_path):
             return None
@@ -5858,7 +5860,7 @@ def _extract_one_frame(video_path: str, timestamp: float, out_path: str) -> str 
                 "-vframes", "1", "-q:v", "2", out_path,
             ],
             capture_output=True,
-            timeout=30,
+            timeout=EXTRACT_RECIPE_TIMEOUT,
         )
         if result.returncode != 0 or not os.path.exists(out_path):
             return None
@@ -5886,7 +5888,7 @@ def _extract_frames_batch_ffmpeg(
             "-q:v", "7", pattern,
         ],
         capture_output=True,
-        timeout=30,
+        timeout=EXTRACT_RECIPE_TIMEOUT,
     )
     if result.returncode != 0:
         return []
@@ -6100,7 +6102,7 @@ def _resize_image_bytes_to_jpeg_data_url(image_bytes: bytes) -> str:
                 out_path,
             ],
             capture_output=True,
-            timeout=12,
+            timeout=EXTRACT_RECIPE_TIMEOUT,
         )
         if result.returncode != 0 or not os.path.exists(out_path):
             encoded = base64.b64encode(image_bytes).decode("utf-8")
@@ -6148,7 +6150,7 @@ def _resolve_tiktok_short_url(url: str) -> str:
             url,
             headers=_slideshow_request_headers(),
             allow_redirects=True,
-            timeout=15,
+            timeout=EXTRACT_RECIPE_TIMEOUT,
         )
         return resp.url or url
     except Exception as e:
@@ -6229,7 +6231,7 @@ def _fetch_tiktok_photo_slideshow(url: str) -> tuple[list[str], dict] | None:
         url,
         headers=_slideshow_request_headers(),
         allow_redirects=True,
-        timeout=12,
+        timeout=EXTRACT_RECIPE_TIMEOUT,
     )
     resp.raise_for_status()
     html = resp.text
@@ -6301,7 +6303,7 @@ def _fetch_image_data_urls(image_urls: list[str]) -> list[str]:
     headers = _slideshow_request_headers()
 
     def _download_one(remote_url: str) -> str:
-        resp = requests.get(remote_url, headers=headers, timeout=12)
+        resp = requests.get(remote_url, headers=headers, timeout=EXTRACT_RECIPE_TIMEOUT)
         resp.raise_for_status()
         return _resize_image_bytes_to_jpeg_data_url(resp.content)
 

@@ -3062,6 +3062,19 @@ def extract_recipe_from_video():
 
         print(f"🎥 Processing video URL: {video_url}")
 
+        if is_youtube_url(video_url):
+            try:
+                info = _yt_meta(video_url)
+                _assert_youtube_shorts_duration((info or {}).get("duration"))
+            except YouTubeVideoTooLongError as e:
+                return _youtube_too_long_response(e)
+            except Exception as e:
+                return jsonify({
+                    "error": "Video metadata failed",
+                    "user_message": "We couldn't read this video. Please try another link or add the recipe manually.",
+                    "details": str(e),
+                }), 500
+
         # 1) Download + extract audio
         t0 = time.time()
         try:
@@ -3398,6 +3411,57 @@ def is_youtube_url(url: str) -> bool:
         return False
     host = (urlparse(url).hostname or "").lower()
     return any(host == d or host.endswith("." + d) for d in {"youtube.com", "www.youtube.com", "youtu.be"})
+
+
+class YouTubeVideoTooLongError(Exception):
+    """Raised when a YouTube video exceeds the Shorts duration limit."""
+
+    def __init__(self, duration: float, max_seconds: int | None = None):
+        self.duration = float(duration)
+        self.max_seconds = max_seconds if max_seconds is not None else _youtube_shorts_max_seconds()
+        super().__init__(
+            f"YouTube video too long ({self.duration:.0f}s). "
+            f"Only Shorts under {self.max_seconds}s are supported."
+        )
+
+
+def _youtube_shorts_max_seconds() -> int:
+    try:
+        return max(1, int(os.getenv("YOUTUBE_SHORTS_MAX_SECONDS", "180")))
+    except ValueError:
+        return 180
+
+
+def _youtube_max_duration_label(seconds: int) -> str:
+    if seconds >= 60 and seconds % 60 == 0:
+        mins = seconds // 60
+        return f"{mins} minute{'s' if mins != 1 else ''}"
+    return f"{seconds} seconds"
+
+
+def _assert_youtube_shorts_duration(duration) -> None:
+    """Reject YouTube videos longer than the Shorts limit (default 180s)."""
+    cap = _youtube_shorts_max_seconds()
+    try:
+        dur = float(duration or 0)
+    except (TypeError, ValueError):
+        return
+    if dur > 0 and dur > cap:
+        raise YouTubeVideoTooLongError(dur, cap)
+
+
+def _youtube_too_long_response(exc: YouTubeVideoTooLongError):
+    limit = _youtube_max_duration_label(exc.max_seconds)
+    msg = (
+        f"Only YouTube Shorts are allowed. Videos must be {limit} or shorter. "
+        "Please try a Shorts link or add the recipe manually."
+    )
+    return jsonify({
+        "error": "Only YouTube Shorts allowed",
+        "message": msg,
+        "user_message": msg,
+        "details": str(exc),
+    }), 413
 
 
 def determine_source_type(url: str) -> str:
@@ -5036,10 +5100,12 @@ def _transcribe_youtube_audio(video_url: str, meta: dict) -> str:
     return _transcribe_audio_bytes(audio_bytes)
 
 
-def _fetch_youtube_transcript(video_url: str) -> tuple[str, dict]:
+def _fetch_youtube_transcript(video_url: str, *, meta: dict | None = None) -> tuple[str, dict]:
     """Fast YouTube path: captions first, bounded Whisper fallback. No video download."""
-    info = _yt_meta(video_url)
-    meta = _video_meta_from_yt_info(info, video_url)
+    if meta is None:
+        info = _yt_meta(video_url)
+        meta = _video_meta_from_yt_info(info, video_url)
+    _assert_youtube_shorts_duration(meta.get("duration"))
 
     t0 = time.time()
     caption_text = _fetch_youtube_caption_transcript(video_url)
@@ -6433,6 +6499,21 @@ def extract_recipe_from_video_internal(video_url: str):
     if tiktok_photo_resp is not None:
         return tiktok_photo_resp
 
+    yt_prefetched_meta: dict | None = None
+    if is_youtube_url(video_url):
+        try:
+            info = _yt_meta(video_url)
+            yt_prefetched_meta = _video_meta_from_yt_info(info, video_url)
+            _assert_youtube_shorts_duration(yt_prefetched_meta.get("duration"))
+        except YouTubeVideoTooLongError as e:
+            return _youtube_too_long_response(e)
+        except Exception as e:
+            return jsonify({
+                "error": "Video metadata failed",
+                "user_message": "We couldn't read this video. Please try another link or add the recipe manually.",
+                "details": str(e),
+            }), 500
+
     temp_dir = None
     video_path = None
     meta: dict = {}
@@ -6560,7 +6641,11 @@ def extract_recipe_from_video_internal(video_url: str):
             print("⚡ YouTube fast path (captions → bounded Whisper)")
             t_yt = time.time()
             try:
-                transcript_text, meta = _fetch_youtube_transcript(video_url)
+                transcript_text, meta = _fetch_youtube_transcript(
+                    video_url, meta=yt_prefetched_meta
+                )
+            except YouTubeVideoTooLongError as e:
+                return _youtube_too_long_response(e)
             except ValueError as ve:
                 return jsonify({"error": str(ve)}), 413
             except Exception as e:

@@ -4907,6 +4907,43 @@ def _build_video_recipe_source(video_url: str, meta: dict, recipe: dict) -> dict
     }
 
 
+def _video_meta_from_yt_info(info: dict, video_url: str) -> dict:
+    return {
+        "duration": info.get("duration"),
+        "title": info.get("title") or "",
+        "description": info.get("description") or "",
+        "provider": (urlparse(video_url).hostname or ""),
+        "extractor": info.get("extractor_key") or info.get("extractor") or "",
+        "webpage_url": info.get("webpage_url") or video_url,
+        "thumbnail": info.get("thumbnail"),
+    }
+
+
+def _social_vision_max_download_seconds(meta: dict, url: str) -> int | None:
+    """Cap IG/TikTok video bytes downloaded for frame extraction (recipe text is usually early)."""
+    try:
+        cap = int(os.getenv("EXTRACT_RECIPE_SOCIAL_VISION_MAX_SECONDS", "45"))
+    except ValueError:
+        cap = 45
+    if cap <= 0:
+        return None
+    lowered = (url or "").lower()
+    if "tiktok.com" not in lowered and "instagram.com" not in lowered:
+        return None
+    duration = float(meta.get("duration") or 0)
+    if duration > cap:
+        return cap
+    return None
+
+
+def _effective_vision_duration(meta: dict, url: str) -> float:
+    duration = float(meta.get("duration") or 0)
+    cap = _social_vision_max_download_seconds(meta, url)
+    if cap and duration > cap:
+        return float(cap)
+    return duration
+
+
 def _prefer_vision_first_for_video_url(url: str) -> bool:
     """IG/TikTok reels are usually music + on-screen text — skip slow transcribe path."""
     if (os.getenv("EXTRACT_RECIPE_SOCIAL_VISION_FIRST") or "1").strip().lower() in ("0", "false", "no"):
@@ -4984,12 +5021,13 @@ def _merge_video_download_meta(video_url: str, video_meta: dict | None, audio_me
     return meta
 
 
-def _download_video_to_file(video_url: str, *, fast: bool = False):
+def _download_video_to_file(video_url: str, *, fast: bool = False, max_seconds: int | None = None):
     """
     Download video (not just audio) to a temp file for frame extraction.
     Uses a single yt-dlp call (extract_info + download=True) to avoid the
     redundant separate metadata round-trip from _yt_meta().
     fast=True prefers ≤480p for quicker social-reel downloads (vision only needs rough frames).
+    max_seconds: when set, only download the first N seconds (for long social reels).
     Returns: (temp_dir, video_path, meta_dict). Caller must shutil.rmtree(temp_dir) when done.
     """
     temp_dir = tempfile.mkdtemp()
@@ -5017,6 +5055,8 @@ def _download_video_to_file(video_url: str, *, fast: bool = False):
         _proxy = _ytdlp_proxy(video_url)
         if _proxy:
             ydl_opts["proxy"] = _proxy
+        if max_seconds and max_seconds > 0:
+            ydl_opts["download_sections"] = [f"*0-{int(max_seconds)}"]
 
         # Single call: fetches metadata AND downloads in one network session
         info = _ydl_extract(ydl_opts, video_url, download=True)
@@ -5034,15 +5074,10 @@ def _download_video_to_file(video_url: str, *, fast: bool = False):
         if not candidates:
             raise RuntimeError("No video file produced by yt-dlp")
         video_path = os.path.join(temp_dir, candidates[0])
-        meta = {
-            "duration": duration,
-            "title": title,
-            "description": info.get("description") or "",
-            "provider": (urlparse(video_url).hostname or ""),
-            "extractor": extractor,
-            "webpage_url": webpage_url,
-            "thumbnail": thumbnail,
-        }
+        meta = _video_meta_from_yt_info(info, video_url)
+        if max_seconds and duration and duration > max_seconds:
+            meta["vision_duration"] = float(max_seconds)
+            print(f"⚡ Partial video download: first {max_seconds}s of {duration}s")
         return temp_dir, video_path, meta
     except Exception:
         shutil.rmtree(temp_dir, ignore_errors=True)
@@ -5704,18 +5739,19 @@ def _extract_frames_batch_ffmpeg(
 ) -> list[str]:
     """Single ffmpeg pass — faster than N separate subprocess calls on short reels."""
     pattern = os.path.join(out_dir, "frame_%02d.jpg")
+    w = _frame_jpeg_max_width()
     if duration_sec and duration_sec > 0:
-        vf = f"fps={num_frames / duration_sec}"
+        vf = f"fps={num_frames / duration_sec},scale={w}:-1"
     else:
-        vf = "fps=1/5"
+        vf = f"fps=1/5,scale={w}:-1"
     result = subprocess.run(
         [
             "ffmpeg", "-y", "-i", video_path,
             "-vf", vf, "-frames:v", str(num_frames),
-            "-q:v", "4", pattern,
+            "-q:v", "7", pattern,
         ],
         capture_output=True,
-        timeout=45,
+        timeout=30,
     )
     if result.returncode != 0:
         return []
@@ -5853,7 +5889,7 @@ def _run_frame_vision_fallback_from_path(
     Returns (recipe_dict, source_dict, extraction_method) or (None, None, None) on failure.
     """
     try:
-        duration = meta.get("duration") or 0
+        duration = float(meta.get("vision_duration") or meta.get("duration") or 0)
         n_frames = _video_frames_for_duration(duration)
         print(f"🎬 Vision fallback: extracting {n_frames} frame(s) from {duration}s video")
         frame_urls = _extract_frame_data_urls_from_video(
@@ -6284,30 +6320,21 @@ def extract_recipe_from_video_internal(video_url: str):
                 vision_result["error"] = str(e)
             vision_result["done"] = True
 
-        # IG/TikTok reels: skip audio download + transcribe (~3s) and go straight to vision
+        # IG/TikTok reels: metadata first → caption if available → partial download for vision
         if _prefer_vision_first_for_video_url(video_url):
             print("⚡ Vision-first mode (social reel)")
             t0 = time.time()
             try:
-                temp_dir, video_path, meta = _download_video_to_file(video_url, fast=True)
-            except ValueError as ve:
-                return jsonify({"error": str(ve)}), 413
-            except yt_dlp.utils.DownloadError as de:
-                slideshow_resp = _try_slideshow_fallback_on_download_error(video_url, url_key)
-                if slideshow_resp is not None:
-                    return slideshow_resp
-                return jsonify({
-                    "error": "Failed to download video",
-                    "details": str(de),
-                    "hint": "For Instagram/TikTok, set YTDLP_COOKIES_FILE or YTDLP_COOKIES_B64.",
-                }), 400
+                info = _yt_meta(video_url)
+                meta = _video_meta_from_yt_info(info, video_url)
             except Exception as e:
                 return jsonify({
-                    "error": "Video download failed",
-                    "user_message": "We couldn't download this video. Please try another link or add the recipe manually.",
+                    "error": "Video metadata failed",
+                    "user_message": "We couldn't read this video. Please try another link or add the recipe manually.",
                     "details": str(e),
                 }), 500
-            print(f"✅ Video downloaded in {time.time() - t0:.2f}s (vision-first)")
+            print(f"📋 Metadata fetched in {time.time() - t0:.2f}s")
+
             extraction_method = "caption_llm"
             recipe = None
             source = None
@@ -6318,11 +6345,38 @@ def extract_recipe_from_video_internal(video_url: str):
                 print(f"📝 Caption LLM finished in {time.time() - t_cap:.2f}s")
                 if _recipe_has_usable_content(recipe):
                     source = _build_video_recipe_source(video_url, meta, recipe)
+
             if not _recipe_has_usable_content(recipe):
+                max_sec = _social_vision_max_download_seconds(meta, video_url)
+                t_dl = time.time()
+                try:
+                    temp_dir, video_path, dl_meta = _download_video_to_file(
+                        video_url, fast=True, max_seconds=max_sec
+                    )
+                    meta.update(dl_meta)
+                except ValueError as ve:
+                    return jsonify({"error": str(ve)}), 413
+                except yt_dlp.utils.DownloadError as de:
+                    slideshow_resp = _try_slideshow_fallback_on_download_error(video_url, url_key)
+                    if slideshow_resp is not None:
+                        return slideshow_resp
+                    return jsonify({
+                        "error": "Failed to download video",
+                        "details": str(de),
+                        "hint": "For Instagram/TikTok, set YTDLP_COOKIES_FILE or YTDLP_COOKIES_B64.",
+                    }), 400
+                except Exception as e:
+                    return jsonify({
+                        "error": "Video download failed",
+                        "user_message": "We couldn't download this video. Please try another link or add the recipe manually.",
+                        "details": str(e),
+                    }), 500
+                print(f"✅ Video downloaded in {time.time() - t_dl:.2f}s (vision-first)")
                 _run_vision()
                 recipe = vision_result.get("recipe")
                 source = vision_result.get("source")
                 extraction_method = vision_result.get("method") or "video_frames_vision"
+
             if recipe and source and _recipe_has_usable_content(recipe):
                 _enrich_recipe_response(recipe)
                 tags = extract_recipe_tags(recipe)

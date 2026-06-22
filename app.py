@@ -4919,6 +4919,141 @@ def _video_meta_from_yt_info(info: dict, video_url: str) -> dict:
     }
 
 
+def _youtube_captions_enabled() -> bool:
+    return (os.getenv("EXTRACT_RECIPE_YOUTUBE_CAPTIONS_FIRST") or "1").strip().lower() not in (
+        "0", "false", "no",
+    )
+
+
+def _vtt_to_plain_text(vtt: str) -> str:
+    """Convert YouTube WebVTT captions to plain transcript text."""
+    lines: list[str] = []
+    for raw in vtt.splitlines():
+        line = raw.strip()
+        if not line or line == "WEBVTT" or "-->" in line:
+            continue
+        if line.startswith(("Kind:", "Language:", "NOTE")):
+            continue
+        if re.match(r"^\d+$", line):
+            continue
+        if re.search(r"<\d{2}:\d{2}", line):
+            continue
+        line = re.sub(r"<[^>]+>", "", line)
+        line = re.sub(r"\s+", " ", line).strip()
+        if not line or re.fullmatch(r"\[[^\]]+\]", line):
+            continue
+        if lines and lines[-1] == line:
+            continue
+        if lines and line.startswith(lines[-1]) and len(line) > len(lines[-1]):
+            lines[-1] = line
+            continue
+        if lines and lines[-1].startswith(line) and len(lines[-1]) > len(line):
+            continue
+        lines.append(line)
+    return " ".join(lines)
+
+
+def _fetch_youtube_caption_transcript(video_url: str) -> str | None:
+    """Download YouTube manual/auto captions via yt-dlp (~2s vs minutes of audio+Whisper)."""
+    if not _youtube_captions_enabled():
+        return None
+    temp_dir = tempfile.mkdtemp()
+    try:
+        ydl_opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "skip_download": True,
+            "writesubtitles": True,
+            "writeautomaticsub": True,
+            "subtitleslangs": ["en", "en-US", "en-GB"],
+            "subtitlesformat": "vtt/best",
+            "outtmpl": os.path.join(temp_dir, "%(id)s"),
+            "noplaylist": True,
+            "extractor_args": {"youtube": _yt_extractor_args()},
+        }
+        _proxy = _ytdlp_proxy(video_url)
+        if _proxy:
+            ydl_opts["proxy"] = _proxy
+        _ydl_extract(ydl_opts, video_url, download=True)
+        vtt_files = sorted(f for f in os.listdir(temp_dir) if f.endswith(".vtt"))
+        if not vtt_files:
+            return None
+        with open(os.path.join(temp_dir, vtt_files[0]), encoding="utf-8", errors="ignore") as f:
+            text = _vtt_to_plain_text(f.read())
+        return text if len(text) >= MIN_TRANSCRIPT_LENGTH_FOR_VIDEO else None
+    except Exception as e:
+        print(f"⚠️ YouTube caption fetch failed: {e}")
+        return None
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def _youtube_whisper_max_seconds() -> int:
+    try:
+        return max(30, int(os.getenv("EXTRACT_RECIPE_YOUTUBE_WHISPER_MAX_SECONDS", "120")))
+    except ValueError:
+        return 120
+
+
+def _youtube_vision_max_seconds() -> int:
+    try:
+        return max(30, int(os.getenv("EXTRACT_RECIPE_YOUTUBE_VISION_MAX_SECONDS", "60")))
+    except ValueError:
+        return 60
+
+
+def _trim_youtube_transcript_for_llm(text: str) -> str:
+    """Bound very long caption transcripts so the recipe LLM stays fast."""
+    try:
+        cap = int(os.getenv("EXTRACT_RECIPE_YOUTUBE_TRANSCRIPT_MAX_CHARS", "12000"))
+    except ValueError:
+        cap = 12000
+    text = (text or "").strip()
+    if len(text) <= cap:
+        return text
+    return text[:cap].rstrip() + "\n[...truncated]"
+
+
+def _transcribe_youtube_audio(video_url: str, meta: dict) -> str:
+    """Whisper fallback for YouTube — only first N seconds on long videos."""
+    duration = float(meta.get("duration") or 0)
+    max_sec = _youtube_whisper_max_seconds()
+    if duration > max_sec:
+        print(f"⚡ YouTube bounded Whisper: first {max_sec}s of {duration:.0f}s")
+        temp_dir, video_path, _ = _download_video_to_file(
+            video_url, fast=True, max_seconds=max_sec
+        )
+        try:
+            audio_bytes = _extract_audio_from_video_file(video_path)
+            if audio_bytes:
+                return _transcribe_audio_bytes(audio_bytes)
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        return ""
+    audio_bytes, _ = download_audio_mp3(video_url)
+    return _transcribe_audio_bytes(audio_bytes)
+
+
+def _fetch_youtube_transcript(video_url: str) -> tuple[str, dict]:
+    """Fast YouTube path: captions first, bounded Whisper fallback. No video download."""
+    info = _yt_meta(video_url)
+    meta = _video_meta_from_yt_info(info, video_url)
+
+    t0 = time.time()
+    caption_text = _fetch_youtube_caption_transcript(video_url)
+    if caption_text and not _is_likely_non_speech(caption_text):
+        meta["transcript_source"] = "youtube_captions"
+        print(f"📝 YouTube captions fetched in {time.time() - t0:.2f}s ({len(caption_text)} chars)")
+        return caption_text, meta
+
+    print("🎤 YouTube captions unavailable; falling back to bounded audio+Whisper...")
+    t1 = time.time()
+    transcript_text = _transcribe_youtube_audio(video_url, meta)
+    meta["transcript_source"] = "whisper"
+    print(f"🎤 YouTube Whisper transcript in {time.time() - t1:.2f}s ({len(transcript_text)} chars)")
+    return transcript_text, meta
+
+
 def _social_vision_max_download_seconds(meta: dict, url: str) -> int | None:
     """Cap IG/TikTok video bytes downloaded for frame extraction (recipe text is usually early)."""
     try:
@@ -6304,11 +6439,30 @@ def extract_recipe_from_video_internal(video_url: str):
         print(f"🎥 Processing video URL: {video_url}")
 
         def _run_vision():
+            nonlocal temp_dir, video_path, meta
             if vision_result.get("done"):
                 return
             if not video_path:
-                print("🎬 Vision fallback skipped: no video file")
-                return
+                try:
+                    max_sec = None
+                    if is_youtube_url(video_url):
+                        duration = float(meta.get("duration") or 0)
+                        cap = _youtube_vision_max_seconds()
+                        if duration > cap:
+                            max_sec = cap
+                    else:
+                        max_sec = _social_vision_max_download_seconds(meta, video_url)
+                    print("🎬 Vision fallback: downloading video...")
+                    t_vdl = time.time()
+                    temp_dir, video_path, dl_meta = _download_video_to_file(
+                        video_url, fast=True, max_seconds=max_sec
+                    )
+                    meta = _merge_video_download_meta(video_url, meta, dl_meta)
+                    print(f"🎬 Vision video ready in {time.time() - t_vdl:.2f}s")
+                except Exception as e:
+                    vision_result["error"] = str(e)
+                    vision_result["done"] = True
+                    return
             try:
                 t_v = time.time()
                 recipe, source, method = _run_frame_vision_fallback_from_path(video_path, video_url, meta)
@@ -6397,99 +6551,118 @@ def extract_recipe_from_video_internal(video_url: str):
                 "message": "Frame+vision extraction failed.",
             }), 500
 
-        # 1) Parallel: low-res video (for vision fallback) + audio-only (for fast transcription)
-        t0 = time.time()
-        audio_dl: dict = {}
-        video_dl: dict = {}
-
-        def _dl_audio():
-            try:
-                audio_dl["bytes"], audio_dl["meta"] = download_audio_mp3(video_url)
-            except Exception as e:
-                audio_dl["error"] = e
-
-        def _dl_video():
-            try:
-                video_dl["temp_dir"], video_dl["path"], video_dl["meta"] = _download_video_to_file(
-                    video_url, fast=True
-                )
-            except Exception as e:
-                video_dl["error"] = e
-
         transcript_text = ""
+        transcript_extraction_method = "transcript_llm"
 
-        def _transcribe_when_audio_ready():
-            nonlocal transcript_text
-            _dl_audio()
+        if is_youtube_url(video_url):
+            print("⚡ YouTube fast path (captions → bounded Whisper)")
+            t_yt = time.time()
             try:
-                audio_bytes = audio_dl.get("bytes")
-                if audio_bytes:
-                    transcript_text = _transcribe_audio_bytes(audio_bytes)
+                transcript_text, meta = _fetch_youtube_transcript(video_url)
+            except ValueError as ve:
+                return jsonify({"error": str(ve)}), 413
             except Exception as e:
-                print(f"⚠️ Transcription failed: {e}")
-
-        t1 = time.time()
-        with ThreadPoolExecutor(max_workers=3) as executor:
-            fv = executor.submit(_dl_video)
-            ft = executor.submit(_transcribe_when_audio_ready)
-            fv.result()
-            ft.result()
-        print(f"🎤 Transcription finished in {time.time() - t1:.2f}s")
-
-        if audio_dl.get("error") and video_dl.get("error"):
-            de = video_dl["error"]
-            if isinstance(de, yt_dlp.utils.DownloadError):
-                slideshow_resp = _try_slideshow_fallback_on_download_error(video_url, url_key)
-                if slideshow_resp is not None:
-                    return slideshow_resp
-                error_str = str(de)
-                lowered_url = video_url.lower()
-                is_instagram = "instagram.com" in lowered_url
-                is_facebook = ("facebook.com" in lowered_url) or ("fb.watch" in lowered_url) or ("fb.com" in lowered_url)
-                cookies_configured = (YTDLP_COOKIES_FILE and os.path.exists(YTDLP_COOKIES_FILE)) or YTDLP_COOKIES_B64
-                if is_instagram:
-                    if not cookies_configured:
-                        hint = "Instagram requires authentication. Please set YTDLP_COOKIES_FILE or YTDLP_COOKIES_B64."
-                    elif "empty media response" in error_str.lower() or "unavailable" in error_str.lower():
-                        hint = "Instagram post may be private or cookies may be expired."
-                    else:
-                        hint = "Instagram extraction failed. The post may be private or require fresh cookies."
-                elif is_facebook:
-                    if not cookies_configured:
-                        hint = "Facebook often requires authentication. Please set YTDLP_COOKIES_FILE or YTDLP_COOKIES_B64."
-                    elif "private" in error_str.lower() or "unavailable" in error_str.lower() or "login" in error_str.lower():
-                        hint = "Facebook post may be private/restricted or cookies may be expired."
-                    else:
-                        hint = "Facebook extraction failed. The post may be private or require fresh cookies."
-                else:
-                    hint = "For TikTok/Instagram/Facebook (and some YouTube), set YTDLP_COOKIES_FILE."
                 return jsonify({
-                    "error": "Failed to download video",
-                    "details": error_str,
-                    "hint": hint,
-                    "cookies_configured": cookies_configured,
-                }), 400
-            if isinstance(de, ValueError):
-                return jsonify({"error": str(de)}), 413
-            return jsonify({
-                "error": "Video download failed",
-                "user_message": "We couldn't download this video. Please try another link or add the recipe manually.",
-                "details": str(de),
-            }), 500
+                    "error": "YouTube transcript failed",
+                    "user_message": "We couldn't read this video. Please try another link or add the recipe manually.",
+                    "details": str(e),
+                }), 500
+            if meta.get("transcript_source") == "youtube_captions":
+                transcript_extraction_method = "youtube_captions_llm"
+            transcript_text = _trim_youtube_transcript_for_llm(transcript_text)
+            print(f"✅ YouTube transcript path finished in {time.time() - t_yt:.2f}s")
+        else:
+            # 1) Parallel: low-res video (for vision fallback) + audio-only (for fast transcription)
+            t0 = time.time()
+            audio_dl: dict = {}
+            video_dl: dict = {}
 
-        temp_dir = video_dl.get("temp_dir")
-        video_path = video_dl.get("path")
-        meta = _merge_video_download_meta(video_url, video_dl.get("meta"), audio_dl.get("meta"))
-        print(f"✅ Downloads finished in {time.time() - t0:.2f}s (audio={'ok' if audio_dl.get('bytes') else 'skip'}, video={'ok' if video_path else 'skip'})")
+            def _dl_audio():
+                try:
+                    audio_dl["bytes"], audio_dl["meta"] = download_audio_mp3(video_url)
+                except Exception as e:
+                    audio_dl["error"] = e
 
-        # 2) Fallback: extract audio from video file if audio-only download failed
-        if not transcript_text and video_path:
-            try:
-                audio_bytes = _extract_audio_from_video_file(video_path)
-                if audio_bytes:
-                    transcript_text = _transcribe_audio_bytes(audio_bytes)
-            except Exception as e:
-                print(f"⚠️ Transcription from video file failed: {e}")
+            def _dl_video():
+                try:
+                    video_dl["temp_dir"], video_dl["path"], video_dl["meta"] = _download_video_to_file(
+                        video_url, fast=True
+                    )
+                except Exception as e:
+                    video_dl["error"] = e
+
+            def _transcribe_when_audio_ready():
+                nonlocal transcript_text
+                _dl_audio()
+                try:
+                    audio_bytes = audio_dl.get("bytes")
+                    if audio_bytes:
+                        transcript_text = _transcribe_audio_bytes(audio_bytes)
+                except Exception as e:
+                    print(f"⚠️ Transcription failed: {e}")
+
+            t1 = time.time()
+            with ThreadPoolExecutor(max_workers=3) as executor:
+                fv = executor.submit(_dl_video)
+                ft = executor.submit(_transcribe_when_audio_ready)
+                fv.result()
+                ft.result()
+            print(f"🎤 Transcription finished in {time.time() - t1:.2f}s")
+
+            if audio_dl.get("error") and video_dl.get("error"):
+                de = video_dl["error"]
+                if isinstance(de, yt_dlp.utils.DownloadError):
+                    slideshow_resp = _try_slideshow_fallback_on_download_error(video_url, url_key)
+                    if slideshow_resp is not None:
+                        return slideshow_resp
+                    error_str = str(de)
+                    lowered_url = video_url.lower()
+                    is_instagram = "instagram.com" in lowered_url
+                    is_facebook = ("facebook.com" in lowered_url) or ("fb.watch" in lowered_url) or ("fb.com" in lowered_url)
+                    cookies_configured = (YTDLP_COOKIES_FILE and os.path.exists(YTDLP_COOKIES_FILE)) or YTDLP_COOKIES_B64
+                    if is_instagram:
+                        if not cookies_configured:
+                            hint = "Instagram requires authentication. Please set YTDLP_COOKIES_FILE or YTDLP_COOKIES_B64."
+                        elif "empty media response" in error_str.lower() or "unavailable" in error_str.lower():
+                            hint = "Instagram post may be private or cookies may be expired."
+                        else:
+                            hint = "Instagram extraction failed. The post may be private or require fresh cookies."
+                    elif is_facebook:
+                        if not cookies_configured:
+                            hint = "Facebook often requires authentication. Please set YTDLP_COOKIES_FILE or YTDLP_COOKIES_B64."
+                        elif "private" in error_str.lower() or "unavailable" in error_str.lower() or "login" in error_str.lower():
+                            hint = "Facebook post may be private/restricted or cookies may be expired."
+                        else:
+                            hint = "Facebook extraction failed. The post may be private or require fresh cookies."
+                    else:
+                        hint = "For TikTok/Instagram/Facebook (and some YouTube), set YTDLP_COOKIES_FILE."
+                    return jsonify({
+                        "error": "Failed to download video",
+                        "details": error_str,
+                        "hint": hint,
+                        "cookies_configured": cookies_configured,
+                    }), 400
+                if isinstance(de, ValueError):
+                    return jsonify({"error": str(de)}), 413
+                return jsonify({
+                    "error": "Video download failed",
+                    "user_message": "We couldn't download this video. Please try another link or add the recipe manually.",
+                    "details": str(de),
+                }), 500
+
+            temp_dir = video_dl.get("temp_dir")
+            video_path = video_dl.get("path")
+            meta = _merge_video_download_meta(video_url, video_dl.get("meta"), audio_dl.get("meta"))
+            print(f"✅ Downloads finished in {time.time() - t0:.2f}s (audio={'ok' if audio_dl.get('bytes') else 'skip'}, video={'ok' if video_path else 'skip'})")
+
+            # 2) Fallback: extract audio from video file if audio-only download failed
+            if not transcript_text and video_path:
+                try:
+                    audio_bytes = _extract_audio_from_video_file(video_path)
+                    if audio_bytes:
+                        transcript_text = _transcribe_audio_bytes(audio_bytes)
+                except Exception as e:
+                    print(f"⚠️ Transcription from video file failed: {e}")
 
         has_usable_transcript = transcript_text and not _is_likely_non_speech(transcript_text)
 
@@ -6632,7 +6805,7 @@ def extract_recipe_from_video_internal(video_url: str):
             "recipe": recipe,
             "tags": tags,
             "transcript": transcript_text,
-            "extraction": {"method": "transcript_llm", "confidence": 0.55},
+            "extraction": {"method": transcript_extraction_method, "confidence": 0.55},
             "meta": meta,
         }
         with _recipe_cache_lock:

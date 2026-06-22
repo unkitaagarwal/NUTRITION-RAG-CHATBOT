@@ -4791,6 +4791,7 @@ def _download_audio_mp3(video_url: str):
         meta = {
             "duration": duration,
             "title": title,
+            "description": info.get("description") or "",
             "provider": (urlparse(video_url).hostname or ""),
             "extractor": extractor,
             "webpage_url": webpage_url,
@@ -4820,6 +4821,90 @@ def _video_frames_for_duration(duration_sec: float | None) -> int:
     if duration_sec <= 45:
         return min(2, cap)
     return cap
+
+
+def _normalize_extracted_recipe(recipe: dict) -> dict:
+    ingredients = recipe.get("ingredients") or []
+    instructions = recipe.get("instructions") or []
+    if ingredients and isinstance(ingredients[0], str):
+        ingredients = [{"name": ing, "quantity": ""} for ing in ingredients]
+    if not isinstance(instructions, list):
+        instructions = [str(instructions)]
+    recipe["ingredients"] = ingredients
+    recipe["instructions"] = instructions
+    return recipe
+
+
+def _recipe_has_usable_content(recipe: dict | None) -> bool:
+    if not recipe:
+        return False
+    instructions = recipe.get("instructions") or []
+    if any(str(step).strip() for step in instructions):
+        return True
+    ingredients = recipe.get("ingredients") or []
+    for ing in ingredients:
+        if isinstance(ing, dict):
+            if (ing.get("name") or "").strip():
+                return True
+        elif str(ing).strip():
+            return True
+    return bool((recipe.get("name") or "").strip())
+
+
+def _video_caption_text(meta: dict) -> str:
+    """Best available post caption/description from yt-dlp metadata."""
+    description = (meta.get("description") or "").strip()
+    title = (meta.get("title") or "").strip()
+    if description and len(description) >= len(title):
+        return description
+    if title and description and description not in title and title not in description:
+        return f"{title}\n\n{description}"
+    return description or title
+
+
+def _caption_looks_like_recipe(text: str) -> bool:
+    if len(text) < 50:
+        return False
+    lowered = text.lower()
+    signals = (
+        "ingredient", "cup", "cups", "tbsp", "tsp", "tablespoon", "teaspoon",
+        "step", "layer", "mix", "bake", "cook", "grams", "ounce", "oz ",
+    )
+    return sum(1 for signal in signals if signal in lowered) >= 2
+
+
+def _extract_recipe_from_video_caption(meta: dict) -> dict | None:
+    """Parse recipe from social post caption when vision/transcript miss on-screen text."""
+    caption = _video_caption_text(meta)
+    if not _caption_looks_like_recipe(caption):
+        return None
+    try:
+        recipe = _extract_recipe_chunk(caption)
+        return _normalize_extracted_recipe(recipe)
+    except Exception as e:
+        print(f"⚠️ Caption recipe extraction failed: {e}")
+        return None
+
+
+def _prefer_caption_for_social_video(meta: dict, url: str) -> bool:
+    """TikTok/IG creators often put the full recipe in the post caption."""
+    if (os.getenv("EXTRACT_RECIPE_SOCIAL_CAPTION_FIRST") or "1").strip().lower() in ("0", "false", "no"):
+        return False
+    lowered = (url or "").lower()
+    if "tiktok.com" not in lowered and "instagram.com" not in lowered:
+        return False
+    return _caption_looks_like_recipe(_video_caption_text(meta))
+
+
+def _build_video_recipe_source(video_url: str, meta: dict, recipe: dict) -> dict:
+    return {
+        "type": "video",
+        "url": video_url,
+        "provider": meta.get("provider", ""),
+        "title": meta.get("title", "") or recipe.get("name", ""),
+        "image": meta.get("thumbnail"),
+        "source_type": determine_source_type(video_url),
+    }
 
 
 def _prefer_vision_first_for_video_url(url: str) -> bool:
@@ -4891,6 +4976,8 @@ def _merge_video_download_meta(video_url: str, video_meta: dict | None, audio_me
         meta["duration"] = audio_meta["duration"]
     if not meta.get("title") and audio_meta.get("title"):
         meta["title"] = audio_meta["title"]
+    if not meta.get("description") and audio_meta.get("description"):
+        meta["description"] = audio_meta["description"]
     meta.setdefault("provider", urlparse(video_url).hostname or "")
     if not meta.get("extractor") and audio_meta.get("source"):
         meta["extractor"] = audio_meta["source"]
@@ -4950,6 +5037,7 @@ def _download_video_to_file(video_url: str, *, fast: bool = False):
         meta = {
             "duration": duration,
             "title": title,
+            "description": info.get("description") or "",
             "provider": (urlparse(video_url).hostname or ""),
             "extractor": extractor,
             "webpage_url": webpage_url,
@@ -5737,25 +5825,18 @@ def _run_frame_vision_fallback(video_url: str, meta: dict) -> tuple[dict | None,
         if not frame_urls:
             return None, None, None
         recipe = extract_recipe_from_video_frames_llm(frame_urls)
-        if not recipe:
+        method = "video_frames_vision"
+        if recipe:
+            recipe = _normalize_extracted_recipe(recipe)
+        if not _recipe_has_usable_content(recipe):
+            caption_recipe = _extract_recipe_from_video_caption(video_meta)
+            if _recipe_has_usable_content(caption_recipe):
+                recipe = caption_recipe
+                method = "caption_llm"
+        if not _recipe_has_usable_content(recipe):
             return None, None, None
-        ingredients = recipe.get("ingredients") or []
-        instructions = recipe.get("instructions") or []
-        if ingredients and isinstance(ingredients[0], str):
-            ingredients = [{"name": ing, "quantity": ""} for ing in ingredients]
-        if not isinstance(instructions, list):
-            instructions = [str(instructions)]
-        recipe["ingredients"] = ingredients
-        recipe["instructions"] = instructions
-        source = {
-            "type": "video",
-            "url": video_url,
-            "provider": video_meta.get("provider", ""),
-            "title": video_meta.get("title", "") or recipe.get("name", ""),
-            "image": video_meta.get("thumbnail"),
-            "source_type": determine_source_type(video_url),
-        }
-        return recipe, source, "video_frames_vision"
+        source = _build_video_recipe_source(video_url, video_meta, recipe)
+        return recipe, source, method
     except Exception as e:
         print(f"⚠️ Frame+vision fallback failed: {e}")
         return None, None, None
@@ -5783,25 +5864,19 @@ def _run_frame_vision_fallback_from_path(
         t_llm = time.time()
         recipe = extract_recipe_from_video_frames_llm(frame_urls)
         print(f"🎬 Vision LLM finished in {time.time() - t_llm:.2f}s ({len(frame_urls)} frame(s))")
-        if not recipe:
+        method = "video_frames_vision"
+        if recipe:
+            recipe = _normalize_extracted_recipe(recipe)
+        if not _recipe_has_usable_content(recipe):
+            print("📝 Vision empty/sparse; trying post caption...")
+            caption_recipe = _extract_recipe_from_video_caption(meta)
+            if _recipe_has_usable_content(caption_recipe):
+                recipe = caption_recipe
+                method = "caption_llm"
+        if not _recipe_has_usable_content(recipe):
             return None, None, None
-        ingredients = recipe.get("ingredients") or []
-        instructions = recipe.get("instructions") or []
-        if ingredients and isinstance(ingredients[0], str):
-            ingredients = [{"name": ing, "quantity": ""} for ing in ingredients]
-        if not isinstance(instructions, list):
-            instructions = [str(instructions)]
-        recipe["ingredients"] = ingredients
-        recipe["instructions"] = instructions
-        source = {
-            "type": "video",
-            "url": video_url,
-            "provider": meta.get("provider", ""),
-            "title": meta.get("title", "") or recipe.get("name", ""),
-            "image": meta.get("thumbnail"),
-            "source_type": determine_source_type(video_url),
-        }
-        return recipe, source, "video_frames_vision"
+        source = _build_video_recipe_source(video_url, meta, recipe)
+        return recipe, source, method
     except Exception as e:
         print(f"⚠️ Frame+vision fallback (from path) failed: {e}")
         return None, None, None
@@ -6233,11 +6308,22 @@ def extract_recipe_from_video_internal(video_url: str):
                     "details": str(e),
                 }), 500
             print(f"✅ Video downloaded in {time.time() - t0:.2f}s (vision-first)")
-            _run_vision()
-            recipe = vision_result.get("recipe")
-            source = vision_result.get("source")
-            extraction_method = vision_result.get("method")
-            if recipe and source:
+            extraction_method = "caption_llm"
+            recipe = None
+            source = None
+            if _prefer_caption_for_social_video(meta, video_url):
+                print("📝 Caption-first mode (social post description)")
+                t_cap = time.time()
+                recipe = _extract_recipe_from_video_caption(meta)
+                print(f"📝 Caption LLM finished in {time.time() - t_cap:.2f}s")
+                if _recipe_has_usable_content(recipe):
+                    source = _build_video_recipe_source(video_url, meta, recipe)
+            if not _recipe_has_usable_content(recipe):
+                _run_vision()
+                recipe = vision_result.get("recipe")
+                source = vision_result.get("source")
+                extraction_method = vision_result.get("method") or "video_frames_vision"
+            if recipe and source and _recipe_has_usable_content(recipe):
                 _enrich_recipe_response(recipe)
                 tags = extract_recipe_tags(recipe)
                 _result = {

@@ -3944,7 +3944,8 @@ def _get_image_data_urls_from_extract_request():
                 content_type = mime_for_filename(single.filename)
                 b64 = base64.b64encode(image_bytes).decode("utf-8")
                 return [f"data:{content_type};base64,{b64}"], None
-        return None, (jsonify({"error": "Uploaded image file is empty"}), 400)
+        # Empty multipart image field — fall through so URL-based extraction can proceed.
+        return None, None
 
     # JSON: images array or single imageBase64/image
     if request.is_json:
@@ -3979,6 +3980,27 @@ def _get_image_data_urls_from_extract_request():
             content_type = format_to_mime.get(image_format, "image/jpeg")
             return [f"data:{content_type};base64,{image_base64}"], None
     return None, None
+
+
+def _get_extract_recipe_url() -> str | None:
+    """Read recipe URL from JSON body or multipart/form fields (mobile clients vary)."""
+    data = request.get_json(silent=True) or {}
+    url = data.get("url") or data.get("videoUrl") or data.get("recipeUrl")
+    if not url:
+        url = (
+            request.form.get("url")
+            or request.form.get("videoUrl")
+            or request.form.get("recipeUrl")
+        )
+    if not url:
+        return None
+    return str(url).strip()
+
+
+def _get_extract_recipe_mode() -> str:
+    data = request.get_json(silent=True) or {}
+    mode = data.get("mode") or request.form.get("mode") or "auto"
+    return str(mode).lower()
 
 
 def extract_recipe_from_image_llm(image_data_url: str):
@@ -4690,12 +4712,15 @@ def bulk_import_recipes():
 
 @app.route("/extract-recipe", methods=["POST"])
 def extract_recipe():
-    # Image input: multipart (field 'image', single or multiple files) or JSON (imageBase64/images array)
+    url = _get_extract_recipe_url()
+    mode = _get_extract_recipe_mode()
+
+    # Image input: multipart (field 'image') or JSON (imageBase64/images array)
     image_data_urls, image_error = _get_image_data_urls_from_extract_request()
-    if image_error:
+    if image_error and not url:
         return image_error[0], image_error[1]
 
-    if image_data_urls:
+    if image_data_urls and not url:
         try:
             recipe = extract_recipe_from_images_llm(image_data_urls)
             _enrich_recipe_response(recipe)
@@ -4722,17 +4747,17 @@ def extract_recipe():
                 "details": str(e),
             }), 500
 
-    data = request.get_json(silent=True) or {}
-    url = data.get("url") or data.get("videoUrl") or data.get("recipeUrl")
-    mode = (data.get("mode") or "auto").lower()
-
     if not url:
-        return jsonify({"error": "url or image is required"}), 400
+        print(f"[extract-recipe] 400: missing url (content-type={request.content_type})")
+        return jsonify({
+            "error": "url or image is required",
+            "user_message": "Please provide a recipe URL or image.",
+        }), 400
 
-    # Use your existing SSRF validation here too
-    ok, err = validate_video_url(url)  # rename this to validate_url (works for all)
+    ok, err = validate_video_url(url)
     if not ok:
-        return jsonify({"error": err}), 400
+        print(f"[extract-recipe] 400: invalid url: {err}")
+        return jsonify({"error": err, "user_message": "That link doesn't look valid. Please check the URL."}), 400
 
     # Decide type
     url_is_video = is_video_url(url)
@@ -7112,10 +7137,16 @@ def extract_recipe_from_video_internal(video_url: str):
                     slideshow_resp = _try_slideshow_fallback_on_download_error(video_url, url_key)
                     if slideshow_resp is not None:
                         return slideshow_resp
+                    print(f"[extract-recipe] 400: video download failed for {video_url[:120]}: {str(de)[:200]}")
                     return jsonify({
                         "error": "Failed to download video",
+                        "user_message": "We couldn't download this video. Please try another link or add the recipe manually.",
                         "details": str(de),
                         "hint": "For Instagram/TikTok, set YTDLP_COOKIES_FILE or YTDLP_COOKIES_B64.",
+                        "cookies_configured": (
+                            (YTDLP_COOKIES_FILE and os.path.exists(YTDLP_COOKIES_FILE))
+                            or bool(YTDLP_COOKIES_B64)
+                        ),
                     }), 400
                 except Exception as e:
                     return jsonify({

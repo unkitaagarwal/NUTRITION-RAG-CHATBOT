@@ -5133,9 +5133,9 @@ def _social_video_frames_for_duration(url: str, duration_sec: float | None) -> i
     if not _is_social_video_url(url):
         return _video_frames_for_duration(duration_sec)
     try:
-        n = int(os.getenv("EXTRACT_RECIPE_SOCIAL_VIDEO_FRAMES", "6"))
+        n = int(os.getenv("EXTRACT_RECIPE_SOCIAL_VIDEO_FRAMES", "3"))
     except ValueError:
-        n = 6
+        n = 3
     return min(max(2, n), MAX_EXTRACT_RECIPE_IMAGES)
 
 
@@ -5200,34 +5200,112 @@ def _social_recipe_is_complete(recipe: dict | None) -> bool:
     return ing_count >= 3 and inst_count >= 2
 
 
+def _caption_has_instructions(caption: str) -> bool:
+    """True when the post caption text itself contains cooking steps (not just ingredients)."""
+    caption = (caption or "").strip()
+    if not caption:
+        return False
+    if re.search(r'(?:^|\n)\s*\d+[\.\):\-]\s+[A-Za-z]', caption, re.MULTILINE):
+        return True
+    if re.search(r'\bstep\s*\d+', caption, re.IGNORECASE):
+        return True
+    if re.search(r'\b(instructions?|directions?|method)\s*:', caption, re.IGNORECASE):
+        return True
+    action_starts = (
+        "mix ", "add ", "fry ", "bake ", "cook ", "heat ", "serve ", "combine ",
+        "stir ", "boil ", "simmer ", "coat ", "season ", "place ", "remove ",
+        "drain ", "slice ", "chop ", "melt ", "whisk ", "pour ", "spread ",
+        "reduce ", "toss ", "marinate ", "preheat ", "transfer ", "top ",
+        "pan-fry ", "deep fry ", "air fry ",
+    )
+    action_lines = 0
+    for line in caption.splitlines():
+        line = line.strip().lstrip("•-*▪→")
+        if len(line) < 12:
+            continue
+        lower = line.lower()
+        if re.match(r"^\d+[\.\)]\s", line):
+            action_lines += 1
+            continue
+        if any(lower.startswith(v) for v in action_starts):
+            action_lines += 1
+    return action_lines >= 2
+
+
 def _social_caption_recipe_acceptable(recipe: dict | None, caption: str) -> bool:
-    """Caption-first social posts must yield ingredients AND instructions, not a partial parse."""
+    """Caption-first: require steps present in source caption — never accept invented instructions."""
     if not _recipe_has_usable_content(recipe):
         return False
-    if not _social_recipe_is_complete(recipe):
-        ing_count = len(recipe.get("ingredients") or [])
-        inst_count = len(recipe.get("instructions") or [])
-        print(
-            f"⚠️ Caption extraction incomplete ({ing_count} ingredient(s), "
-            f"{inst_count} step(s)); will try vision"
+    caption = (caption or "").strip()
+    if not _caption_has_instructions(caption):
+        inst_count = sum(
+            1 for step in (recipe.get("instructions") or [])
+            if str(step).strip()
         )
+        if inst_count > 0:
+            print("⚠️ Rejecting caption result: instructions not in source caption (would be invented)")
+        else:
+            print("⚠️ Caption has ingredients only; will use vision for instructions")
         return False
-    return True
+    ing_count = sum(
+        1 for ing in (recipe.get("ingredients") or [])
+        if isinstance(ing, dict) and (ing.get("name") or "").strip()
+    )
+    inst_count = sum(
+        1 for step in (recipe.get("instructions") or [])
+        if str(step).strip()
+    )
+    cap_len = len(caption)
+    min_ing = 2 if cap_len >= 400 else 3
+    min_inst = 1 if cap_len >= 400 else 2
+    if ing_count >= min_ing and inst_count >= min_inst:
+        return True
+    print(
+        f"⚠️ Caption extraction incomplete ({ing_count} ingredient(s), "
+        f"{inst_count} step(s)); will try vision"
+    )
+    return False
 
 
 def _caption_has_full_recipe_text(caption: str) -> bool:
-    """True when yt-dlp post metadata likely contains the full recipe (not just hashtags)."""
+    """True when post metadata likely contains a full recipe (TikTok 'more' text, IG caption)."""
     caption = (caption or "").strip()
-    if len(caption) < 180:
+    if len(caption) < 120:
         return False
+    if len(caption) >= 280 and _caption_looks_like_recipe(caption):
+        return True
     if re.search(r'(?:^|\n)\s*\d+[\.\):\-]\s+\w', caption, re.MULTILINE | re.IGNORECASE):
         return True
+    if re.search(r'\bstep\s*\d+', caption, re.IGNORECASE):
+        return True
     qty_hits = len(re.findall(
-        r'\d+(?:\.\d+)?\s*(?:tbsp|tsp|tablespoons?|teaspoons?|cups?|cloves?|g\b|oz\b|ml\b)',
+        r'\d+(?:\.\d+)?\s*(?:tbsp|tsp|tablespoons?|teaspoons?|cups?|cloves?|g\b|gram|oz\b|ml\b|lb|pcs|pieces?)',
         caption,
         re.IGNORECASE,
     ))
-    return qty_hits >= 4
+    if qty_hits >= 3:
+        return True
+    if len(caption) >= 200 and qty_hits >= 2:
+        return True
+    return False
+
+
+def _should_try_social_caption_first(meta: dict, url: str) -> bool:
+    """Try caption LLM only when post text includes real steps — not ingredients-only captions."""
+    if (os.getenv("EXTRACT_RECIPE_SOCIAL_CAPTION_FIRST") or "1").strip().lower() in ("0", "false", "no"):
+        return False
+    if not _is_social_video_url(url):
+        return False
+    caption = _video_caption_text(meta)
+    if len(caption) < 150 or not _caption_looks_like_recipe(caption):
+        return False
+    if not _caption_has_instructions(caption):
+        print(
+            f"📝 Caption has ingredients only ({len(caption)} chars); "
+            "skipping caption LLM — will use vision for instructions"
+        )
+        return False
+    return True
 
 
 def _video_caption_text(meta: dict) -> str:
@@ -5282,7 +5360,8 @@ Return ONLY valid JSON matching:
 }
 Rules:
 - Extract EVERY ingredient with its quantity when stated.
-- Extract EVERY cooking step as its own instruction, in order. If the caption has 4 steps, return 4 instructions.
+- Extract EVERY cooking step that appears in the caption, in order.
+- If the caption has NO cooking steps, return "instructions": [] — do NOT invent or infer steps.
 - Do not skip, merge, or omit steps that appear in the caption.
 - Ignore hashtags, @mentions, and engagement text ("follow for more", "link in bio").
 - meal_type: exactly one of Breakfast, Lunch, Dinner, Snack.
@@ -5328,24 +5407,6 @@ def _extract_recipe_from_video_caption(meta: dict) -> dict | None:
     except Exception as e:
         print(f"⚠️ Caption recipe extraction failed: {e}")
         return None
-
-
-def _prefer_caption_for_social_video(meta: dict, url: str) -> bool:
-    """Use post description/caption when it contains the full recipe (TikTok 'more' text, IG caption)."""
-    if (os.getenv("EXTRACT_RECIPE_SOCIAL_CAPTION_FIRST") or "1").strip().lower() in ("0", "false", "no"):
-        return False
-    if not _is_social_video_url(url):
-        return False
-    caption = _video_caption_text(meta)
-    if not _caption_looks_like_recipe(caption):
-        return False
-    if not _caption_has_full_recipe_text(caption):
-        print(
-            f"📝 Post caption too short/incomplete ({len(caption)} chars); "
-            "will try vision as fallback"
-        )
-        return False
-    return True
 
 
 def _build_video_recipe_source(video_url: str, meta: dict, recipe: dict) -> dict:
@@ -6765,6 +6826,37 @@ def _fetch_instagram_page_caption(url: str) -> str | None:
         return None
 
 
+def _fetch_social_reel_meta(video_url: str) -> dict:
+    """One page fetch + yt-dlp info for TikTok/IG (avoids duplicate TikTok HTML requests)."""
+    page_caption = None
+    lowered = (video_url or "").lower()
+    if "tiktok.com" in lowered:
+        page_caption = _fetch_tiktok_page_caption(video_url)
+    elif "instagram.com" in lowered:
+        page_caption = _fetch_instagram_page_caption(video_url)
+
+    try:
+        info = _yt_meta(video_url)
+        meta = _video_meta_from_yt_info(info, video_url)
+    except Exception as e:
+        print(f"⚠️ yt-dlp metadata failed, using page caption only: {e}")
+        meta = {
+            "duration": None,
+            "title": "",
+            "description": page_caption or "",
+            "provider": urlparse(video_url).hostname or "",
+            "extractor": "",
+            "webpage_url": video_url,
+            "thumbnail": None,
+        }
+
+    existing = (meta.get("description") or "").strip()
+    if page_caption and len(page_caption) > len(existing):
+        print(f"📝 Post caption enriched: {len(existing)} → {len(page_caption)} chars")
+        meta["description"] = page_caption
+    return meta
+
+
 def _enrich_social_meta_from_page(meta: dict, video_url: str) -> dict:
     """Replace truncated yt-dlp descriptions with full post captions from the platform page."""
     meta = dict(meta)
@@ -7089,14 +7181,12 @@ def extract_recipe_from_video_internal(video_url: str):
                 vision_result["error"] = str(e)
             vision_result["done"] = True
 
-        # IG/TikTok reels: metadata first → caption if available → partial download for vision
+        # IG/TikTok reels: caption from post text first (fast) → vision only if needed
         if _prefer_vision_first_for_video_url(video_url):
-            print("⚡ Vision-first mode (social reel)")
+            print("⚡ Social reel fast path (caption → vision fallback)")
             t0 = time.time()
             try:
-                info = _yt_meta(video_url)
-                meta = _video_meta_from_yt_info(info, video_url)
-                meta = _enrich_social_meta_from_page(meta, video_url)
+                meta = _fetch_social_reel_meta(video_url)
             except Exception as e:
                 return jsonify({
                     "error": "Video metadata failed",
@@ -7108,11 +7198,10 @@ def extract_recipe_from_video_internal(video_url: str):
             extraction_method = "caption_llm"
             recipe = None
             source = None
-            if _prefer_caption_for_social_video(meta, video_url):
-                print("📝 Caption-first mode (social post description)")
+            caption_text = _video_caption_text(meta)
+            if _should_try_social_caption_first(meta, video_url):
+                print(f"📝 Caption-first mode ({len(caption_text)} chars)")
                 t_cap = time.time()
-                caption_text = _video_caption_text(meta)
-                print(f"📝 Metadata caption length: {len(caption_text)} chars")
                 recipe = _extract_recipe_from_video_caption(meta)
                 print(f"📝 Caption LLM finished in {time.time() - t_cap:.2f}s")
                 if _social_caption_recipe_acceptable(recipe, caption_text):
@@ -7120,8 +7209,10 @@ def extract_recipe_from_video_internal(video_url: str):
                 else:
                     recipe = None
             else:
-                caption_text = _video_caption_text(meta)
-                print(f"📝 Skipping caption-first ({len(caption_text)} chars metadata); using vision")
+                print(
+                    f"📝 Caption not used for extraction ({len(caption_text)} chars); "
+                    "using vision"
+                )
 
             if not _recipe_has_usable_content(recipe):
                 max_sec = _social_vision_max_download_seconds(meta, video_url)

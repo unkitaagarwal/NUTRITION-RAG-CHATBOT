@@ -180,6 +180,7 @@ LLM_MODEL = os.getenv("RECIPE_LLM_MODEL", "gpt-4o-mini")  # change if needed
 RECIPE_LLM_MODEL = os.getenv("RECIPE_LLM_MODEL", "gpt-4o-mini")
 # LLM/ffmpeg timeout budget for /extract-recipe (seconds)
 EXTRACT_RECIPE_TIMEOUT = int(os.getenv("EXTRACT_RECIPE_TIMEOUT", "50"))
+DEFAULT_RECIPE_SERVINGS = int(os.getenv("DEFAULT_RECIPE_SERVINGS", "4"))
 
 # YouTube proxy is now OPT-IN only (set YT_USE_PROXY=1 to re-enable).
 # YouTube is downloaded directly — no 3rd-party proxy — by impersonating the
@@ -4267,13 +4268,205 @@ def _short_recipe_description(recipe: dict) -> str:
     return desc
 
 
+_PREP_TIME_WORDS = (
+    "marinate", "soak", "rest", "chill", "refrigerat", "proof", "rise",
+    "prep", "prepare", "chop", "dice", "slice", "peel", "grate", "mix",
+    "combine", "coat", "season", "toss", "assemble",
+)
+_COOK_TIME_WORDS = (
+    "fry", "bake", "roast", "grill", "simmer", "boil", "sauté", "saute",
+    "cook", "heat", "microwave", "broil", "steam", "reduce", "brown",
+    "crisp", "golden", "pan-fry", "pan fry", "oven", "air fry",
+)
+
+
+def _metadata_fill_enabled() -> bool:
+    return (os.getenv("EXTRACT_RECIPE_FILL_METADATA") or "1").strip().lower() not in (
+        "0", "false", "no",
+    )
+
+
+def _recipe_has_named_ingredients(recipe: dict) -> bool:
+    for ing in recipe.get("ingredients") or []:
+        if isinstance(ing, dict) and (ing.get("name") or "").strip():
+            return True
+        if isinstance(ing, str) and ing.strip():
+            return True
+    return False
+
+
+def _minutes_in_instruction_text(text: str) -> int:
+    """Parse minute/hour mentions from a single instruction line."""
+    lower = text.lower()
+    minutes = 0
+    for m in re.finditer(r"(\d+)\s*(?:h|hr|hrs|hour|hours)\b", lower):
+        minutes += int(m.group(1)) * 60
+    range_spans: list[tuple[int, int]] = []
+    for m in re.finditer(r"(\d+)\s*[-–]\s*(\d+)\s*(?:min|mins|minutes|minute|m)\b", lower):
+        minutes += (int(m.group(1)) + int(m.group(2))) // 2
+        range_spans.append(m.span())
+    for m in re.finditer(r"(\d+)\s*(?:min|mins|minutes|minute|m)\b", lower):
+        if any(start <= m.start() < end for start, end in range_spans):
+            continue
+        minutes += int(m.group(1))
+    return minutes
+
+
+def _infer_times_from_instructions(instructions: list) -> tuple[str, str]:
+    """Infer prep/cook durations from time mentions inside instruction steps."""
+    prep_total = 0
+    cook_total = 0
+    for step in instructions:
+        text = str(step).strip()
+        if not text:
+            continue
+        mins = _minutes_in_instruction_text(text)
+        if mins <= 0:
+            continue
+        lower = text.lower()
+        is_cook = any(w in lower for w in _COOK_TIME_WORDS)
+        is_prep = any(w in lower for w in _PREP_TIME_WORDS)
+        if is_cook:
+            cook_total += mins
+        elif is_prep:
+            prep_total += mins
+        else:
+            cook_total += mins
+    prep_str = f"{prep_total} mins" if prep_total else ""
+    cook_str = f"{cook_total} mins" if cook_total else ""
+    return prep_str, cook_str
+
+
+def _format_minutes_label(minutes: int) -> str:
+    if minutes <= 0:
+        return ""
+    if minutes >= 60 and minutes % 60 == 0:
+        hrs = minutes // 60
+        return f"{hrs} hr" if hrs == 1 else f"{hrs} hrs"
+    return f"{minutes} mins"
+
+
+def _estimate_missing_recipe_metadata_llm(recipe: dict) -> dict:
+    """Estimate prep/cook times and per-serving nutrition when the source omits them."""
+    servings = str(recipe.get("servings") or DEFAULT_RECIPE_SERVINGS).strip()
+    payload = {
+        "name": recipe.get("name") or "",
+        "servings": servings,
+        "ingredients": recipe.get("ingredients") or [],
+        "instructions": recipe.get("instructions") or [],
+    }
+    system = (
+        "Estimate realistic home-cooking metadata for a recipe. "
+        "Return ONLY JSON: "
+        '{"prep_time":"","cook_time":"","total_time":"",'
+        '"calories":"","protein_g":"","carbs_g":"","fat_g":""}. '
+        "Times must be human-readable strings like \"15 mins\" or \"1 hr\" (not ISO). "
+        "Infer prep_time from chopping/mixing/coating steps; cook_time from frying/baking/boiling steps. "
+        "total_time should equal prep + cook. "
+        "Macros are per serving as numeric strings. Use ingredient quantities when available. "
+        "JSON only."
+    )
+    user = f"Recipe:\n{json.dumps(payload, ensure_ascii=False)}\n\nReturn estimates."
+    try:
+        completion = client.chat.completions.create(
+            model=RECIPE_LLM_MODEL,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            temperature=0.2,
+            max_tokens=250,
+            response_format={"type": "json_object"},
+            timeout=EXTRACT_RECIPE_TIMEOUT,
+        )
+        data = json.loads(completion.choices[0].message.content.strip())
+        out = {}
+        for key in ("prep_time", "cook_time", "total_time"):
+            val = str((data or {}).get(key) or "").strip()
+            if val:
+                out[key] = val
+        for key in ("calories", "protein_g", "carbs_g", "fat_g"):
+            val = str((data or {}).get(key) or "").strip()
+            if val:
+                out[key] = val
+        return out
+    except Exception as e:
+        print(f"⚠️ Recipe metadata estimation failed: {e}")
+        return {}
+
+
+def _recipe_field_empty(recipe: dict, key: str) -> bool:
+    return not str(recipe.get(key) or "").strip()
+
+
+def _fill_missing_recipe_metadata(recipe: dict) -> None:
+    """Backfill only fields the extraction LLM left empty — never overwrite provided values."""
+    if not recipe or not _metadata_fill_enabled():
+        return
+
+    # Snapshot which fields were empty in the extraction LLM response.
+    fill_servings = _recipe_field_empty(recipe, "servings")
+    fill_prep = _recipe_field_empty(recipe, "prep_time")
+    fill_cook = _recipe_field_empty(recipe, "cook_time")
+    fill_total = _recipe_field_empty(recipe, "total_time")
+
+    nutrition = recipe.get("nutrition")
+    if not isinstance(nutrition, dict):
+        nutrition = {}
+        recipe["nutrition"] = nutrition
+    fill_nutrition = {
+        key: not str(nutrition.get(key) or "").strip()
+        for key in ("calories", "protein_g", "carbs_g", "fat_g")
+    }
+
+    instructions = recipe.get("instructions") or []
+    if isinstance(instructions, str):
+        instructions = [instructions]
+
+    if fill_servings:
+        recipe["servings"] = str(DEFAULT_RECIPE_SERVINGS)
+
+    if instructions and (fill_prep or fill_cook):
+        infer_prep, infer_cook = _infer_times_from_instructions(instructions)
+        if fill_prep and infer_prep:
+            recipe["prep_time"] = infer_prep
+        if fill_cook and infer_cook:
+            recipe["cook_time"] = infer_cook
+
+    need_times_llm = (
+        (fill_prep and _recipe_field_empty(recipe, "prep_time"))
+        or (fill_cook and _recipe_field_empty(recipe, "cook_time"))
+        or (fill_total and _recipe_field_empty(recipe, "total_time"))
+    )
+    need_nutrition_llm = any(fill_nutrition.values()) and _recipe_has_named_ingredients(recipe)
+    if (need_times_llm or need_nutrition_llm) and (instructions or _recipe_has_named_ingredients(recipe)):
+        estimated = _estimate_missing_recipe_metadata_llm(recipe)
+        if fill_prep and _recipe_field_empty(recipe, "prep_time") and estimated.get("prep_time"):
+            recipe["prep_time"] = estimated["prep_time"]
+        if fill_cook and _recipe_field_empty(recipe, "cook_time") and estimated.get("cook_time"):
+            recipe["cook_time"] = estimated["cook_time"]
+        if fill_total and _recipe_field_empty(recipe, "total_time") and estimated.get("total_time"):
+            recipe["total_time"] = estimated["total_time"]
+        for key, should_fill in fill_nutrition.items():
+            if should_fill and estimated.get(key):
+                nutrition[key] = estimated[key]
+
+    if fill_total and _recipe_field_empty(recipe, "total_time"):
+        prep_m = _time_str_to_minutes_for_cook_time(recipe.get("prep_time") or "")
+        cook_m = _time_str_to_minutes_for_cook_time(recipe.get("cook_time") or "")
+        total_m = prep_m + cook_m
+        if total_m > 0:
+            recipe["total_time"] = _format_minutes_label(total_m)
+
+
 def _enrich_recipe_response(recipe: dict) -> None:
-    """Set meal_type, cuisine (normalized), diet_flags, and description on recipe for /extract-recipe response."""
+    """Set meal_type, cuisine, diet_flags, description, and inferred metadata on recipe."""
     if not recipe:
         return
     recipe["meal_type"] = normalize_meal_type(recipe.get("meal_type"))
     recipe["cuisine"] = normalize_cuisine(recipe.get("cuisine"))
     recipe["diet_flags"] = extract_recipe_diet_flags(recipe)
+    _fill_missing_recipe_metadata(recipe)
     recipe["description"] = _short_recipe_description(recipe)
 
 

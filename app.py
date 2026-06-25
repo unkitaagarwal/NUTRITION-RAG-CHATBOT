@@ -33,7 +33,7 @@ import shutil
 import time
 import socket
 import ipaddress
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, urlunparse
 import http.cookiejar
 import requests
 from bs4 import BeautifulSoup
@@ -58,6 +58,7 @@ _plan_meal_history_lock = Lock()
 # Same video URL always produces the same recipe, so we never re-run the full pipeline.
 _recipe_cache: dict = {}
 _recipe_cache_lock = Lock()
+_lang_detect_cache: dict[str, str] = {}
 
 # Initialize once
 # ---------- Config ----------
@@ -4009,7 +4010,7 @@ def extract_recipe_from_image_llm(image_data_url: str):
 
 
 def extract_recipe_from_video_frames_llm(
-    image_data_urls: list, *, caption: str = "", social: bool = False
+    image_data_urls: list, *, caption: str = "", social: bool = False, language: str | None = None
 ) -> dict:
     """Vision path for video frame(s). social=True uses high detail for on-screen recipe overlays."""
     if not image_data_urls:
@@ -4017,6 +4018,7 @@ def extract_recipe_from_video_frames_llm(
     caption_hint = ""
     if caption and caption.strip():
         caption_hint = f" Post metadata caption (may be partial): {caption.strip()[:2000]}"
+    lang_rule = _source_language_prompt_rule() if social else ""
     if social:
         system = (
             "Extract a COMPLETE recipe from TikTok/Instagram cooking video frame(s). "
@@ -4024,18 +4026,19 @@ def extract_recipe_from_video_frames_llm(
             "Read ALL visible overlay text across ALL frames and merge into ONE recipe. "
             "Do not invent or simplify — extract every ingredient with quantity and every step. "
             "Return ONLY JSON: "
-            '{"name":"","ingredients":[{"name":"","quantity":""}],'
+            '{"language":"","name":"","ingredients":[{"name":"","quantity":""}],'
             '"instructions":["Step 1: ...","Step 2: ..."],'
             '"servings":"","prep_time":"","cook_time":"","total_time":"",'
             '"notes":[],"meal_type":"","cuisine":"","nutrition":{"calories":"","protein_g":"","carbs_g":"","fat_g":""}}. '
-            "meal_type: Breakfast|Lunch|Dinner|Snack. Estimate nutrition per serving. JSON only."
+            f"meal_type: Breakfast|Lunch|Dinner|Snack. Estimate nutrition per serving.{lang_rule} JSON only."
         )
         user_text = (
             f"These are {len(image_data_urls)} frame(s) from a short-form cooking video. "
             f"Read every line of on-screen recipe text and return the full recipe JSON.{caption_hint}"
         )
-        detail = "high"
-        max_tokens = 1600
+        # Low detail when caption already provides context — much faster than high on multiple frames.
+        detail = "low" if (caption_hint and len(image_data_urls) <= 2) else "high"
+        max_tokens = 1400 if detail == "low" else 1600
     else:
         system = (
             "Extract recipe from cooking video frame(s). Return ONLY JSON: "
@@ -4068,19 +4071,22 @@ def extract_recipe_from_video_frames_llm(
     return json.loads(completion.choices[0].message.content)
 
 
-def extract_recipe_from_slideshow_llm(image_data_urls: list, *, caption: str = "") -> dict:
+def extract_recipe_from_slideshow_llm(
+    image_data_urls: list, *, caption: str = "", language: str | None = None
+) -> dict:
     """Fast vision path for social slideshows: low detail, compact prompt, fewer tokens."""
     if not image_data_urls:
         raise ValueError("At least one image is required")
     caption_hint = f" Post caption/title: {caption.strip()}." if caption and caption.strip() else ""
+    lang_rule = _source_language_prompt_rule()
     system = (
         "Extract a complete recipe from social-media slideshow slide(s) with on-screen text overlays."
         " Combine all slides into ONE recipe. Return ONLY JSON: "
-        '{"name":"","ingredients":[{"name":"","quantity":""}],'
+        '{"language":"","name":"","ingredients":[{"name":"","quantity":""}],'
         '"instructions":["..."],"servings":"","prep_time":"","cook_time":"","total_time":"",'
         '"notes":[],"meal_type":"","cuisine":"","nutrition":{"calories":"","protein_g":"","carbs_g":"","fat_g":""}}. '
         "Read every visible ingredient and cooking step across slides. "
-        "meal_type: Breakfast|Lunch|Dinner|Snack. Estimate nutrition per serving when possible. JSON only."
+        f"meal_type: Breakfast|Lunch|Dinner|Snack. Estimate nutrition per serving when possible.{lang_rule} JSON only."
     )
     content = [{
         "type": "text",
@@ -4264,7 +4270,7 @@ def extract_recipe_diet_flags(recipe: dict) -> list[str]:
     return list(dict.fromkeys(f for f in flags if f in DIET_FLAGS))
 
 
-def _short_recipe_description(recipe: dict) -> str:
+def _short_recipe_description(recipe: dict, *, language: str | None = None) -> str:
     """
     Build a short, one-line summary of the recipe (max 100 chars) for /extract-recipe response.
     Uses recipe name + diet/style flags. Ends with a full stop; no ellipsis.
@@ -4272,14 +4278,17 @@ def _short_recipe_description(recipe: dict) -> str:
     if not recipe:
         return ""
     name = (recipe.get("name") or "").strip()
-    diet_flags = recipe.get("diet_flags") or []
-    diet_words = " ".join(str(d).lower() for d in diet_flags if d).strip()
-    if diet_words and name:
-        desc = f"{diet_words} {name}"
-    elif name:
-        desc = name
+    if language and language != "en":
+        desc = name or "Receta"
     else:
-        desc = diet_words or "Recipe"
+        diet_flags = recipe.get("diet_flags") or []
+        diet_words = " ".join(str(d).lower() for d in diet_flags if d).strip()
+        if diet_words and name:
+            desc = f"{diet_words} {name}"
+        elif name:
+            desc = name
+        else:
+            desc = diet_words or "Recipe"
     desc = re.sub(r"\s+", " ", desc).strip()
     if len(desc) > 100:
         desc = desc[:99].rstrip()
@@ -4368,7 +4377,7 @@ def _format_minutes_label(minutes: int) -> str:
     return f"{minutes} mins"
 
 
-def _estimate_missing_recipe_metadata_llm(recipe: dict) -> dict:
+def _estimate_missing_recipe_metadata_llm(recipe: dict, *, language: str | None = None) -> dict:
     """Estimate prep/cook times and per-serving nutrition when the source omits them."""
     servings = str(recipe.get("servings") or DEFAULT_RECIPE_SERVINGS).strip()
     payload = {
@@ -4377,6 +4386,7 @@ def _estimate_missing_recipe_metadata_llm(recipe: dict) -> dict:
         "ingredients": recipe.get("ingredients") or [],
         "instructions": recipe.get("instructions") or [],
     }
+    lang_rule = _metadata_language_rule(language)
     system = (
         "Estimate realistic home-cooking metadata for a recipe. "
         "Return ONLY JSON: "
@@ -4385,8 +4395,7 @@ def _estimate_missing_recipe_metadata_llm(recipe: dict) -> dict:
         "Times must be human-readable strings like \"15 mins\" or \"1 hr\" (not ISO). "
         "Infer prep_time from chopping/mixing/coating steps; cook_time from frying/baking/boiling steps. "
         "total_time should equal prep + cook. "
-        "Macros are per serving as numeric strings. Use ingredient quantities when available. "
-        "JSON only."
+        f"Macros are per serving as numeric strings.{lang_rule} JSON only."
     )
     user = f"Recipe:\n{json.dumps(payload, ensure_ascii=False)}\n\nReturn estimates."
     try:
@@ -4421,7 +4430,7 @@ def _recipe_field_empty(recipe: dict, key: str) -> bool:
     return not str(recipe.get(key) or "").strip()
 
 
-def _fill_missing_recipe_metadata(recipe: dict) -> None:
+def _fill_missing_recipe_metadata(recipe: dict, *, language: str | None = None) -> None:
     """Backfill only fields the extraction LLM left empty — never overwrite provided values."""
     if not recipe or not _metadata_fill_enabled():
         return
@@ -4462,7 +4471,7 @@ def _fill_missing_recipe_metadata(recipe: dict) -> None:
     )
     need_nutrition_llm = any(fill_nutrition.values()) and _recipe_has_named_ingredients(recipe)
     if (need_times_llm or need_nutrition_llm) and (instructions or _recipe_has_named_ingredients(recipe)):
-        estimated = _estimate_missing_recipe_metadata_llm(recipe)
+        estimated = _estimate_missing_recipe_metadata_llm(recipe, language=language)
         if fill_prep and _recipe_field_empty(recipe, "prep_time") and estimated.get("prep_time"):
             recipe["prep_time"] = estimated["prep_time"]
         if fill_cook and _recipe_field_empty(recipe, "cook_time") and estimated.get("cook_time"):
@@ -4481,15 +4490,23 @@ def _fill_missing_recipe_metadata(recipe: dict) -> None:
             recipe["total_time"] = _format_minutes_label(total_m)
 
 
-def _enrich_recipe_response(recipe: dict) -> None:
+def _enrich_recipe_response(recipe: dict, *, language: str | None = None) -> None:
     """Set meal_type, cuisine, diet_flags, description, and inferred metadata on recipe."""
     if not recipe:
         return
-    recipe["meal_type"] = normalize_meal_type(recipe.get("meal_type"))
-    recipe["cuisine"] = normalize_cuisine(recipe.get("cuisine"))
-    recipe["diet_flags"] = extract_recipe_diet_flags(recipe)
-    _fill_missing_recipe_metadata(recipe)
-    recipe["description"] = _short_recipe_description(recipe)
+    is_english = not language or language == "en"
+    if is_english:
+        recipe["meal_type"] = normalize_meal_type(recipe.get("meal_type"))
+        recipe["cuisine"] = normalize_cuisine(recipe.get("cuisine"))
+        recipe["diet_flags"] = extract_recipe_diet_flags(recipe)
+    else:
+        if not (recipe.get("meal_type") or "").strip():
+            recipe["meal_type"] = ""
+        if not (recipe.get("cuisine") or "").strip():
+            recipe["cuisine"] = ""
+        recipe["diet_flags"] = []
+    _fill_missing_recipe_metadata(recipe, language=language)
+    recipe["description"] = _short_recipe_description(recipe, language=language)
 
 
 def _guess_difficulty_from_tags(tags: list[str]) -> str:
@@ -5128,15 +5145,289 @@ def _is_social_video_url(url: str) -> bool:
     return "tiktok.com" in lowered or "instagram.com" in lowered
 
 
+def _is_tiktok_video_url(url: str) -> bool:
+    lowered = (url or "").lower()
+    return any(h in lowered for h in ("tiktok.com", "vt.tiktok.com", "vm.tiktok.com"))
+
+
+_LANGUAGE_NAMES = {
+    "en": "English", "es": "Spanish", "fr": "French", "de": "German", "it": "Italian",
+    "pt": "Portuguese", "id": "Indonesian", "ms": "Malay", "tl": "Filipino", "fil": "Filipino",
+    "vi": "Vietnamese", "th": "Thai", "ja": "Japanese", "ko": "Korean", "zh": "Chinese",
+    "ar": "Arabic", "hi": "Hindi", "ru": "Russian", "tr": "Turkish", "nl": "Dutch",
+    "pl": "Polish", "sv": "Swedish", "no": "Norwegian", "da": "Danish", "fi": "Finnish",
+}
+
+
+def _normalize_language_code(code: str | None) -> str | None:
+    if not code:
+        return None
+    raw = str(code).strip().lower().replace("_", "-")
+    if not raw:
+        return None
+    primary = raw.split("-")[0]
+    if len(primary) == 2 and primary.isalpha():
+        return primary
+    return None
+
+
+def _detect_text_language(text: str) -> str:
+    """Heuristic ISO-639-1 code from post text when platform metadata has no language."""
+    text = (text or "").strip()
+    if not text:
+        return "en"
+    if re.search(r"[\u4e00-\u9fff]", text):
+        return "zh"
+    if re.search(r"[\u3040-\u30ff]", text):
+        return "ja"
+    if re.search(r"[\uac00-\ud7af]", text):
+        return "ko"
+    if re.search(r"[\u0600-\u06ff]", text):
+        return "ar"
+    if re.search(r"[\u0900-\u097f]", text):
+        return "hi"
+    if re.search(r"[\u0400-\u04ff]", text):
+        return "ru"
+    if re.search(r"[\u0e00-\u0e7f]", text):
+        return "th"
+    lower = f" {text.lower()} "
+    # French before Spanish — many function words (de, la, que) and accents overlap.
+    french_words = (
+        " à ", " au ", " aux ", " des ", " les ", " une ", " recette", " ingrédient", " crème",
+        " pâte", " cuillère", " pour ", " avec ", " étape", " franc", " traditionnel", " abonner",
+        " cuisson", " farine", " beurre", " lard ", " vraie ", " cuisine", " lorrain", " tourte",
+        " pense ", " région", " vrai ",
+    )
+    french_score = sum(w in lower for w in french_words)
+    if french_score >= 2 or (
+        french_score >= 1 and re.search(r"[àâçéèêëîïôùûœ]", lower)
+    ):
+        return "fr"
+    if re.search(r"[ñ¿¡]", text) or re.search(r"ción|ando\b|ación", lower):
+        return "es"
+    spanish_words = (
+        " con ", " para ", " los ", " las ", " del ", " una ", " receta", " cucharada",
+        " paso", " pasos", " harina", " fácil", " déjenme", " enseñar", " el ", " sin ", " más ",
+        " agua ", " cocinar", " cebolla", " también", " como ",
+    )
+    spanish_score = sum(w in lower for w in spanish_words)
+    if spanish_score >= 2:
+        return "es"
+    if spanish_score >= 1 and re.search(r"ñ", lower):
+        return "es"
+    if sum(w in lower for w in (" dan ", " dengan ", " resep", " langkah", " bumbu ")) >= 2:
+        return "id"
+    if sum(w in lower for w in (" dan ", " resipi", " langkah", " sudu ")) >= 2:
+        return "ms"
+    if sum(w in lower for w in (" und ", " mit ", " rezept", " esslöffel", " zutaten ")) >= 2:
+        return "de"
+    if sum(w in lower for w in (" com ", " receita", " colher", " passo ")) >= 2:
+        return "pt"
+    if sum(w in lower for w in (" và ", " với ", " công thức", " muốn ")) >= 2:
+        return "vi"
+    return "en"
+
+
+def _llm_language_detect_enabled() -> bool:
+    return (os.getenv("EXTRACT_RECIPE_LLM_LANGUAGE_DETECT") or "1").strip().lower() not in (
+        "0", "false", "no",
+    )
+
+
+def _source_language_prompt_rule() -> str:
+    """Universal extraction rule — works for any language without pre-detection."""
+    return (
+        ' Include "language": ISO-639-1 code of the source content (e.g. "en", "es", "fr", "de", "id", "ja"). '
+        "Write ALL recipe fields (name, ingredients, instructions, notes, meal_type, cuisine, "
+        "servings, prep_time, cook_time, total_time) in the SAME language as the source — "
+        "never translate to English unless the source is English."
+    )
+
+
+def _metadata_language_rule(language: str | None) -> str:
+    if not language or language == "en":
+        return " Use the same language as the recipe name and instructions."
+    label = _LANGUAGE_NAMES.get(language, language)
+    return f" Write all time strings in {label}."
+
+
+def _detect_language_llm(text: str) -> str | None:
+    """LLM ISO-639-1 detection — language-agnostic, cached per text snippet."""
+    text = (text or "").strip()
+    if not text or not _llm_language_detect_enabled():
+        return None
+    sample = text[:1200]
+    key = hashlib.sha256(sample.encode()).hexdigest()
+    with _recipe_cache_lock:
+        cached = _lang_detect_cache.get(key)
+    if cached:
+        return cached
+    try:
+        completion = client.chat.completions.create(
+            model=os.getenv("RECIPE_LANGUAGE_MODEL") or RECIPE_LLM_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Detect the primary human language of the text. "
+                        'Return ONLY JSON: {"language":"xx"} where xx is ISO-639-1 '
+                        "(en, es, fr, de, it, pt, id, ms, vi, th, ja, ko, zh, ar, hi, ru, tr, nl, pl, sv, da, fi, no)."
+                    ),
+                },
+                {"role": "user", "content": sample},
+            ],
+            temperature=0,
+            max_tokens=24,
+            response_format={"type": "json_object"},
+            timeout=min(12, EXTRACT_RECIPE_TIMEOUT),
+        )
+        data = json.loads(completion.choices[0].message.content.strip())
+        code = _normalize_language_code((data or {}).get("language"))
+        if code:
+            with _recipe_cache_lock:
+                _lang_detect_cache[key] = code
+            return code
+    except Exception as e:
+        print(f"⚠️ LLM language detection failed: {e}")
+    return None
+
+
+def _platform_language_code(meta: dict) -> str | None:
+    for key in ("textLanguage", "descLanguage", "language", "lang"):
+        code = _normalize_language_code(meta.get(key))
+        if code:
+            return code
+    return None
+
+
+def _resolve_response_language(meta: dict, recipe: dict | None = None, *, use_llm: bool | None = None) -> str:
+    """
+    Language-agnostic resolution priority:
+    1) language field from extraction LLM
+    2) platform textLanguage (TikTok page JSON)
+    3) LLM detect on recipe/caption (optional, off during meta fetch)
+    4) heuristic fallback
+    """
+    if use_llm is None:
+        use_llm = _llm_language_detect_enabled()
+
+    if recipe:
+        code = _normalize_language_code(recipe.get("language"))
+        if code:
+            return code
+        parts = [recipe.get("name") or ""]
+        instructions = recipe.get("instructions") or []
+        if instructions:
+            parts.append(str(instructions[0]))
+        sample = " ".join(p for p in parts if p).strip()
+        if sample:
+            if use_llm:
+                detected = _detect_language_llm(sample)
+                if detected:
+                    return detected
+            heuristic = _detect_text_language(sample)
+            if heuristic != "en":
+                return heuristic
+
+    platform = _platform_language_code(meta)
+    if platform and platform != "en":
+        return platform
+
+    caption = _video_caption_text(meta)
+    if caption:
+        if use_llm:
+            detected = _detect_language_llm(caption)
+            if detected:
+                return detected
+        heuristic = _detect_text_language(caption)
+        if heuristic != "en":
+            return heuristic
+
+    return platform or "en"
+
+
+def _pop_recipe_language(recipe: dict | None) -> str | None:
+    """Remove internal language field from recipe dict; return normalized ISO code."""
+    if not recipe:
+        return None
+    raw = recipe.pop("language", None)
+    return _normalize_language_code(raw)
+
+
+def _finalize_recipe_for_response(recipe: dict, meta: dict) -> str:
+    """Resolve language, enrich recipe, return ISO code for API response."""
+    lang = _pop_recipe_language(recipe)
+    if not lang:
+        lang = _resolve_response_language(meta, recipe, use_llm=False)
+    _enrich_recipe_response(recipe, language=lang)
+    return lang
+
+
+def _is_unrelated_tiktok_description(description: str, title: str) -> bool:
+    """True when yt-dlp/page JSON injected promo text unrelated to the video title."""
+    if not description or not title:
+        return False
+    desc_lang = _detect_text_language(description)
+    title_lang = _detect_text_language(title)
+    if desc_lang != title_lang and title_lang != "en":
+        return True
+    promo_markers = (
+        "contest", "giveaway", "voucher", "fairprice", "heritagefest", "heritage fest",
+        "ntuc", "follow us", "tag your friend", "win a", "win $", "terms and conditions",
+        "sponsored", "#ad", "paid partnership", "local food", "heritagefest",
+    )
+    lower = description.lower()
+    if any(m in lower for m in promo_markers) and not any(m in title.lower() for m in promo_markers):
+        return True
+    title_words = [
+        w for w in re.findall(r"\w{4,}", title.lower())
+        if w not in ("para", "con", "de", "que", "los", "las", "del", "una", "con", "pour", "avec", "les")
+    ]
+    if title_words and not any(w in lower for w in title_words[:4]):
+        if desc_lang != title_lang:
+            return True
+    return False
+
+
+def _tiktok_post_language(meta: dict) -> str:
+    """Backward-compatible alias — delegates to language-agnostic resolver."""
+    return _resolve_response_language(meta)
+
+
+def _apply_response_language(payload: dict, video_url: str, meta: dict) -> dict:
+    """Attach language to social-video extract responses."""
+    if not (_is_social_video_url(video_url) or _is_tiktok_video_url(video_url)):
+        return payload
+    lang = payload.get("language")
+    if not lang:
+        recipe = payload.get("recipe") or {}
+        lang = _resolve_response_language(meta, recipe, use_llm=False)
+    payload["language"] = lang
+    if isinstance(payload.get("meta"), dict):
+        payload["meta"] = {**payload["meta"], "language": lang}
+    return payload
+
+
+def _return_video_extract_result(
+    result: dict, url_key: str, video_url: str, meta: dict, *, language: str | None = None
+) -> tuple:
+    if language:
+        result["language"] = language
+    result = _apply_response_language(result, video_url, meta)
+    with _recipe_cache_lock:
+        _recipe_cache[url_key] = result
+    return jsonify(result), 200
+
+
 def _social_video_frames_for_duration(url: str, duration_sec: float | None) -> int:
     """TikTok/IG: sample multiple frames when vision fallback is needed."""
     if not _is_social_video_url(url):
         return _video_frames_for_duration(duration_sec)
     try:
-        n = int(os.getenv("EXTRACT_RECIPE_SOCIAL_VIDEO_FRAMES", "3"))
+        n = int(os.getenv("EXTRACT_RECIPE_SOCIAL_VIDEO_FRAMES", "2"))
     except ValueError:
-        n = 3
-    return min(max(2, n), MAX_EXTRACT_RECIPE_IMAGES)
+        n = 2
+    return min(max(1, n), MAX_EXTRACT_RECIPE_IMAGES)
 
 
 def _video_frames_for_duration(duration_sec: float | None) -> int:
@@ -5200,16 +5491,36 @@ def _social_recipe_is_complete(recipe: dict | None) -> bool:
     return ing_count >= 3 and inst_count >= 2
 
 
+_CAPTION_QTY_PATTERN = re.compile(
+    r'\d+(?:\.\d+)?\s*(?:'
+    r'tbsp|tsp|tablespoons?|teaspoons?|cups?|cloves?|'
+    r'g\b|gram|grams|kg|ml\b|l\b|litre|liter|oz\b|lb|pcs|pieces?|'
+    r'cuillères?|c\.?\s*à\s*s\.?|c\.?\s*à\s*c\.?|'
+    r'cucharadas?|cucharaditas?|tazas?'
+    r')',
+    re.IGNORECASE,
+)
+
+
+def _caption_has_numbered_steps(caption: str) -> bool:
+    """Numbered steps in any language (supports accented letters)."""
+    return bool(re.search(r'(?:^|\n)\s*\d+[\.\):\-]\s+[^\d\s]', caption, re.MULTILINE))
+
+
 def _caption_has_instructions(caption: str) -> bool:
     """True when the post caption text itself contains cooking steps (not just ingredients)."""
     caption = (caption or "").strip()
     if not caption:
         return False
-    if re.search(r'(?:^|\n)\s*\d+[\.\):\-]\s+[A-Za-z]', caption, re.MULTILINE):
+    if _caption_has_numbered_steps(caption):
         return True
-    if re.search(r'\bstep\s*\d+', caption, re.IGNORECASE):
+    if re.search(r'\b(?:step|étape|paso|langkah)\s*\d+', caption, re.IGNORECASE):
         return True
-    if re.search(r'\b(instructions?|directions?|method)\s*:', caption, re.IGNORECASE):
+    if re.search(
+        r'\b(?:instructions?|directions?|method|préparation|preparation|étapes?|pasos?)\s*:',
+        caption,
+        re.IGNORECASE,
+    ):
         return True
     action_starts = (
         "mix ", "add ", "fry ", "bake ", "cook ", "heat ", "serve ", "combine ",
@@ -5217,6 +5528,8 @@ def _caption_has_instructions(caption: str) -> bool:
         "drain ", "slice ", "chop ", "melt ", "whisk ", "pour ", "spread ",
         "reduce ", "toss ", "marinate ", "preheat ", "transfer ", "top ",
         "pan-fry ", "deep fry ", "air fry ",
+        "mélange", "ajoute", "cuire", "faire ", "verser ", "étaler ", "préchauff",
+        "mezcl", "añad", "cocin", "calient", "hornea", "agrega",
     )
     action_lines = 0
     for line in caption.splitlines():
@@ -5272,17 +5585,13 @@ def _caption_has_full_recipe_text(caption: str) -> bool:
     caption = (caption or "").strip()
     if len(caption) < 120:
         return False
+    if _caption_has_numbered_steps(caption):
+        return True
     if len(caption) >= 280 and _caption_looks_like_recipe(caption):
         return True
-    if re.search(r'(?:^|\n)\s*\d+[\.\):\-]\s+\w', caption, re.MULTILINE | re.IGNORECASE):
+    if re.search(r'\b(?:step|étape|paso)\s*\d+', caption, re.IGNORECASE):
         return True
-    if re.search(r'\bstep\s*\d+', caption, re.IGNORECASE):
-        return True
-    qty_hits = len(re.findall(
-        r'\d+(?:\.\d+)?\s*(?:tbsp|tsp|tablespoons?|teaspoons?|cups?|cloves?|g\b|gram|oz\b|ml\b|lb|pcs|pieces?)',
-        caption,
-        re.IGNORECASE,
-    ))
+    qty_hits = len(_CAPTION_QTY_PATTERN.findall(caption))
     if qty_hits >= 3:
         return True
     if len(caption) >= 200 and qty_hits >= 2:
@@ -5297,7 +5606,9 @@ def _should_try_social_caption_first(meta: dict, url: str) -> bool:
     if not _is_social_video_url(url):
         return False
     caption = _video_caption_text(meta)
-    if len(caption) < 150 or not _caption_looks_like_recipe(caption):
+    if len(caption) < 150:
+        return False
+    if not (_caption_looks_like_recipe(caption) or _caption_has_full_recipe_text(caption)):
         return False
     if not _caption_has_instructions(caption):
         print(
@@ -5312,6 +5623,8 @@ def _video_caption_text(meta: dict) -> str:
     """Best available post caption/description from yt-dlp metadata."""
     description = (meta.get("description") or "").strip()
     title = (meta.get("title") or "").strip()
+    if title and description and _is_unrelated_tiktok_description(description, title):
+        return title
     if description and len(description) >= len(title):
         return description
     if title and description and description not in title and title not in description:
@@ -5324,25 +5637,34 @@ def _caption_looks_like_recipe(text: str) -> bool:
         return False
     lowered = text.lower()
     signals = (
-        "ingredient", "cup", "cups", "tbsp", "tsp", "tablespoon", "teaspoon",
-        "step", "steps", "layer", "mix", "bake", "cook", "fry", "simmer",
-        "grams", "ounce", "oz ", "season", "sauce", "garlic", "chicken",
+        "ingredient", "ingrédient", "ingrediente", "bahan", "zutaten",
+        "cup", "cups", "tbsp", "tsp", "tablespoon", "teaspoon", "cuillère", "cucharada",
+        "step", "steps", "étape", "étapes", "paso", "pasos", "langkah",
+        "layer", "mix", "mélange", "bake", "cook", "cuire", "cocinar", "fry", "simmer",
+        "grams", "gram", "ounce", "oz ", "season", "sauce", "garlic", "chicken",
+        "recette", "receta", "resep", "rezept", "œuf", "oeuf", "farine", "beurre", "crème",
     )
-    return sum(1 for signal in signals if signal in lowered) >= 2
+    if sum(1 for signal in signals if signal in lowered) >= 2:
+        return True
+    if len(_CAPTION_QTY_PATTERN.findall(text)) >= 2 and len(text) >= 100:
+        return True
+    return False
 
 
-def _extract_recipe_from_social_caption_llm(caption: str) -> dict:
+def _extract_recipe_from_social_caption_llm(caption: str, *, language: str | None = None) -> dict:
     """Extract a full recipe from TikTok/IG caption text (ingredients + numbered steps)."""
-    system_prompt = """You extract a complete recipe from a TikTok or Instagram post caption.
+    lang_rule = _source_language_prompt_rule()
+    system_prompt = f"""You extract a complete recipe from a TikTok or Instagram post caption.
 Captions often contain:
 - A recipe name
 - Ingredient lists with quantities (tbsp, tsp, cups, cloves, etc.)
 - Numbered steps or short instruction lines
 
 Return ONLY valid JSON matching:
-{
+{{
+  "language": "",
   "name": "",
-  "ingredients": [{"name": "...", "quantity": "..."}],
+  "ingredients": [{{"name": "...", "quantity": "..."}}],
   "instructions": ["Step 1: ...", "Step 2: ..."],
   "servings": "",
   "prep_time": "",
@@ -5351,13 +5673,13 @@ Return ONLY valid JSON matching:
   "notes": [],
   "meal_type": "",
   "cuisine": "",
-  "nutrition": {
+  "nutrition": {{
     "calories": "",
     "protein_g": "",
     "carbs_g": "",
     "fat_g": ""
-  }
-}
+  }}
+}}
 Rules:
 - Extract EVERY ingredient with its quantity when stated.
 - Extract EVERY cooking step that appears in the caption, in order.
@@ -5365,7 +5687,7 @@ Rules:
 - Do not skip, merge, or omit steps that appear in the caption.
 - Ignore hashtags, @mentions, and engagement text ("follow for more", "link in bio").
 - meal_type: exactly one of Breakfast, Lunch, Dinner, Snack.
-- nutrition: best-effort per-serving estimates as strings from ingredients.
+- nutrition: best-effort per-serving estimates as strings from ingredients.{lang_rule}
 - Output JSON only (no markdown)."""
 
     user_prompt = f"Post caption:\n{caption}\n\nReturn the complete recipe JSON now."
@@ -5378,7 +5700,7 @@ Rules:
                 {"role": "user", "content": user_prompt},
             ],
             temperature=0.1,
-            max_tokens=1800,
+            max_tokens=1400,
             response_format={"type": "json_object"},
             timeout=EXTRACT_RECIPE_TIMEOUT,
         )
@@ -5390,13 +5712,13 @@ Rules:
                 {"role": "user", "content": user_prompt},
             ],
             temperature=0.1,
-            max_tokens=1800,
+            max_tokens=1400,
             timeout=EXTRACT_RECIPE_TIMEOUT,
         )
     return _force_json(completion.choices[0].message.content.strip())
 
 
-def _extract_recipe_from_video_caption(meta: dict) -> dict | None:
+def _extract_recipe_from_video_caption(meta: dict, *, language: str | None = None) -> dict | None:
     """Parse recipe from social post caption when vision/transcript miss on-screen text."""
     caption = _video_caption_text(meta)
     if not _caption_looks_like_recipe(caption):
@@ -5421,10 +5743,13 @@ def _build_video_recipe_source(video_url: str, meta: dict, recipe: dict) -> dict
 
 
 def _video_meta_from_yt_info(info: dict, video_url: str) -> dict:
-    description = _combine_yt_caption_fields(info)
+    description = _combine_yt_caption_fields(info, video_url)
+    title = (info.get("title") or "").strip()
+    if _is_tiktok_video_url(video_url) and title and description and _is_unrelated_tiktok_description(description, title):
+        description = title
     return {
         "duration": info.get("duration"),
-        "title": info.get("title") or "",
+        "title": title,
         "description": description,
         "provider": (urlparse(video_url).hostname or ""),
         "extractor": info.get("extractor_key") or info.get("extractor") or "",
@@ -5433,7 +5758,7 @@ def _video_meta_from_yt_info(info: dict, video_url: str) -> dict:
     }
 
 
-def _combine_yt_caption_fields(info: dict) -> str:
+def _combine_yt_caption_fields(info: dict, video_url: str = "") -> str:
     """Merge all caption-like text yt-dlp may return (TikTok/IG descriptions vary by extractor)."""
     candidates: list[str] = []
     for key in ("description", "title", "fulltitle", "alt_title"):
@@ -5442,6 +5767,11 @@ def _combine_yt_caption_fields(info: dict) -> str:
             candidates.append(val)
     if not candidates:
         return ""
+    title = (info.get("title") or "").strip()
+    description = (info.get("description") or "").strip()
+    url = video_url or info.get("webpage_url") or ""
+    if _is_tiktok_video_url(url) and title and description and _is_unrelated_tiktok_description(description, title):
+        return title
     primary = max(candidates, key=len)
     extras = [c for c in candidates if c != primary and c not in primary]
     if extras:
@@ -5589,9 +5919,9 @@ def _fetch_youtube_transcript(video_url: str, *, meta: dict | None = None) -> tu
 def _social_vision_max_download_seconds(meta: dict, url: str) -> int | None:
     """Cap IG/TikTok video bytes downloaded for frame extraction (recipe text is usually early)."""
     try:
-        cap = int(os.getenv("EXTRACT_RECIPE_SOCIAL_VISION_MAX_SECONDS", "45"))
+        cap = int(os.getenv("EXTRACT_RECIPE_SOCIAL_VISION_MAX_SECONDS", "20"))
     except ValueError:
-        cap = 45
+        cap = 20
     if cap <= 0:
         return None
     lowered = (url or "").lower()
@@ -5612,15 +5942,15 @@ def _effective_vision_duration(meta: dict, url: str) -> float:
 
 
 def _prefer_vision_first_for_video_url(url: str) -> bool:
-    """IG/TikTok: fetch post caption first; vision is fallback when caption is incomplete."""
+    """IG/TikTok video reels: fetch post caption first; vision is fallback when caption is incomplete."""
     if (os.getenv("EXTRACT_RECIPE_SOCIAL_VISION_FIRST") or "1").strip().lower() in ("0", "false", "no"):
         return False
+    if _is_tiktok_photo_url(url):
+        return False
     lowered = (url or "").lower()
-    return (
-        "instagram.com/reel" in lowered
-        or "instagram.com/p/" in lowered
-        or "tiktok.com/" in lowered
-    )
+    if "instagram.com/reel" in lowered or "instagram.com/p/" in lowered:
+        return True
+    return _is_tiktok_video_reel_url(url)
 
 
 def _frame_jpeg_max_width() -> int:
@@ -6669,13 +6999,23 @@ def _resize_image_bytes_to_jpeg_data_url(image_bytes: bytes) -> str:
 
 
 def _slideshow_request_headers() -> dict:
+    """Desktop Chrome UA — TikTok photo slideshow JSON is empty with mobile/iPhone UA."""
     return {
         "User-Agent": (
-            "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) "
-            "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1"
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
         ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
     }
+
+
+def _strip_url_query(url: str) -> str:
+    """Drop tracking query params before fetching TikTok pages."""
+    p = urlparse(url or "")
+    if not p.scheme or not p.netloc:
+        return url
+    return urlunparse((p.scheme, p.netloc, p.path, "", "", ""))
 
 
 def _slideshow_requests_session() -> requests.Session:
@@ -6713,8 +7053,20 @@ def _resolve_tiktok_short_url(url: str) -> str:
 
 
 def _is_tiktok_photo_url(url: str) -> bool:
-    lowered = (url or "").lower()
-    return "tiktok.com" in lowered and "/photo/" in lowered
+    """True for TikTok /photo/ slideshow posts (not /video/ reels)."""
+    try:
+        p = urlparse(url or "")
+        host = (p.hostname or "").lower()
+        if not any(h in host for h in ("tiktok.com", "vt.tiktok.com", "vm.tiktok.com")):
+            return False
+        return bool(re.search(r"/photo/\d+", p.path, re.I))
+    except Exception:
+        return False
+
+
+def _is_tiktok_video_reel_url(url: str) -> bool:
+    """TikTok video/reel URLs — excludes /photo/ slideshow posts."""
+    return _is_tiktok_video_url(url) and not _is_tiktok_photo_url(url)
 
 
 def _is_instagram_post_url(url: str) -> bool:
@@ -6747,34 +7099,44 @@ def _make_instaloader() -> instaloader.Instaloader:
     return L
 
 
-def _collect_tiktok_desc_from_json(obj, best: list[str]) -> None:
-    """Walk TikTok page JSON and keep the longest video desc (expandable post caption)."""
+def _collect_tiktok_desc_from_json(obj, best: list[str], best_lang: list[str] | None = None, locked: list[bool] | None = None) -> None:
+    """Walk TikTok page JSON; prefer itemStruct.desc (actual post) over unrelated longer strings."""
+    if locked is None:
+        locked = [False]
     if isinstance(obj, dict):
         desc = None
         item_struct = obj.get("itemStruct")
         if isinstance(item_struct, dict):
             desc = item_struct.get("desc")
-        elif isinstance(obj.get("desc"), str) and any(
+            if best_lang is not None:
+                for lk in ("textLanguage", "language", "descLanguage", "lang"):
+                    code = _normalize_language_code(item_struct.get(lk))
+                    if code:
+                        best_lang[:] = [code]
+            if isinstance(desc, str) and desc.strip():
+                best[:] = [desc.strip()]
+                locked[0] = True
+        elif not locked[0] and isinstance(obj.get("desc"), str) and any(
             k in obj for k in ("id", "video", "createTime", "author", "stats")
         ):
             desc = obj.get("desc")
-        if isinstance(desc, str):
+        if not locked[0] and isinstance(desc, str):
             text = desc.strip()
             if len(text) > len(best[0] if best else ""):
                 best[:] = [text]
         for value in obj.values():
-            _collect_tiktok_desc_from_json(value, best)
+            _collect_tiktok_desc_from_json(value, best, best_lang, locked)
     elif isinstance(obj, list):
         for item in obj:
-            _collect_tiktok_desc_from_json(item, best)
+            _collect_tiktok_desc_from_json(item, best, best_lang, locked)
 
 
-def _fetch_tiktok_page_caption(url: str) -> str | None:
-    """Fetch the full TikTok post description from page HTML (shown after tapping 'more')."""
+def _fetch_tiktok_page_info(url: str) -> tuple[str | None, str | None]:
+    """Fetch TikTok post caption + language from page HTML (shown after tapping 'more')."""
     if (os.getenv("EXTRACT_RECIPE_TIKTOK_PAGE_CAPTION") or "1").strip().lower() in ("0", "false", "no"):
-        return None
+        return None, None
     if "tiktok.com" not in (url or "").lower():
-        return None
+        return None, None
     try:
         resolved = _resolve_tiktok_short_url(url)
         sess = _slideshow_requests_session()
@@ -6786,6 +7148,7 @@ def _fetch_tiktok_page_caption(url: str) -> str | None:
         )
         resp.raise_for_status()
         best: list[str] = [""]
+        best_lang: list[str] = []
         for pattern in (
             r'<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>(.*?)</script>',
             r'<script id="SIGI_STATE"[^>]*>(.*?)</script>',
@@ -6797,13 +7160,22 @@ def _fetch_tiktok_page_caption(url: str) -> str | None:
                 data = json.loads(match.group(1))
             except json.JSONDecodeError:
                 continue
-            _collect_tiktok_desc_from_json(data, best)
-        if best[0]:
-            print(f"📝 TikTok page caption fetched ({len(best[0])} chars)")
-        return best[0] or None
+            _collect_tiktok_desc_from_json(data, best, best_lang)
+        caption = best[0] or None
+        lang = best_lang[0] if best_lang else None
+        if caption:
+            print(f"📝 TikTok page caption fetched ({len(caption)} chars)")
+        if lang:
+            print(f"🌐 TikTok post language: {lang}")
+        return caption, lang
     except Exception as e:
         print(f"⚠️ TikTok page caption fetch failed: {e}")
-        return None
+        return None, None
+
+
+def _fetch_tiktok_page_caption(url: str) -> str | None:
+    caption, _ = _fetch_tiktok_page_info(url)
+    return caption
 
 
 def _fetch_instagram_page_caption(url: str) -> str | None:
@@ -6827,19 +7199,41 @@ def _fetch_instagram_page_caption(url: str) -> str | None:
 
 
 def _fetch_social_reel_meta(video_url: str) -> dict:
-    """One page fetch + yt-dlp info for TikTok/IG (avoids duplicate TikTok HTML requests)."""
-    page_caption = None
+    """Parallel page fetch + yt-dlp info for TikTok/IG."""
     lowered = (video_url or "").lower()
-    if "tiktok.com" in lowered:
-        page_caption = _fetch_tiktok_page_caption(video_url)
-    elif "instagram.com" in lowered:
-        page_caption = _fetch_instagram_page_caption(video_url)
+    page_box: dict = {"caption": None, "lang": None}
+    yt_box: dict = {"meta": None, "error": None}
 
-    try:
-        info = _yt_meta(video_url)
-        meta = _video_meta_from_yt_info(info, video_url)
-    except Exception as e:
-        print(f"⚠️ yt-dlp metadata failed, using page caption only: {e}")
+    def _fetch_page():
+        if "tiktok.com" in lowered:
+            page_box["caption"], page_box["lang"] = _fetch_tiktok_page_info(video_url)
+        elif "instagram.com" in lowered:
+            page_box["caption"] = _fetch_instagram_page_caption(video_url)
+
+    def _fetch_yt():
+        try:
+            info = _yt_meta(video_url)
+            meta = _video_meta_from_yt_info(info, video_url)
+            yt_lang = _normalize_language_code(info.get("language") or info.get("lang"))
+            if yt_lang:
+                meta["language"] = yt_lang
+            yt_box["meta"] = meta
+        except Exception as e:
+            yt_box["error"] = e
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        f_page = executor.submit(_fetch_page)
+        f_yt = executor.submit(_fetch_yt)
+        f_page.result()
+        f_yt.result()
+
+    page_caption = page_box["caption"]
+    page_lang = page_box["lang"]
+
+    if yt_box["meta"]:
+        meta = yt_box["meta"]
+    else:
+        print(f"⚠️ yt-dlp metadata failed, using page caption only: {yt_box['error']}")
         meta = {
             "duration": None,
             "title": "",
@@ -6851,9 +7245,15 @@ def _fetch_social_reel_meta(video_url: str) -> dict:
         }
 
     existing = (meta.get("description") or "").strip()
+    title = (meta.get("title") or "").strip()
     if page_caption and len(page_caption) > len(existing):
-        print(f"📝 Post caption enriched: {len(existing)} → {len(page_caption)} chars")
-        meta["description"] = page_caption
+        if not _is_unrelated_tiktok_description(page_caption, title):
+            print(f"📝 Post caption enriched: {len(existing)} → {len(page_caption)} chars")
+            meta["description"] = page_caption
+        else:
+            print("📝 Skipping unrelated page caption (language/topic mismatch with title)")
+    if page_lang:
+        meta["language"] = page_lang
     return meta
 
 
@@ -6875,16 +7275,77 @@ def _enrich_social_meta_from_page(meta: dict, video_url: str) -> dict:
 
 def _merge_meta_keep_longer_description(meta: dict, update: dict) -> dict:
     merged = dict(meta)
+    prev_lang = merged.get("language")
     merged.update(update)
     old = (meta.get("description") or "").strip()
     new = (update.get("description") or "").strip()
     if len(old) > len(new):
         merged["description"] = old
+    if prev_lang:
+        merged["language"] = prev_lang
     return merged
 
 
+def _tiktok_photo_to_video_url(url: str) -> str:
+    """TikTok photo posts expose full item JSON at the equivalent /video/ URL."""
+    match = re.search(
+        r"(https?://(?:www\.)?tiktok\.com/@[^/]+/)photo/(\d+)",
+        url or "",
+        re.I,
+    )
+    if match:
+        return f"{match.group(1)}video/{match.group(2)}"
+    return url
+
+
+def _extract_tiktok_image_post_from_page(data: dict) -> tuple[list[str], dict] | None:
+    """Parse slideshow images from TikTok __UNIVERSAL_DATA_FOR_REHYDRATION__ JSON."""
+    if not isinstance(data, dict):
+        return None
+    scope = data.get("__DEFAULT_SCOPE__", data)
+    if not isinstance(scope, dict):
+        return None
+    video_detail = scope.get("webapp.video-detail")
+    if not isinstance(video_detail, dict):
+        return None
+    if video_detail.get("statusCode") not in (None, 0):
+        return None
+    item = (video_detail.get("itemInfo") or {}).get("itemStruct") or {}
+    image_post = item.get("imagePost")
+    if not isinstance(image_post, dict):
+        return None
+    images = image_post.get("images") or []
+    urls: list[str] = []
+    for img in images:
+        if not isinstance(img, dict):
+            continue
+        image_url = img.get("imageURL") or img.get("imageUrl") or {}
+        if isinstance(image_url, dict):
+            url_list = image_url.get("urlList") or image_url.get("url_list") or []
+            if url_list:
+                urls.append(url_list[0])
+    if not urls:
+        return None
+    title = (item.get("desc") or image_post.get("title") or "").strip()
+    lang = None
+    for lk in ("textLanguage", "language", "descLanguage", "lang"):
+        lang = _normalize_language_code(item.get(lk))
+        if lang:
+            break
+    meta = {
+        "title": title,
+        "description": title,
+        "slide_count": len(urls),
+        "provider": "tiktok.com",
+        "extractor": "tiktok_photo",
+    }
+    if lang:
+        meta["language"] = lang
+    return urls, meta
+
+
 def _walk_tiktok_image_post(obj):
-    """Find TikTok photo-mode slideshow images inside embedded page JSON."""
+    """Fallback walk for imagePost nested elsewhere in page JSON."""
     if isinstance(obj, dict):
         image_post = obj.get("imagePost")
         if isinstance(image_post, dict):
@@ -6894,9 +7355,9 @@ def _walk_tiktok_image_post(obj):
                 for img in images:
                     if not isinstance(img, dict):
                         continue
-                    image_url = img.get("imageURL")
+                    image_url = img.get("imageURL") or img.get("imageUrl")
                     if isinstance(image_url, dict):
-                        url_list = image_url.get("urlList") or []
+                        url_list = image_url.get("urlList") or image_url.get("url_list") or []
                         if url_list:
                             urls.append(url_list[0])
                 if urls:
@@ -6914,17 +7375,8 @@ def _walk_tiktok_image_post(obj):
     return None
 
 
-def _fetch_tiktok_photo_slideshow(url: str) -> tuple[list[str], dict] | None:
-    """Download a TikTok /photo/ page and extract slideshow image CDN URLs."""
-    sess = _slideshow_requests_session()
-    resp = sess.get(
-        url,
-        headers=_slideshow_request_headers(),
-        allow_redirects=True,
-        timeout=EXTRACT_RECIPE_TIMEOUT,
-    )
-    resp.raise_for_status()
-    html = resp.text
+def _parse_tiktok_slideshow_html(html: str) -> tuple[list[str], dict] | None:
+    """Extract slideshow image URLs from TikTok page HTML (UNIVERSAL_DATA or SIGI_STATE)."""
     for pattern in (
         r'<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>(.*?)</script>',
         r'<script id="SIGI_STATE"[^>]*>(.*?)</script>',
@@ -6936,12 +7388,58 @@ def _fetch_tiktok_photo_slideshow(url: str) -> tuple[list[str], dict] | None:
             data = json.loads(match.group(1))
         except json.JSONDecodeError:
             continue
-        found = _walk_tiktok_image_post(data)
+        found = _extract_tiktok_image_post_from_page(data)
+        if not found:
+            found = _walk_tiktok_image_post(data)
         if found:
-            image_urls, meta = found
-            meta.setdefault("provider", "tiktok.com")
-            meta.setdefault("extractor", "tiktok_photo")
-            return image_urls, meta
+            return found
+    return None
+
+
+def _tiktok_slideshow_page_urls(url: str, *, resolved: str | None = None) -> list[str]:
+    """Ordered page URLs to try — video page first, then original /photo/ (legacy)."""
+    bases: list[str] = []
+    for candidate in (_strip_url_query(url), _strip_url_query(resolved) if resolved else None):
+        if candidate and candidate not in bases:
+            bases.append(candidate)
+    ordered: list[str] = []
+    seen: set[str] = set()
+
+    def _add(page_url: str) -> None:
+        if page_url and page_url not in seen:
+            seen.add(page_url)
+            ordered.append(page_url)
+
+    for base in bases:
+        _add(_tiktok_photo_to_video_url(base))
+        _add(base)
+    return ordered
+
+
+def _fetch_tiktok_photo_slideshow(url: str, *, resolved: str | None = None) -> tuple[list[str], dict] | None:
+    """Download TikTok photo/slideshow pages and extract image CDN URLs."""
+    if "tiktok.com" not in (url or "").lower():
+        return None
+    sess = _slideshow_requests_session()
+    for fetch_url in _tiktok_slideshow_page_urls(url, resolved=resolved):
+        try:
+            print(f"📸 Trying TikTok slideshow page: {fetch_url}")
+            resp = sess.get(
+                fetch_url,
+                headers=_slideshow_request_headers(),
+                allow_redirects=True,
+                timeout=EXTRACT_RECIPE_TIMEOUT,
+            )
+            resp.raise_for_status()
+            found = _parse_tiktok_slideshow_html(resp.text)
+            if found:
+                image_urls, meta = found
+                meta.setdefault("provider", "tiktok.com")
+                meta.setdefault("extractor", "tiktok_photo")
+                print(f"📸 TikTok photo slideshow: {len(image_urls)} image(s) from {fetch_url}")
+                return image_urls, meta
+        except Exception as e:
+            print(f"⚠️ TikTok slideshow page failed ({fetch_url}): {e}")
     return None
 
 
@@ -6980,11 +7478,25 @@ def _fetch_instagram_carousel_slideshow(url: str) -> tuple[list[str], dict] | No
     }
 
 
-def _slideshow_image_urls(url: str) -> tuple[list[str], dict] | None:
-    """Return TikTok photo-post slideshow image URLs. Does not probe Instagram (video pipeline first)."""
-    if _is_tiktok_photo_url(url):
-        return _fetch_tiktok_photo_slideshow(url)
+def _slideshow_image_urls(url: str, *, resolved: str | None = None) -> tuple[list[str], dict] | None:
+    """Return TikTok /photo/ slideshow image URLs only (never probes /video/ reels)."""
+    if _is_tiktok_photo_url(url) or (resolved and _is_tiktok_photo_url(resolved)):
+        return _fetch_tiktok_photo_slideshow(url, resolved=resolved)
     return None
+
+
+def _tiktok_download_error_suggests_photo_post(error_str: str) -> bool:
+    """yt-dlp 'Unsupported URL' on a /video/ link may be a photo-mode post."""
+    lower = (error_str or "").lower()
+    return any(
+        m in lower
+        for m in (
+            "unsupported url",
+            "photomode",
+            "image post",
+            "no video formats",
+        )
+    )
 
 
 def _fetch_image_data_urls(image_urls: list[str]) -> list[str]:
@@ -7025,9 +7537,11 @@ def _extract_recipe_from_slideshow(url: str, url_key: str, slideshow: tuple[list
         data_urls = _fetch_image_data_urls(image_urls)
         print(f"📥 Slideshow images ready in {time.time() - t_dl:.2f}s")
         t_llm = time.time()
-        recipe = extract_recipe_from_slideshow_llm(data_urls, caption=meta.get("title", ""))
+        recipe = extract_recipe_from_slideshow_llm(
+            data_urls, caption=meta.get("title", "")
+        )
         print(f"🧠 Slideshow vision LLM finished in {time.time() - t_llm:.2f}s")
-        _enrich_recipe_response(recipe)
+        lang = _finalize_recipe_for_response(recipe, meta)
         tags = extract_recipe_tags(recipe)
         source = {
             "type": "slideshow",
@@ -7044,7 +7558,9 @@ def _extract_recipe_from_slideshow(url: str, url_key: str, slideshow: tuple[list
             "transcript": None,
             "extraction": {"method": "slideshow_vision", "confidence": 0.6},
             "meta": meta,
+            "language": lang,
         }
+        result = _apply_response_language(result, url, meta)
         with _recipe_cache_lock:
             _recipe_cache[url_key] = result
         print(f"✅ Slideshow recipe extracted in {time.time() - t0:.2f}s")
@@ -7058,14 +7574,23 @@ def _extract_recipe_from_slideshow(url: str, url_key: str, slideshow: tuple[list
         }), 500
 
 
-def _try_slideshow_fallback_on_download_error(url: str, url_key: str):
+def _try_slideshow_fallback_on_download_error(
+    url: str, url_key: str, *, download_error: str | None = None
+):
     """
     Only invoked after the normal video download path fails.
-    Does not run for URLs that the existing pipeline can still handle as video.
+    TikTok /photo/ and IG carousels only — regular TikTok/IG/YouTube videos are untouched.
     Returns a Flask (response, status) tuple on success/failure, or None to keep the original error.
     """
     resolved = _resolve_tiktok_short_url(url)
-    slideshow = _slideshow_image_urls(resolved)
+    slideshow = _slideshow_image_urls(url, resolved=resolved)
+    if (
+        not slideshow
+        and _is_tiktok_video_reel_url(url)
+        and _tiktok_download_error_suggests_photo_post(download_error or "")
+    ):
+        print("📸 TikTok download unsupported — probing photo slideshow JSON on video page")
+        slideshow = _fetch_tiktok_photo_slideshow(url, resolved=resolved)
     if not slideshow and _is_instagram_post_url(url):
         slideshow = _fetch_instagram_carousel_slideshow(url)
     if not slideshow:
@@ -7079,19 +7604,28 @@ def _try_tiktok_photo_slideshow_fast_path(url: str, url_key: str):
     """
     Skip yt-dlp for confirmed TikTok /photo/ posts — they always fail video download.
     Only runs for TikTok URLs that resolve to /photo/; video/reel URLs are untouched.
+    Returns None when this handler does not apply (caller continues video pipeline).
     """
     lowered = (url or "").lower()
     if "tiktok.com" not in lowered and "vt.tiktok.com" not in lowered and "vm.tiktok.com" not in lowered:
         return None
     resolved = _resolve_tiktok_short_url(url)
-    if not _is_tiktok_photo_url(resolved):
+    is_photo = _is_tiktok_photo_url(url) or _is_tiktok_photo_url(resolved)
+    if not is_photo:
         return None
-    slideshow = _slideshow_image_urls(resolved)
-    if not slideshow:
-        return None
-    cache_key = hashlib.sha256(resolved.encode()).hexdigest()
-    print(f"⚡ TikTok photo fast-path: {url} -> {resolved}")
-    return _extract_recipe_from_slideshow(resolved, url_key, slideshow)
+    slideshow = _fetch_tiktok_photo_slideshow(url, resolved=resolved)
+    if slideshow:
+        print(f"⚡ TikTok photo fast-path: {url} -> {resolved}")
+        return _extract_recipe_from_slideshow(resolved, url_key, slideshow)
+    return None
+
+
+def _tiktok_photo_slideshow_error_response():
+    return jsonify({
+        "error": "Failed to fetch TikTok photo slideshow",
+        "user_message": "We couldn't read this photo slideshow. Please try another link or add the recipe manually.",
+        "details": "Could not extract images from this TikTok photo post.",
+    }), 400
 
 
 def extract_recipe_from_video_internal(video_url: str):
@@ -7116,12 +7650,19 @@ def extract_recipe_from_video_internal(video_url: str):
     with _recipe_cache_lock:
         if url_key in _recipe_cache:
             print(f"⚡ Cache hit for video URL: {video_url}")
-            return jsonify({**_recipe_cache[url_key], "cached": True}), 200
+            cached = _apply_response_language(
+                dict(_recipe_cache[url_key]), video_url, _recipe_cache[url_key].get("meta") or {}
+            )
+            return jsonify({**cached, "cached": True}), 200
     # ─────────────────────────────────────────────────────────────────────────
 
     tiktok_photo_resp = _try_tiktok_photo_slideshow_fast_path(video_url, url_key)
     if tiktok_photo_resp is not None:
         return tiktok_photo_resp
+
+    resolved_tt = _resolve_tiktok_short_url(video_url)
+    if _is_tiktok_photo_url(video_url) or _is_tiktok_photo_url(resolved_tt):
+        return _tiktok_photo_slideshow_error_response()
 
     yt_prefetched_meta: dict | None = None
     if is_youtube_url(video_url):
@@ -7225,7 +7766,9 @@ def extract_recipe_from_video_internal(video_url: str):
                 except ValueError as ve:
                     return jsonify({"error": str(ve)}), 413
                 except yt_dlp.utils.DownloadError as de:
-                    slideshow_resp = _try_slideshow_fallback_on_download_error(video_url, url_key)
+                    slideshow_resp = _try_slideshow_fallback_on_download_error(
+                        video_url, url_key, download_error=str(de)
+                    )
                     if slideshow_resp is not None:
                         return slideshow_resp
                     print(f"[extract-recipe] 400: video download failed for {video_url[:120]}: {str(de)[:200]}")
@@ -7261,7 +7804,7 @@ def extract_recipe_from_video_internal(video_url: str):
                         ),
                         "message": "Incomplete recipe extraction (missing ingredients or steps).",
                     }), 500
-                _enrich_recipe_response(recipe)
+                lang = _finalize_recipe_for_response(recipe, meta)
                 tags = extract_recipe_tags(recipe)
                 _result = {
                     "source": source,
@@ -7271,9 +7814,7 @@ def extract_recipe_from_video_internal(video_url: str):
                     "extraction": {"method": extraction_method, "confidence": 0.5},
                     "meta": meta,
                 }
-                with _recipe_cache_lock:
-                    _recipe_cache[url_key] = _result
-                return jsonify(_result), 200
+                return _return_video_extract_result(_result, url_key, video_url, meta, language=lang)
             return jsonify({
                 "error": "Failed to extract recipe from video",
                 "user_message": "We couldn't extract a recipe from this link. Please try another or add the recipe manually.",
@@ -7345,7 +7886,9 @@ def extract_recipe_from_video_internal(video_url: str):
             if audio_dl.get("error") and video_dl.get("error"):
                 de = video_dl["error"]
                 if isinstance(de, yt_dlp.utils.DownloadError):
-                    slideshow_resp = _try_slideshow_fallback_on_download_error(video_url, url_key)
+                    slideshow_resp = _try_slideshow_fallback_on_download_error(
+                        video_url, url_key, download_error=str(de)
+                    )
                     if slideshow_resp is not None:
                         return slideshow_resp
                     error_str = str(de)
@@ -7407,12 +7950,10 @@ def extract_recipe_from_video_internal(video_url: str):
             source = vision_result.get("source")
             extraction_method = vision_result.get("method")
             if recipe and source:
-                _enrich_recipe_response(recipe)
+                lang = _finalize_recipe_for_response(recipe, meta)
                 tags = extract_recipe_tags(recipe)
                 _result = {"source": source, "recipe": recipe, "tags": tags, "transcript": None, "extraction": {"method": extraction_method, "confidence": 0.5}, "meta": meta}
-                with _recipe_cache_lock:
-                    _recipe_cache[url_key] = _result
-                return jsonify(_result), 200
+                return _return_video_extract_result(_result, url_key, video_url, meta, language=lang)
             return jsonify({
                 "error": "Failed to extract recipe from video",
                 "user_message": "We couldn't extract a recipe from this link. Please try another or add the recipe manually.",
@@ -7430,12 +7971,10 @@ def extract_recipe_from_video_internal(video_url: str):
             source = vision_result.get("source")
             extraction_method = vision_result.get("method")
             if recipe and source:
-                _enrich_recipe_response(recipe)
+                lang = _finalize_recipe_for_response(recipe, meta)
                 tags = extract_recipe_tags(recipe)
                 _result = {"source": source, "recipe": recipe, "tags": tags, "transcript": None, "extraction": {"method": extraction_method, "confidence": 0.5}, "meta": meta}
-                with _recipe_cache_lock:
-                    _recipe_cache[url_key] = _result
-                return jsonify(_result), 200
+                return _return_video_extract_result(_result, url_key, video_url, meta, language=lang)
             return jsonify({
                 "error": "Transcript is empty after cleanup",
                 "user_message": "We couldn't extract a recipe from this link. Please try another or add the recipe manually.",
@@ -7462,12 +8001,10 @@ def extract_recipe_from_video_internal(video_url: str):
             source = vision_result.get("source")
             extraction_method = vision_result.get("method")
             if recipe and source:
-                _enrich_recipe_response(recipe)
+                lang = _finalize_recipe_for_response(recipe, meta)
                 tags = extract_recipe_tags(recipe)
                 _result = {"source": source, "recipe": recipe, "tags": tags, "transcript": None, "extraction": {"method": extraction_method, "confidence": 0.5}, "meta": meta}
-                with _recipe_cache_lock:
-                    _recipe_cache[url_key] = _result
-                return jsonify(_result), 200
+                return _return_video_extract_result(_result, url_key, video_url, meta, language=lang)
             return jsonify({
                 "error": "Failed to extract recipe from transcript chunk",
                 "user_message": "We couldn't extract a recipe from this link. Please try another or add the recipe manually.",
@@ -7502,12 +8039,10 @@ def extract_recipe_from_video_internal(video_url: str):
             if fallback_recipe and fallback_source and (
                 fallback_recipe.get("instructions") or fallback_recipe.get("ingredients")
             ):
-                _enrich_recipe_response(fallback_recipe)
+                lang = _finalize_recipe_for_response(fallback_recipe, meta)
                 tags = extract_recipe_tags(fallback_recipe)
                 _result = {"source": fallback_source, "recipe": fallback_recipe, "tags": tags, "transcript": None, "extraction": {"method": extraction_method, "confidence": 0.5}, "meta": meta}
-                with _recipe_cache_lock:
-                    _recipe_cache[url_key] = _result
-                return jsonify(_result), 200
+                return _return_video_extract_result(_result, url_key, video_url, meta, language=lang)
         elif not ingredients:
             print("🎬 Ingredients empty from transcript; running frame+vision fallback...")
             _run_vision()
@@ -7515,15 +8050,13 @@ def extract_recipe_from_video_internal(video_url: str):
             fallback_source = vision_result.get("source")
             extraction_method = vision_result.get("method")
             if fallback_recipe and fallback_source:
-                _enrich_recipe_response(fallback_recipe)
+                lang = _finalize_recipe_for_response(fallback_recipe, meta)
                 tags = extract_recipe_tags(fallback_recipe)
                 _result = {"source": fallback_source, "recipe": fallback_recipe, "tags": tags, "transcript": None, "extraction": {"method": extraction_method, "confidence": 0.5}, "meta": meta}
-                with _recipe_cache_lock:
-                    _recipe_cache[url_key] = _result
-                return jsonify(_result), 200
+                return _return_video_extract_result(_result, url_key, video_url, meta, language=lang)
 
         source_type = determine_source_type(video_url)
-        _enrich_recipe_response(recipe)
+        lang = _finalize_recipe_for_response(recipe, meta)
         tags = extract_recipe_tags(recipe)
         source = {
             "type": "video",
@@ -7541,12 +8074,7 @@ def extract_recipe_from_video_internal(video_url: str):
             "extraction": {"method": transcript_extraction_method, "confidence": 0.55},
             "meta": meta,
         }
-        with _recipe_cache_lock:
-            _recipe_cache[url_key] = _result
-        return jsonify(_result), 200
-
-    except Exception as e:
-        print(f"💥 Critical error in extract_recipe_from_video_internal: {str(e)}")
+        return _return_video_extract_result(_result, url_key, video_url, meta, language=lang)
         return jsonify({
                 "error": "Unexpected server error",
                 "user_message": DEFAULT_500_USER_MESSAGE,

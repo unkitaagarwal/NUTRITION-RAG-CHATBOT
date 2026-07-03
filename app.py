@@ -3059,7 +3059,9 @@ def extract_recipe_from_video():
         with _recipe_cache_lock:
             if url_key in _recipe_cache:
                 print(f"⚡ Cache hit for video URL: {video_url}")
-                return jsonify({**_recipe_cache[url_key], "cached": True})
+                cached = dict(_recipe_cache[url_key])
+                _ensure_cached_recipe_nutrition(cached)
+                return jsonify({**cached, "cached": True})
         # ─────────────────────────────────────────────────────────────────────────
 
         print(f"🎥 Processing video URL: {video_url}")
@@ -3608,13 +3610,108 @@ def extract_recipe_tags(recipe: dict) -> list[str]:
     
     return tags
 
-def fetch_html(url: str, timeout: int | None = None) -> str:
-    headers = {
-        "User-Agent": "Mozilla/5.0 (RecipeBot/1.0)"
+# ── Tiered webpage fetching ──────────────────────────────────────────────
+# Tier 1: direct fetch with realistic browser headers (handles most sites).
+# Tier 2: ScraperAPI fallback for sites behind Cloudflare / anti-bot walls
+#         (e.g. AllRecipes). Only used when a block is detected AND a key is
+#         configured; degrades gracefully to a clean error otherwise.
+SCRAPER_API_KEY = os.getenv("SCRAPER_API_KEY", "").strip()
+SCRAPER_API_ENDPOINT = "https://api.scraperapi.com/"
+# ScraperAPI retries internally for up to ~60s, so its client timeout must be
+# generous and independent of the (shorter) LLM budget.
+SCRAPER_API_TIMEOUT = int(os.getenv("SCRAPER_API_TIMEOUT", "70"))
+# ultra_premium activates advanced anti-bot bypass (needed for Cloudflare
+# *managed* challenges like AllRecipes). Costs more credits — disable via env
+# to save free-tier credits if you only hit lighter protections.
+SCRAPER_API_ULTRA = os.getenv("SCRAPER_API_ULTRA", "true").strip().lower() == "true"
+
+_BROWSER_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+    ),
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;q=0.9,"
+        "image/avif,image/webp,*/*;q=0.8"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+# HTTP statuses that typically indicate an anti-bot block rather than a real
+# "page missing" error — worth retrying through the scraping fallback.
+_BLOCK_STATUSES = {401, 402, 403, 429, 503}
+
+
+def _looks_like_challenge(html: str) -> bool:
+    """Detect a Cloudflare/anti-bot interstitial returned with a 200 status."""
+    if not html:
+        return True
+    snippet = html[:3000].lower()
+    return (
+        "just a moment" in snippet
+        or "challenges.cloudflare.com" in snippet
+        or "_cf_chl_opt" in snippet
+        or "enable javascript and cookies to continue" in snippet
+    )
+
+
+def _fetch_via_scraperapi(url: str) -> str:
+    """Fetch a URL through ScraperAPI (renders JS + solves Cloudflare)."""
+    params = {
+        "api_key": SCRAPER_API_KEY,
+        "url": url,
+        "render": "true",  # execute JS / solve managed challenge
     }
-    r = requests.get(url, headers=headers, timeout=timeout or EXTRACT_RECIPE_TIMEOUT)
+    if SCRAPER_API_ULTRA:
+        params["ultra_premium"] = "true"  # advanced anti-bot bypass
+    r = requests.get(SCRAPER_API_ENDPOINT, params=params, timeout=SCRAPER_API_TIMEOUT)
     r.raise_for_status()
     return r.text
+
+
+def fetch_html(url: str, timeout: int | None = None) -> str:
+    timeout = timeout or EXTRACT_RECIPE_TIMEOUT
+    last_response = None
+    direct_error = None
+
+    # ── Tier 1: direct fetch with realistic browser headers ──────────────
+    try:
+        last_response = requests.get(url, headers=_BROWSER_HEADERS, timeout=timeout)
+        blocked = (
+            last_response.status_code in _BLOCK_STATUSES
+            or _looks_like_challenge(last_response.text)
+        )
+        if not blocked:
+            last_response.raise_for_status()
+            return last_response.text
+        print(f"[fetch_html] direct fetch blocked (status={last_response.status_code}) for {url[:120]}")
+    except requests.exceptions.RequestException as e:
+        direct_error = e
+        print(f"[fetch_html] direct fetch error for {url[:120]}: {str(e)[:200]}")
+
+    # ── Tier 2: ScraperAPI fallback (handles Cloudflare-protected sites) ──
+    if SCRAPER_API_KEY:
+        try:
+            print(f"[fetch_html] retrying via ScraperAPI (ultra={SCRAPER_API_ULTRA}) for {url[:120]}")
+            return _fetch_via_scraperapi(url)
+        except requests.exceptions.RequestException as e:
+            print(f"[fetch_html] ScraperAPI fetch failed for {url[:120]}: {str(e)[:200]}")
+    else:
+        print("[fetch_html] blocked and no SCRAPER_API_KEY set — cannot fall back")
+
+    # ── All tiers exhausted — raise a clean error for /extract-recipe ─────
+    if last_response is not None:
+        # Real block status (402/403/429/503) raises with the true code so the
+        # endpoint can show the right user message.
+        last_response.raise_for_status()
+        # 200 but challenge HTML: surface as a 403-style block.
+        synthetic = requests.models.Response()
+        synthetic.status_code = 403
+        synthetic._content = last_response.content
+        raise requests.exceptions.HTTPError(
+            "Blocked by anti-bot challenge (e.g. Cloudflare)", response=synthetic
+        )
+    raise direct_error
 
 def extract_og_image(soup: BeautifulSoup) -> str | None:
     og = soup.find("meta", property="og:image")
@@ -3828,9 +3925,30 @@ def normalize_recipe_from_jsonld(recipe_obj: dict, soup: BeautifulSoup):
     nutrition = recipe_obj.get("nutrition") or {}
     norm_nutrition = {}
     if isinstance(nutrition, dict):
-        for k, v in nutrition.items():
-            if isinstance(v, (str, int, float)):
-                norm_nutrition[k] = str(v)
+        for key in _RECIPE_NUTRITION_KEYS:
+            parsed = _parse_recipe_nutrition_value(
+                nutrition.get(key) or nutrition.get(key.replace("_g", "")),
+                calories=(key == "calories"),
+            )
+            if parsed:
+                norm_nutrition[key] = parsed
+        # JSON-LD may use proteinContent, carbohydrateContent, fatContent
+        alias_map = {
+            "protein_g": ("proteinContent", "protein"),
+            "carbs_g": ("carbohydrateContent", "carbs"),
+            "fat_g": ("fatContent", "fat"),
+            "calories": ("calories",),
+        }
+        for key, aliases in alias_map.items():
+            if key in norm_nutrition:
+                continue
+            for alias in aliases:
+                parsed = _parse_recipe_nutrition_value(
+                    nutrition.get(alias), calories=(key == "calories")
+                )
+                if parsed:
+                    norm_nutrition[key] = parsed
+                    break
 
     # Cuisine: recipeCuisine can be string or list in JSON-LD
     cuisine_raw = recipe_obj.get("recipeCuisine") or ""
@@ -3866,7 +3984,7 @@ def clean_page_text(html: str) -> str:
     return text.strip()[:40000]  # cap to avoid huge prompts
 
 def extract_recipe_from_webpage_llm(page_text: str):
-    system = """Extract recipe data from webpage text.
+    system = f"""Extract recipe data from webpage text.
 Return ONLY valid JSON:
 {
   "name": "",
@@ -3891,6 +4009,7 @@ Rules:
 - meal_type: exactly one of Breakfast, Lunch, Dinner, Snack (infer from context).
 - Infer cuisine from recipe name, ingredients, or context when evident (e.g. Italian, Mexican, Indian, American); otherwise use "".
 - You MUST provide a best-effort numeric estimate (as strings) for nutrition macros PER SERVING: calories, protein_g, carbs_g, fat_g. Use your nutrition knowledge of typical ingredients/quantities to approximate. Only leave a macro field \"\" if there is literally no information about ingredients.
+- {_RECIPE_NUTRITION_PROMPT_RULE}
 - Return JSON only."""
     user = f"Webpage text:\n{page_text}"
 
@@ -4030,7 +4149,7 @@ def extract_recipe_from_video_frames_llm(
             '"instructions":["Step 1: ...","Step 2: ..."],'
             '"servings":"","prep_time":"","cook_time":"","total_time":"",'
             '"notes":[],"meal_type":"","cuisine":"","nutrition":{"calories":"","protein_g":"","carbs_g":"","fat_g":""}}. '
-            f"meal_type: Breakfast|Lunch|Dinner|Snack. Estimate nutrition per serving.{lang_rule} JSON only."
+            f"meal_type: Breakfast|Lunch|Dinner|Snack. {_RECIPE_NUTRITION_PROMPT_RULE}{lang_rule} JSON only."
         )
         user_text = (
             f"These are {len(image_data_urls)} frame(s) from a short-form cooking video. "
@@ -4046,7 +4165,7 @@ def extract_recipe_from_video_frames_llm(
             '"instructions":["..."],"servings":"","prep_time":"","cook_time":"","total_time":"",'
             '"notes":[],"meal_type":"","cuisine":"","nutrition":{"calories":"","protein_g":"","carbs_g":"","fat_g":""}}. '
             "Read on-screen text and visible food. meal_type: Breakfast|Lunch|Dinner|Snack. "
-            "Estimate nutrition per serving when possible. JSON only."
+            f"{_RECIPE_NUTRITION_PROMPT_RULE} JSON only."
         )
         user_text = "Extract the recipe JSON from this video frame."
         detail = "low"
@@ -4086,7 +4205,7 @@ def extract_recipe_from_slideshow_llm(
         '"instructions":["..."],"servings":"","prep_time":"","cook_time":"","total_time":"",'
         '"notes":[],"meal_type":"","cuisine":"","nutrition":{"calories":"","protein_g":"","carbs_g":"","fat_g":""}}. '
         "Read every visible ingredient and cooking step across slides. "
-        f"meal_type: Breakfast|Lunch|Dinner|Snack. Estimate nutrition per serving when possible.{lang_rule} JSON only."
+        f"meal_type: Breakfast|Lunch|Dinner|Snack. {_RECIPE_NUTRITION_PROMPT_RULE}{lang_rule} JSON only."
     )
     content = [{
         "type": "text",
@@ -4118,7 +4237,7 @@ def extract_recipe_from_images_llm(image_data_urls: list):
     """Extract one combined recipe from one or more images (e.g. multi-page recipe). Uses vision LLM."""
     if not image_data_urls:
         raise ValueError("At least one image is required")
-    system = """Extract recipe data from the image(s). If multiple images are provided (e.g. multiple pages), combine them into ONE recipe.
+    system = f"""Extract recipe data from the image(s). If multiple images are provided (e.g. multiple pages), combine them into ONE recipe.
 Return ONLY valid JSON:
 {
   "name": "",
@@ -4143,6 +4262,7 @@ Rules:
 - meal_type: exactly one of Breakfast, Lunch, Dinner, Snack (infer from context).
 - Infer cuisine from recipe name, ingredients, or visible context when evident (e.g. Italian, Mexican, Indian); otherwise use "".
 - You MUST provide a best-effort numeric estimate (as strings) for nutrition macros PER SERVING: calories, protein_g, carbs_g, fat_g. Use your nutrition knowledge of typical ingredients/quantities to approximate from what you see. Only leave a macro field \"\" if there is literally no information about ingredients.
+- {_RECIPE_NUTRITION_PROMPT_RULE}
 - Return JSON only. Read all text visible across the images. Merge ingredients and instructions from all pages into one recipe."""
     content = [{"type": "text", "text": "Extract the recipe from these image(s) and return the JSON. If there are multiple images, treat them as one multi-page recipe and merge into a single recipe."}]
     for url in image_data_urls:
@@ -4377,6 +4497,177 @@ def _format_minutes_label(minutes: int) -> str:
     return f"{minutes} mins"
 
 
+_RECIPE_NUTRITION_KEYS = ("calories", "protein_g", "carbs_g", "fat_g")
+
+_RECIPE_NUTRITION_PROMPT_RULE = (
+    "Nutrition macros (calories, protein_g, carbs_g, fat_g) are PER SERVING and MUST be numeric strings only "
+    '(e.g. "120", "6.5"). Never use words like variable, approximate, varies, unknown, or descriptive text.'
+)
+
+_INVALID_NUTRITION_TEXT = (
+    "variable", "varies", "approximate", "approx", "unknown", "n/a", "na", "tbd",
+    "estimate", "depends", "not available", "per serving", "per piece", "per item",
+)
+
+
+def _format_recipe_nutrition_number(value: float, *, calories: bool = False) -> str:
+    if calories:
+        return str(int(round(value)))
+    if abs(value - round(value)) < 0.05:
+        return str(int(round(value)))
+    return str(round(value, 1))
+
+
+def _parse_recipe_nutrition_value(value, *, calories: bool = False) -> str | None:
+    """Return a normalized numeric macro string, or None when value is missing/invalid."""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        number = float(value)
+        if number < 0:
+            return None
+        return _format_recipe_nutrition_number(number, calories=calories)
+
+    text = str(value).strip()
+    if not text:
+        return None
+
+    lower = text.lower()
+    if not re.search(r"\d", text) and any(token in lower for token in _INVALID_NUTRITION_TEXT):
+        return None
+
+    match = re.search(r"(\d+(?:\.\d+)?)", text.replace(",", ""))
+    if not match:
+        return None
+
+    number = float(match.group(1))
+    if number < 0:
+        return None
+    return _format_recipe_nutrition_number(number, calories=calories)
+
+
+def _recipe_nutrition_macro_missing(value) -> bool:
+    return _parse_recipe_nutrition_value(value) is None
+
+
+def _normalize_recipe_nutrition_fields(nutrition: dict) -> set[str]:
+    """Normalize macro strings in place. Returns keys still missing a valid numeric value."""
+    missing: set[str] = set()
+    for key in _RECIPE_NUTRITION_KEYS:
+        parsed = _parse_recipe_nutrition_value(
+            nutrition.get(key), calories=(key == "calories")
+        )
+        if parsed is None:
+            nutrition.pop(key, None)
+            missing.add(key)
+        else:
+            nutrition[key] = parsed
+    return missing
+
+
+def _derive_calories_from_macros(nutrition: dict) -> bool:
+    """Fill calories from protein/carbs/fat when all three are known."""
+    protein = _parse_recipe_nutrition_value(nutrition.get("protein_g"))
+    carbs = _parse_recipe_nutrition_value(nutrition.get("carbs_g"))
+    fat = _parse_recipe_nutrition_value(nutrition.get("fat_g"))
+    if not (protein and carbs and fat):
+        return False
+    calories = 4 * float(protein) + 4 * float(carbs) + 9 * float(fat)
+    nutrition["calories"] = _format_recipe_nutrition_number(calories, calories=True)
+    return True
+
+
+def _estimate_recipe_nutrition_only_llm(recipe: dict, *, language: str | None = None) -> dict:
+    """Focused nutrition estimate when extraction returned placeholders or partial macros."""
+    servings = str(recipe.get("servings") or DEFAULT_RECIPE_SERVINGS).strip()
+    payload = {
+        "name": recipe.get("name") or "",
+        "servings": servings,
+        "ingredients": recipe.get("ingredients") or [],
+        "instructions": recipe.get("instructions") or [],
+    }
+    lang_rule = _metadata_language_rule(language)
+    system = (
+        "Estimate per-serving nutrition macros for a recipe from its ingredients and instructions. "
+        "Return ONLY JSON: "
+        '{"calories":"","protein_g":"","carbs_g":"","fat_g":""}. '
+        f"Every field MUST be a numeric string. {_RECIPE_NUTRITION_PROMPT_RULE}{lang_rule} JSON only."
+    )
+    user = f"Recipe:\n{json.dumps(payload, ensure_ascii=False)}\n\nReturn numeric per-serving macros."
+    try:
+        completion = client.chat.completions.create(
+            model=RECIPE_LLM_MODEL,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            temperature=0.2,
+            max_tokens=180,
+            response_format={"type": "json_object"},
+            timeout=EXTRACT_RECIPE_TIMEOUT,
+        )
+        data = json.loads(completion.choices[0].message.content.strip())
+        out = {}
+        for key in _RECIPE_NUTRITION_KEYS:
+            parsed = _parse_recipe_nutrition_value(
+                (data or {}).get(key), calories=(key == "calories")
+            )
+            if parsed:
+                out[key] = parsed
+        return out
+    except Exception as e:
+        print(f"⚠️ Recipe nutrition estimation failed: {e}")
+        return {}
+
+
+def _ensure_recipe_nutrition_macros(recipe: dict, *, language: str | None = None) -> None:
+    """Guarantee nutrition macros are numeric strings, estimating when needed."""
+    if not recipe:
+        return
+
+    nutrition = recipe.get("nutrition")
+    if not isinstance(nutrition, dict):
+        nutrition = {}
+        recipe["nutrition"] = nutrition
+
+    missing = _normalize_recipe_nutrition_fields(nutrition)
+    if "calories" in missing and _derive_calories_from_macros(nutrition):
+        missing.discard("calories")
+
+    if not missing:
+        return
+    if not _recipe_has_named_ingredients(recipe):
+        return
+
+    estimated = _estimate_recipe_nutrition_only_llm(recipe, language=language)
+    for key in list(missing):
+        if estimated.get(key):
+            nutrition[key] = estimated[key]
+
+    missing = _normalize_recipe_nutrition_fields(nutrition)
+    if "calories" in missing and _derive_calories_from_macros(nutrition):
+        missing.discard("calories")
+
+    if missing and _recipe_has_named_ingredients(recipe):
+        retry = _estimate_recipe_nutrition_only_llm(recipe, language=language)
+        for key in list(missing):
+            if retry.get(key):
+                nutrition[key] = retry[key]
+        missing = _normalize_recipe_nutrition_fields(nutrition)
+        if "calories" in missing and _derive_calories_from_macros(nutrition):
+            missing.discard("calories")
+
+    for key in missing:
+        nutrition[key] = "0"
+
+
+def _ensure_cached_recipe_nutrition(payload: dict) -> None:
+    recipe = payload.get("recipe")
+    if isinstance(recipe, dict):
+        lang = _normalize_language_code(payload.get("language") or recipe.get("language"))
+        _ensure_recipe_nutrition_macros(recipe, language=lang)
+
+
 def _estimate_missing_recipe_metadata_llm(recipe: dict, *, language: str | None = None) -> dict:
     """Estimate prep/cook times and per-serving nutrition when the source omits them."""
     servings = str(recipe.get("servings") or DEFAULT_RECIPE_SERVINGS).strip()
@@ -4395,7 +4686,7 @@ def _estimate_missing_recipe_metadata_llm(recipe: dict, *, language: str | None 
         "Times must be human-readable strings like \"15 mins\" or \"1 hr\" (not ISO). "
         "Infer prep_time from chopping/mixing/coating steps; cook_time from frying/baking/boiling steps. "
         "total_time should equal prep + cook. "
-        f"Macros are per serving as numeric strings.{lang_rule} JSON only."
+        f"{_RECIPE_NUTRITION_PROMPT_RULE}{lang_rule} JSON only."
     )
     user = f"Recipe:\n{json.dumps(payload, ensure_ascii=False)}\n\nReturn estimates."
     try:
@@ -4417,9 +4708,11 @@ def _estimate_missing_recipe_metadata_llm(recipe: dict, *, language: str | None 
             if val:
                 out[key] = val
         for key in ("calories", "protein_g", "carbs_g", "fat_g"):
-            val = str((data or {}).get(key) or "").strip()
-            if val:
-                out[key] = val
+            parsed = _parse_recipe_nutrition_value(
+                (data or {}).get(key), calories=(key == "calories")
+            )
+            if parsed:
+                out[key] = parsed
         return out
     except Exception as e:
         print(f"⚠️ Recipe metadata estimation failed: {e}")
@@ -4446,8 +4739,8 @@ def _fill_missing_recipe_metadata(recipe: dict, *, language: str | None = None) 
         nutrition = {}
         recipe["nutrition"] = nutrition
     fill_nutrition = {
-        key: not str(nutrition.get(key) or "").strip()
-        for key in ("calories", "protein_g", "carbs_g", "fat_g")
+        key: _recipe_nutrition_macro_missing(nutrition.get(key))
+        for key in _RECIPE_NUTRITION_KEYS
     }
 
     instructions = recipe.get("instructions") or []
@@ -4506,6 +4799,7 @@ def _enrich_recipe_response(recipe: dict, *, language: str | None = None) -> Non
             recipe["cuisine"] = ""
         recipe["diet_flags"] = []
     _fill_missing_recipe_metadata(recipe, language=language)
+    _ensure_recipe_nutrition_macros(recipe, language=language)
     recipe["description"] = _short_recipe_description(recipe, language=language)
 
 
@@ -4794,7 +5088,9 @@ def extract_recipe():
     with _recipe_cache_lock:
         if webpage_key in _recipe_cache:
             print(f"⚡ Cache hit for webpage URL: {url}")
-            return jsonify({**_recipe_cache[webpage_key], "cached": True})
+            cached = dict(_recipe_cache[webpage_key])
+            _ensure_cached_recipe_nutrition(cached)
+            return jsonify({**cached, "cached": True})
     # ─────────────────────────────────────────────────────────────────────────
 
     try:
@@ -4897,7 +5193,7 @@ def _force_json(text: str) -> dict:
 
 
 def _extract_recipe_chunk(transcript_chunk: str) -> dict:
-    system_prompt = """You extract recipe data from cooking transcripts.
+    system_prompt = f"""You extract recipe data from cooking transcripts.
 Return ONLY valid JSON matching:
 {
   "name": "",
@@ -4924,6 +5220,7 @@ Rules:
 - Ingredients must include quantities when stated; else quantity "".
 - Instructions must be actionable, chronological, and detailed.
 - You MUST provide a best-effort numeric estimate (as strings) for nutrition macros PER SERVING: calories, protein_g, carbs_g, fat_g. Use your nutrition knowledge of typical ingredients/quantities and transcript context to approximate. Only leave a macro field \"\" if there is literally no information about ingredients.
+- {_RECIPE_NUTRITION_PROMPT_RULE}
 - Output JSON only (no markdown, no commentary)."""
 
     user_prompt = f"Transcript:\n{transcript_chunk}\n\nReturn the JSON now."
@@ -4957,7 +5254,7 @@ Rules:
 
 
 def _merge_recipe_parts(parts: list[dict]) -> dict:
-    system_prompt = """Merge multiple partial recipe JSONs into ONE final recipe JSON.
+    system_prompt = f"""Merge multiple partial recipe JSONs into ONE final recipe JSON.
 Return ONLY valid JSON matching:
 {
   "name": "",
@@ -4984,6 +5281,7 @@ Rules:
 - For meal_type: use the first non-empty from parts (one of Breakfast, Lunch, Dinner, Snack); if none, use "Dinner".
 - For cuisine: use the first non-empty cuisine from the parts; if none, use "".
 - Merge/average any provided nutrition macros (calories, protein_g, carbs_g, fat_g) into a single best-effort estimate PER SERVING. If some parts omit macros, use available information from other parts. Only leave a macro field \"\" if ALL parts lack enough information.
+- {_RECIPE_NUTRITION_PROMPT_RULE}
 - Output JSON only."""
 
     user_prompt = json.dumps({"parts": parts}, ensure_ascii=False)
@@ -7653,6 +7951,7 @@ def extract_recipe_from_video_internal(video_url: str):
             cached = _apply_response_language(
                 dict(_recipe_cache[url_key]), video_url, _recipe_cache[url_key].get("meta") or {}
             )
+            _ensure_cached_recipe_nutrition(cached)
             return jsonify({**cached, "cached": True}), 200
     # ─────────────────────────────────────────────────────────────────────────
 

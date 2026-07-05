@@ -244,15 +244,16 @@ def _ytdlp_proxy(url: str) -> str | None:
 
     Direct-first strategy: the 1st attempt is proxy-free, and _ydl_extract()
     retries through the matching proxy only if the direct attempt is blocked.
-    Proxy fallback applies to YouTube and Facebook ONLY — Instagram/TikTok
-    work fine directly (with cookies) and never use a proxy.
+    Proxy fallback applies to YouTube and all social sites (Facebook,
+    Instagram, TikTok) — datacenter IPs (e.g. Render) get throttled/blocked
+    by TikTok's CDN even with valid cookies.
     Forcing the proxy on every request is opt-in:
-    YT_USE_PROXY=1 (YouTube) / SOCIAL_USE_PROXY=1 (Facebook).
+    YT_USE_PROXY=1 (YouTube) / SOCIAL_USE_PROXY=1 (FB/IG/TikTok).
     """
     try:
         if is_youtube_url(url):
             return (YT_PROXY or None) if YT_USE_PROXY else None
-        if _is_facebook_url(url):
+        if _is_social_proxy_url(url):
             return (SOCIAL_PROXY or None) if SOCIAL_USE_PROXY else None
     except Exception:
         pass
@@ -264,16 +265,23 @@ def _is_facebook_url(url: str) -> bool:
     return any(s in host for s in ("facebook.com", "fb.watch", "fb.com"))
 
 
+def _is_social_proxy_url(url: str) -> bool:
+    """Social sites that route through SOCIAL_PROXY (FB, Instagram, TikTok)."""
+    host = (urlparse(url).hostname or "").lower()
+    return _is_facebook_url(url) or any(
+        s in host for s in ("tiktok.com", "instagram.com", "instagr.am")
+    )
+
+
 def _fallback_proxy(url: str) -> str | None:
     """Proxy to retry through when a direct attempt is blocked, or None.
 
-    YouTube → YT_PROXY; Facebook → SOCIAL_PROXY (defaults to YT_PROXY).
-    Instagram/TikTok → no proxy ever (direct + cookies is sufficient).
+    YouTube → YT_PROXY; FB/Instagram/TikTok → SOCIAL_PROXY (defaults to YT_PROXY).
     """
     try:
         if is_youtube_url(url):
             return YT_PROXY or None
-        if _is_facebook_url(url):
+        if _is_social_proxy_url(url):
             return SOCIAL_PROXY or None
     except Exception:
         pass
@@ -7645,6 +7653,10 @@ def _slideshow_requests_session() -> requests.Session:
             sess.cookies = cj
         except Exception:
             pass
+    # Route TikTok page fetches through the residential proxy when enabled —
+    # datacenter IPs get served degraded/guest pages with truncated captions.
+    if SOCIAL_USE_PROXY and SOCIAL_PROXY:
+        sess.proxies = {"http": SOCIAL_PROXY, "https": SOCIAL_PROXY}
     return sess
 
 

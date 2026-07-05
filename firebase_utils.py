@@ -220,6 +220,118 @@ def upload_meal_image_bytes_to_storage(
     return firebase_url
 
 
+# ── MealMap (meal-plan-chef) recipe-extract image storage ─────────────────────
+# Re-hosts external recipe images (Instagram/TikTok thumbnails, og:image, etc.)
+# for the /extract-recipe endpoint so their URLs never expire.
+
+_MEALMAP_PROJECT_ID = "meal-plan-chef"
+_RECIPE_EXTRACT_IMG_PREFIX = (
+    os.getenv("RECIPE_EXTRACT_IMG_PREFIX") or "recipe-extract-img"
+).strip().strip("/")
+
+
+def _mealmap_storage_bucket():
+    """Return the Storage bucket for the MealMap (meal-plan-chef) project.
+
+    Bucket name resolves from MEALMAP_STORAGE_BUCKET, else
+    {MEALMAP_PROJECT_ID or 'meal-plan-chef'}.firebasestorage.app (the domain
+    newer Firebase projects use for their default bucket).
+    """
+    init_mealmap_firestore()  # ensures the named 'mealmap' app is initialized
+    app = firebase_admin.get_app(_MEALMAP_APP_NAME)
+    bucket_name = (os.getenv("MEALMAP_STORAGE_BUCKET") or "").strip()
+    if not bucket_name:
+        pid = (os.getenv("MEALMAP_PROJECT_ID") or _MEALMAP_PROJECT_ID).strip()
+        bucket_name = f"{pid}.firebasestorage.app"
+    return storage.bucket(bucket_name, app=app)
+
+
+def persist_extract_recipe_image(image_url: str | None) -> str | None:
+    """Download an external recipe image and re-host it in the MealMap Storage
+    bucket under recipe-extract-img/ (root level), so the returned URL is stable.
+
+    Returns a firebasestorage.googleapis.com URL on success, or None on
+    skip/failure — callers should fall back to the original URL.
+    """
+    if not image_url or not isinstance(image_url, str):
+        return None
+    if not image_url.lower().startswith(("http://", "https://")):
+        return None  # skip data: URLs, relative paths, already-hosted blanks
+    if "firebasestorage.googleapis.com" in image_url:
+        return None  # already re-hosted — don't download+re-upload our own URL
+    if (os.getenv("DISABLE_EXTRACT_IMAGE_PERSISTENCE") or "").strip().lower() in ("1", "true", "yes"):
+        return None
+
+    # Send a browser-like User-Agent + Referer. Many recipe sites sit behind
+    # Cloudflare/bot protection and 403 the default "python-requests" UA (this is
+    # why Instagram CDN images work but WordPress blog images fail).
+    try:
+        from urllib.parse import urlsplit
+        _u = urlsplit(image_url)
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+            ),
+            "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": f"{_u.scheme}://{_u.netloc}/",
+            "Sec-Fetch-Dest": "image",
+            "Sec-Fetch-Mode": "no-cors",
+            "Sec-Fetch-Site": "same-origin",
+        }
+        resp = requests.get(image_url, timeout=15, headers=headers)
+        resp.raise_for_status()
+        data = resp.content
+    except Exception as e:
+        print(f"[extract-image] download failed: {e}")
+        return None
+
+    if not data:
+        return None
+    if len(data) > _MEAL_IMAGE_MAX_BYTES:
+        print("[extract-image] persist skipped: image too large")
+        return None
+
+    ct = (resp.headers.get("Content-Type") or "image/jpeg").split(";")[0].strip().lower()
+    if "png" in ct:
+        ext = ".png"
+    elif "webp" in ct:
+        ext = ".webp"
+    else:
+        ext = ".jpg"
+        ct = "image/jpeg"
+
+    try:
+        bucket = _mealmap_storage_bucket()
+    except Exception as e:
+        print(f"[extract-image] MealMap storage bucket unavailable: {e}")
+        return None
+
+    object_name = f"{_RECIPE_EXTRACT_IMG_PREFIX}/{uuid.uuid4().hex}{ext}"
+    blob = bucket.blob(object_name)
+    try:
+        blob.upload_from_string(data, content_type=ct)
+        print(f"[extract-image] uploaded to MealMap Storage: {object_name}")
+    except Exception as e:
+        print(f"[extract-image] upload failed: {e}")
+        return None
+
+    # Best-effort public ACL (no-op under uniform bucket-level access — Storage
+    # Rules govern read access in that case).
+    try:
+        blob.make_public()
+    except Exception as e:
+        print(f"[extract-image] make_public skipped (ok if Storage Rules grant read): {e}")
+
+    encoded_name = object_name.replace("/", "%2F")
+    firebase_url = (
+        f"https://firebasestorage.googleapis.com/v0/b/{bucket.name}/o/{encoded_name}?alt=media"
+    )
+    print(f"[extract-image] returning Firebase URL: {firebase_url}")
+    return firebase_url
+
+
 def save_recommend_meal_image_record(
     plan_id: str,
     day_index: int,

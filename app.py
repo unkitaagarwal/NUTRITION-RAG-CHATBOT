@@ -13,6 +13,7 @@ from firebase_utils import (
     upload_meal_image_bytes_to_storage,
     save_recommend_meal_image_record,
     recommend_meal_image_storage_path,
+    persist_extract_recipe_image,
 )
 from dotenv import load_dotenv
 import os
@@ -59,6 +60,16 @@ _plan_meal_history_lock = Lock()
 _recipe_cache: dict = {}
 _recipe_cache_lock = Lock()
 _lang_detect_cache: dict[str, str] = {}
+
+# Bounded pool + registry for uploading the recipe thumbnail to Storage
+# concurrently with recipe extraction (the upload is kicked off as soon as the
+# thumbnail URL is known and resolved just before the response is built, so it
+# overlaps the LLM call instead of adding to it). Keyed by url_key.
+_image_persist_executor = ThreadPoolExecutor(
+    max_workers=int(os.getenv("EXTRACT_IMAGE_PERSIST_WORKERS", "4")),
+    thread_name_prefix="persist-img",
+)
+_img_persist_futures: dict = {}
 
 # Initialize once
 # ---------- Config ----------
@@ -179,6 +190,12 @@ def _resolve_share_url(url: str) -> str:
         return url
 LLM_MODEL = os.getenv("RECIPE_LLM_MODEL", "gpt-4o-mini")  # change if needed
 RECIPE_LLM_MODEL = os.getenv("RECIPE_LLM_MODEL", "gpt-4o-mini")
+# Model for TEXT-based recipe extraction (caption + webpage HTML). Defaults to
+# RECIPE_LLM_MODEL so behavior is unchanged unless set. Point this at a faster
+# text model (e.g. gpt-4.1-mini) to speed up caption/webpage extraction without
+# affecting the vision model used for on-screen video-frame text.
+RECIPE_TEXT_MODEL = os.getenv("RECIPE_TEXT_MODEL") or RECIPE_LLM_MODEL
+print(f"[startup] recipe models: text={RECIPE_TEXT_MODEL}, base/vision={RECIPE_LLM_MODEL}")
 # LLM/ffmpeg timeout budget for /extract-recipe (seconds)
 EXTRACT_RECIPE_TIMEOUT = int(os.getenv("EXTRACT_RECIPE_TIMEOUT", "50"))
 DEFAULT_RECIPE_SERVINGS = int(os.getenv("DEFAULT_RECIPE_SERVINGS", "4"))
@@ -3059,7 +3076,9 @@ def extract_recipe_from_video():
         with _recipe_cache_lock:
             if url_key in _recipe_cache:
                 print(f"⚡ Cache hit for video URL: {video_url}")
-                return jsonify({**_recipe_cache[url_key], "cached": True})
+                cached = dict(_recipe_cache[url_key])
+                _ensure_cached_recipe_nutrition(cached)
+                return jsonify({**_apply_extract_recipe_image_pref(cached), "cached": True})
         # ─────────────────────────────────────────────────────────────────────────
 
         print(f"🎥 Processing video URL: {video_url}")
@@ -3608,13 +3627,108 @@ def extract_recipe_tags(recipe: dict) -> list[str]:
     
     return tags
 
-def fetch_html(url: str, timeout: int | None = None) -> str:
-    headers = {
-        "User-Agent": "Mozilla/5.0 (RecipeBot/1.0)"
+# ── Tiered webpage fetching ──────────────────────────────────────────────
+# Tier 1: direct fetch with realistic browser headers (handles most sites).
+# Tier 2: ScraperAPI fallback for sites behind Cloudflare / anti-bot walls
+#         (e.g. AllRecipes). Only used when a block is detected AND a key is
+#         configured; degrades gracefully to a clean error otherwise.
+SCRAPER_API_KEY = os.getenv("SCRAPER_API_KEY", "").strip()
+SCRAPER_API_ENDPOINT = "https://api.scraperapi.com/"
+# ScraperAPI retries internally for up to ~60s, so its client timeout must be
+# generous and independent of the (shorter) LLM budget.
+SCRAPER_API_TIMEOUT = int(os.getenv("SCRAPER_API_TIMEOUT", "70"))
+# ultra_premium activates advanced anti-bot bypass (needed for Cloudflare
+# *managed* challenges like AllRecipes). Costs more credits — disable via env
+# to save free-tier credits if you only hit lighter protections.
+SCRAPER_API_ULTRA = os.getenv("SCRAPER_API_ULTRA", "true").strip().lower() == "true"
+
+_BROWSER_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+    ),
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;q=0.9,"
+        "image/avif,image/webp,*/*;q=0.8"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+# HTTP statuses that typically indicate an anti-bot block rather than a real
+# "page missing" error — worth retrying through the scraping fallback.
+_BLOCK_STATUSES = {401, 402, 403, 429, 503}
+
+
+def _looks_like_challenge(html: str) -> bool:
+    """Detect a Cloudflare/anti-bot interstitial returned with a 200 status."""
+    if not html:
+        return True
+    snippet = html[:3000].lower()
+    return (
+        "just a moment" in snippet
+        or "challenges.cloudflare.com" in snippet
+        or "_cf_chl_opt" in snippet
+        or "enable javascript and cookies to continue" in snippet
+    )
+
+
+def _fetch_via_scraperapi(url: str) -> str:
+    """Fetch a URL through ScraperAPI (renders JS + solves Cloudflare)."""
+    params = {
+        "api_key": SCRAPER_API_KEY,
+        "url": url,
+        "render": "true",  # execute JS / solve managed challenge
     }
-    r = requests.get(url, headers=headers, timeout=timeout or EXTRACT_RECIPE_TIMEOUT)
+    if SCRAPER_API_ULTRA:
+        params["ultra_premium"] = "true"  # advanced anti-bot bypass
+    r = requests.get(SCRAPER_API_ENDPOINT, params=params, timeout=SCRAPER_API_TIMEOUT)
     r.raise_for_status()
     return r.text
+
+
+def fetch_html(url: str, timeout: int | None = None) -> str:
+    timeout = timeout or EXTRACT_RECIPE_TIMEOUT
+    last_response = None
+    direct_error = None
+
+    # ── Tier 1: direct fetch with realistic browser headers ──────────────
+    try:
+        last_response = requests.get(url, headers=_BROWSER_HEADERS, timeout=timeout)
+        blocked = (
+            last_response.status_code in _BLOCK_STATUSES
+            or _looks_like_challenge(last_response.text)
+        )
+        if not blocked:
+            last_response.raise_for_status()
+            return last_response.text
+        print(f"[fetch_html] direct fetch blocked (status={last_response.status_code}) for {url[:120]}")
+    except requests.exceptions.RequestException as e:
+        direct_error = e
+        print(f"[fetch_html] direct fetch error for {url[:120]}: {str(e)[:200]}")
+
+    # ── Tier 2: ScraperAPI fallback (handles Cloudflare-protected sites) ──
+    if SCRAPER_API_KEY:
+        try:
+            print(f"[fetch_html] retrying via ScraperAPI (ultra={SCRAPER_API_ULTRA}) for {url[:120]}")
+            return _fetch_via_scraperapi(url)
+        except requests.exceptions.RequestException as e:
+            print(f"[fetch_html] ScraperAPI fetch failed for {url[:120]}: {str(e)[:200]}")
+    else:
+        print("[fetch_html] blocked and no SCRAPER_API_KEY set — cannot fall back")
+
+    # ── All tiers exhausted — raise a clean error for /extract-recipe ─────
+    if last_response is not None:
+        # Real block status (402/403/429/503) raises with the true code so the
+        # endpoint can show the right user message.
+        last_response.raise_for_status()
+        # 200 but challenge HTML: surface as a 403-style block.
+        synthetic = requests.models.Response()
+        synthetic.status_code = 403
+        synthetic._content = last_response.content
+        raise requests.exceptions.HTTPError(
+            "Blocked by anti-bot challenge (e.g. Cloudflare)", response=synthetic
+        )
+    raise direct_error
 
 def extract_og_image(soup: BeautifulSoup) -> str | None:
     og = soup.find("meta", property="og:image")
@@ -3828,9 +3942,30 @@ def normalize_recipe_from_jsonld(recipe_obj: dict, soup: BeautifulSoup):
     nutrition = recipe_obj.get("nutrition") or {}
     norm_nutrition = {}
     if isinstance(nutrition, dict):
-        for k, v in nutrition.items():
-            if isinstance(v, (str, int, float)):
-                norm_nutrition[k] = str(v)
+        for key in _RECIPE_NUTRITION_KEYS:
+            parsed = _parse_recipe_nutrition_value(
+                nutrition.get(key) or nutrition.get(key.replace("_g", "")),
+                calories=(key == "calories"),
+            )
+            if parsed:
+                norm_nutrition[key] = parsed
+        # JSON-LD may use proteinContent, carbohydrateContent, fatContent
+        alias_map = {
+            "protein_g": ("proteinContent", "protein"),
+            "carbs_g": ("carbohydrateContent", "carbs"),
+            "fat_g": ("fatContent", "fat"),
+            "calories": ("calories",),
+        }
+        for key, aliases in alias_map.items():
+            if key in norm_nutrition:
+                continue
+            for alias in aliases:
+                parsed = _parse_recipe_nutrition_value(
+                    nutrition.get(alias), calories=(key == "calories")
+                )
+                if parsed:
+                    norm_nutrition[key] = parsed
+                    break
 
     # Cuisine: recipeCuisine can be string or list in JSON-LD
     cuisine_raw = recipe_obj.get("recipeCuisine") or ""
@@ -3866,7 +4001,7 @@ def clean_page_text(html: str) -> str:
     return text.strip()[:40000]  # cap to avoid huge prompts
 
 def extract_recipe_from_webpage_llm(page_text: str):
-    system = """Extract recipe data from webpage text.
+    system = f"""Extract recipe data from webpage text.
 Return ONLY valid JSON:
 {
   "name": "",
@@ -3891,11 +4026,12 @@ Rules:
 - meal_type: exactly one of Breakfast, Lunch, Dinner, Snack (infer from context).
 - Infer cuisine from recipe name, ingredients, or context when evident (e.g. Italian, Mexican, Indian, American); otherwise use "".
 - You MUST provide a best-effort numeric estimate (as strings) for nutrition macros PER SERVING: calories, protein_g, carbs_g, fat_g. Use your nutrition knowledge of typical ingredients/quantities to approximate. Only leave a macro field \"\" if there is literally no information about ingredients.
+- {_RECIPE_NUTRITION_PROMPT_RULE}
 - Return JSON only."""
     user = f"Webpage text:\n{page_text}"
 
     completion = client.chat.completions.create(
-        model=os.getenv("RECIPE_LLM_MODEL", "gpt-4o-mini"),
+        model=RECIPE_TEXT_MODEL,
         messages=[{"role":"system","content":system},{"role":"user","content":user}],
         temperature=0.2,
         max_tokens=1800,
@@ -4004,6 +4140,91 @@ def _get_extract_recipe_mode() -> str:
     return str(mode).lower()
 
 
+def _get_extract_recipe_include_image() -> bool:
+    """When false, omit source.image from /extract-recipe responses (default true)."""
+    data = request.get_json(silent=True) or {}
+    raw = data.get("include_image")
+    if raw is None:
+        raw = data.get("includeImage")
+    if raw is None:
+        raw = request.form.get("include_image") or request.args.get("include_image")
+    if raw is None:
+        return True
+    return str(raw).strip().lower() in ("1", "true", "yes")
+
+
+def _get_extract_recipe_no_cache() -> bool:
+    """When true, skip _recipe_cache lookup for this request."""
+    data = request.get_json(silent=True) or {}
+    raw = data.get("no_cache")
+    if raw is None:
+        raw = data.get("noCache")
+    if raw is None:
+        raw = request.form.get("no_cache") or request.args.get("no_cache")
+    if raw is None:
+        return False
+    if isinstance(raw, bool):
+        return raw
+    return str(raw).strip().lower() in ("1", "true", "yes")
+
+
+def _start_persist_image(image_url: str | None):
+    """Kick off the thumbnail upload in the background so it overlaps extraction.
+    Returns a Future (resolving to the Storage URL or None), or None if no URL."""
+    if not image_url or not isinstance(image_url, str):
+        return None
+    try:
+        return _image_persist_executor.submit(persist_extract_recipe_image, image_url)
+    except Exception as e:
+        print(f"[extract-image] could not schedule persist: {e}")
+        return None
+
+
+def _persist_recipe_source_image(source: dict | None, meta: dict | None = None, *, future=None) -> None:
+    """Re-host the recipe image in MealMap Storage so the URL never expires, and
+    rewrite source['image'] / meta['thumbnail'] in place to the stable Storage URL.
+
+    If `future` (from _start_persist_image) is given, we wait on the already
+    in-flight upload instead of starting a new one — so the upload overlaps the
+    LLM call and adds ~0s to the request. Otherwise it uploads synchronously.
+    Always runs so the image is persisted even when include_image=false.
+    Best-effort: on failure the original URLs are left untouched.
+    """
+    original = None
+    if isinstance(source, dict) and source.get("image"):
+        original = source["image"]
+    elif isinstance(meta, dict) and meta.get("thumbnail"):
+        original = meta["thumbnail"]
+    if not original:
+        return
+    try:
+        if future is not None:
+            stored = future.result(timeout=EXTRACT_RECIPE_TIMEOUT)
+        else:
+            stored = persist_extract_recipe_image(original)
+    except Exception as e:
+        print(f"[extract-image] persist error: {e}")
+        return
+    if not stored:
+        return
+    if isinstance(source, dict) and source.get("image") == original:
+        source["image"] = stored
+    if isinstance(meta, dict) and meta.get("thumbnail") == original:
+        meta["thumbnail"] = stored
+
+
+def _apply_extract_recipe_image_pref(payload: dict) -> dict:
+    """Drop source.image when the client sets include_image=false."""
+    if _get_extract_recipe_include_image():
+        return payload
+    source = payload.get("source")
+    if not isinstance(source, dict) or "image" not in source:
+        return payload
+    out = dict(payload)
+    out["source"] = {k: v for k, v in source.items() if k != "image"}
+    return out
+
+
 def extract_recipe_from_image_llm(image_data_url: str):
     """Extract recipe from a single image. Returns same structure as extract_recipe_from_webpage_llm."""
     return extract_recipe_from_images_llm([image_data_url])
@@ -4030,7 +4251,7 @@ def extract_recipe_from_video_frames_llm(
             '"instructions":["Step 1: ...","Step 2: ..."],'
             '"servings":"","prep_time":"","cook_time":"","total_time":"",'
             '"notes":[],"meal_type":"","cuisine":"","nutrition":{"calories":"","protein_g":"","carbs_g":"","fat_g":""}}. '
-            f"meal_type: Breakfast|Lunch|Dinner|Snack. Estimate nutrition per serving.{lang_rule} JSON only."
+            f"meal_type: Breakfast|Lunch|Dinner|Snack. {_RECIPE_NUTRITION_PROMPT_RULE}{lang_rule} JSON only."
         )
         user_text = (
             f"These are {len(image_data_urls)} frame(s) from a short-form cooking video. "
@@ -4046,7 +4267,7 @@ def extract_recipe_from_video_frames_llm(
             '"instructions":["..."],"servings":"","prep_time":"","cook_time":"","total_time":"",'
             '"notes":[],"meal_type":"","cuisine":"","nutrition":{"calories":"","protein_g":"","carbs_g":"","fat_g":""}}. '
             "Read on-screen text and visible food. meal_type: Breakfast|Lunch|Dinner|Snack. "
-            "Estimate nutrition per serving when possible. JSON only."
+            f"{_RECIPE_NUTRITION_PROMPT_RULE} JSON only."
         )
         user_text = "Extract the recipe JSON from this video frame."
         detail = "low"
@@ -4086,7 +4307,7 @@ def extract_recipe_from_slideshow_llm(
         '"instructions":["..."],"servings":"","prep_time":"","cook_time":"","total_time":"",'
         '"notes":[],"meal_type":"","cuisine":"","nutrition":{"calories":"","protein_g":"","carbs_g":"","fat_g":""}}. '
         "Read every visible ingredient and cooking step across slides. "
-        f"meal_type: Breakfast|Lunch|Dinner|Snack. Estimate nutrition per serving when possible.{lang_rule} JSON only."
+        f"meal_type: Breakfast|Lunch|Dinner|Snack. {_RECIPE_NUTRITION_PROMPT_RULE}{lang_rule} JSON only."
     )
     content = [{
         "type": "text",
@@ -4118,7 +4339,7 @@ def extract_recipe_from_images_llm(image_data_urls: list):
     """Extract one combined recipe from one or more images (e.g. multi-page recipe). Uses vision LLM."""
     if not image_data_urls:
         raise ValueError("At least one image is required")
-    system = """Extract recipe data from the image(s). If multiple images are provided (e.g. multiple pages), combine them into ONE recipe.
+    system = f"""Extract recipe data from the image(s). If multiple images are provided (e.g. multiple pages), combine them into ONE recipe.
 Return ONLY valid JSON:
 {
   "name": "",
@@ -4143,6 +4364,7 @@ Rules:
 - meal_type: exactly one of Breakfast, Lunch, Dinner, Snack (infer from context).
 - Infer cuisine from recipe name, ingredients, or visible context when evident (e.g. Italian, Mexican, Indian); otherwise use "".
 - You MUST provide a best-effort numeric estimate (as strings) for nutrition macros PER SERVING: calories, protein_g, carbs_g, fat_g. Use your nutrition knowledge of typical ingredients/quantities to approximate from what you see. Only leave a macro field \"\" if there is literally no information about ingredients.
+- {_RECIPE_NUTRITION_PROMPT_RULE}
 - Return JSON only. Read all text visible across the images. Merge ingredients and instructions from all pages into one recipe."""
     content = [{"type": "text", "text": "Extract the recipe from these image(s) and return the JSON. If there are multiple images, treat them as one multi-page recipe and merge into a single recipe."}]
     for url in image_data_urls:
@@ -4377,6 +4599,180 @@ def _format_minutes_label(minutes: int) -> str:
     return f"{minutes} mins"
 
 
+_RECIPE_NUTRITION_KEYS = ("calories", "protein_g", "carbs_g", "fat_g")
+
+_RECIPE_NUTRITION_PROMPT_RULE = (
+    "Nutrition macros (calories, protein_g, carbs_g, fat_g) are PER SERVING and MUST be numeric strings only "
+    '(e.g. "120", "6.5"). Never use words like variable, approximate, varies, unknown, or descriptive text.'
+)
+
+_INVALID_NUTRITION_TEXT = (
+    "variable", "varies", "approximate", "approx", "unknown", "n/a", "na", "tbd",
+    "estimate", "depends", "not available", "per serving", "per piece", "per item",
+)
+
+
+def _format_recipe_nutrition_number(value: float, *, calories: bool = False) -> str:
+    if calories:
+        return str(int(round(value)))
+    if abs(value - round(value)) < 0.05:
+        return str(int(round(value)))
+    return str(round(value, 1))
+
+
+def _parse_recipe_nutrition_value(value, *, calories: bool = False) -> str | None:
+    """Return a normalized numeric macro string, or None when value is missing/invalid."""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        number = float(value)
+        if number < 0:
+            return None
+        return _format_recipe_nutrition_number(number, calories=calories)
+
+    text = str(value).strip()
+    if not text:
+        return None
+
+    lower = text.lower()
+    if not re.search(r"\d", text) and any(token in lower for token in _INVALID_NUTRITION_TEXT):
+        return None
+
+    match = re.search(r"(\d+(?:\.\d+)?)", text.replace(",", ""))
+    if not match:
+        return None
+
+    number = float(match.group(1))
+    if number < 0:
+        return None
+    return _format_recipe_nutrition_number(number, calories=calories)
+
+
+def _recipe_nutrition_macro_missing(value) -> bool:
+    return _parse_recipe_nutrition_value(value) is None
+
+
+def _normalize_recipe_nutrition_fields(nutrition: dict) -> set[str]:
+    """Normalize macro strings in place. Returns keys still missing a valid numeric value."""
+    missing: set[str] = set()
+    for key in _RECIPE_NUTRITION_KEYS:
+        parsed = _parse_recipe_nutrition_value(
+            nutrition.get(key), calories=(key == "calories")
+        )
+        if parsed is None:
+            nutrition.pop(key, None)
+            missing.add(key)
+        else:
+            nutrition[key] = parsed
+    return missing
+
+
+def _derive_calories_from_macros(nutrition: dict) -> bool:
+    """Fill calories from protein/carbs/fat when all three are known."""
+    protein = _parse_recipe_nutrition_value(nutrition.get("protein_g"))
+    carbs = _parse_recipe_nutrition_value(nutrition.get("carbs_g"))
+    fat = _parse_recipe_nutrition_value(nutrition.get("fat_g"))
+    if not (protein and carbs and fat):
+        return False
+    calories = 4 * float(protein) + 4 * float(carbs) + 9 * float(fat)
+    nutrition["calories"] = _format_recipe_nutrition_number(calories, calories=True)
+    return True
+
+
+def _estimate_recipe_nutrition_only_llm(recipe: dict, *, language: str | None = None) -> dict:
+    """Focused nutrition estimate when extraction returned placeholders or partial macros."""
+    servings = str(recipe.get("servings") or DEFAULT_RECIPE_SERVINGS).strip()
+    payload = {
+        "name": recipe.get("name") or "",
+        "servings": servings,
+        "ingredients": recipe.get("ingredients") or [],
+        "instructions": recipe.get("instructions") or [],
+    }
+    lang_rule = _metadata_language_rule(language)
+    system = (
+        "Estimate per-serving nutrition macros for a recipe from its ingredients and instructions. "
+        "Return ONLY JSON: "
+        '{"calories":"","protein_g":"","carbs_g":"","fat_g":""}. '
+        f"Every field MUST be a numeric string. {_RECIPE_NUTRITION_PROMPT_RULE}{lang_rule} JSON only."
+    )
+    user = f"Recipe:\n{json.dumps(payload, ensure_ascii=False)}\n\nReturn numeric per-serving macros."
+    try:
+        completion = client.chat.completions.create(
+            model=RECIPE_LLM_MODEL,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            temperature=0.2,
+            max_tokens=180,
+            response_format={"type": "json_object"},
+            timeout=EXTRACT_RECIPE_TIMEOUT,
+        )
+        data = json.loads(completion.choices[0].message.content.strip())
+        out = {}
+        for key in _RECIPE_NUTRITION_KEYS:
+            parsed = _parse_recipe_nutrition_value(
+                (data or {}).get(key), calories=(key == "calories")
+            )
+            if parsed:
+                out[key] = parsed
+        return out
+    except Exception as e:
+        print(f"⚠️ Recipe nutrition estimation failed: {e}")
+        return {}
+
+
+def _ensure_recipe_nutrition_macros(recipe: dict, *, language: str | None = None) -> None:
+    """Guarantee nutrition macros are numeric strings, estimating when needed."""
+    if not recipe:
+        return
+
+    nutrition = recipe.get("nutrition")
+    if not isinstance(nutrition, dict):
+        nutrition = {}
+        recipe["nutrition"] = nutrition
+
+    missing = _normalize_recipe_nutrition_fields(nutrition)
+    if "calories" in missing and _derive_calories_from_macros(nutrition):
+        missing.discard("calories")
+
+    if not missing:
+        return
+    if not _recipe_has_named_ingredients(recipe):
+        return
+
+    estimated = _estimate_recipe_nutrition_only_llm(recipe, language=language)
+    for key in list(missing):
+        if estimated.get(key):
+            nutrition[key] = estimated[key]
+
+    missing = _normalize_recipe_nutrition_fields(nutrition)
+    if "calories" in missing and _derive_calories_from_macros(nutrition):
+        missing.discard("calories")
+
+    # Optional second attempt (off by default): a retry is a full extra LLM call
+    # on the request path for marginal gain. Enable with NUTRITION_ESTIMATE_RETRY=1.
+    _retry_nutrition = (os.getenv("NUTRITION_ESTIMATE_RETRY") or "").strip().lower() in ("1", "true", "yes")
+    if _retry_nutrition and missing and _recipe_has_named_ingredients(recipe):
+        retry = _estimate_recipe_nutrition_only_llm(recipe, language=language)
+        for key in list(missing):
+            if retry.get(key):
+                nutrition[key] = retry[key]
+        missing = _normalize_recipe_nutrition_fields(nutrition)
+        if "calories" in missing and _derive_calories_from_macros(nutrition):
+            missing.discard("calories")
+
+    for key in missing:
+        nutrition[key] = "0"
+
+
+def _ensure_cached_recipe_nutrition(payload: dict) -> None:
+    recipe = payload.get("recipe")
+    if isinstance(recipe, dict):
+        lang = _normalize_language_code(payload.get("language") or recipe.get("language"))
+        _ensure_recipe_nutrition_macros(recipe, language=lang)
+
+
 def _estimate_missing_recipe_metadata_llm(recipe: dict, *, language: str | None = None) -> dict:
     """Estimate prep/cook times and per-serving nutrition when the source omits them."""
     servings = str(recipe.get("servings") or DEFAULT_RECIPE_SERVINGS).strip()
@@ -4395,7 +4791,7 @@ def _estimate_missing_recipe_metadata_llm(recipe: dict, *, language: str | None 
         "Times must be human-readable strings like \"15 mins\" or \"1 hr\" (not ISO). "
         "Infer prep_time from chopping/mixing/coating steps; cook_time from frying/baking/boiling steps. "
         "total_time should equal prep + cook. "
-        f"Macros are per serving as numeric strings.{lang_rule} JSON only."
+        f"{_RECIPE_NUTRITION_PROMPT_RULE}{lang_rule} JSON only."
     )
     user = f"Recipe:\n{json.dumps(payload, ensure_ascii=False)}\n\nReturn estimates."
     try:
@@ -4417,9 +4813,11 @@ def _estimate_missing_recipe_metadata_llm(recipe: dict, *, language: str | None 
             if val:
                 out[key] = val
         for key in ("calories", "protein_g", "carbs_g", "fat_g"):
-            val = str((data or {}).get(key) or "").strip()
-            if val:
-                out[key] = val
+            parsed = _parse_recipe_nutrition_value(
+                (data or {}).get(key), calories=(key == "calories")
+            )
+            if parsed:
+                out[key] = parsed
         return out
     except Exception as e:
         print(f"⚠️ Recipe metadata estimation failed: {e}")
@@ -4446,8 +4844,8 @@ def _fill_missing_recipe_metadata(recipe: dict, *, language: str | None = None) 
         nutrition = {}
         recipe["nutrition"] = nutrition
     fill_nutrition = {
-        key: not str(nutrition.get(key) or "").strip()
-        for key in ("calories", "protein_g", "carbs_g", "fat_g")
+        key: _recipe_nutrition_macro_missing(nutrition.get(key))
+        for key in _RECIPE_NUTRITION_KEYS
     }
 
     instructions = recipe.get("instructions") or []
@@ -4506,6 +4904,7 @@ def _enrich_recipe_response(recipe: dict, *, language: str | None = None) -> Non
             recipe["cuisine"] = ""
         recipe["diet_flags"] = []
     _fill_missing_recipe_metadata(recipe, language=language)
+    _ensure_recipe_nutrition_macros(recipe, language=language)
     recipe["description"] = _short_recipe_description(recipe, language=language)
 
 
@@ -4750,13 +5149,13 @@ def extract_recipe():
                 "image": None,
                 "source_type": "Photos",
             }
-            return jsonify({
+            return jsonify(_apply_extract_recipe_image_pref({
                 "source": source,
                 "recipe": recipe,
                 "tags": tags,
                 "transcript": None,
                 "extraction": {"method": "image_vision", "confidence": 0.6},
-            })
+            }))
         except Exception as e:
             return jsonify({
                 "error": "Failed to extract recipe from image",
@@ -4791,10 +5190,13 @@ def extract_recipe():
     # Webpage pipeline
     # ── Cache check ──────────────────────────────────────────────────────────
     webpage_key = hashlib.sha256(url.encode()).hexdigest()
-    with _recipe_cache_lock:
-        if webpage_key in _recipe_cache:
-            print(f"⚡ Cache hit for webpage URL: {url}")
-            return jsonify({**_recipe_cache[webpage_key], "cached": True})
+    if not _get_extract_recipe_no_cache():
+        with _recipe_cache_lock:
+            if webpage_key in _recipe_cache:
+                print(f"⚡ Cache hit for webpage URL: {url}")
+                cached = dict(_recipe_cache[webpage_key])
+                _ensure_cached_recipe_nutrition(cached)
+                return jsonify({**_apply_extract_recipe_image_pref(cached), "cached": True})
     # ─────────────────────────────────────────────────────────────────────────
 
     try:
@@ -4829,6 +5231,11 @@ def extract_recipe():
             "source_type": source_type,
         }
 
+        # Re-host the recipe image in MealMap Storage and rewrite source.image to
+        # the stable Storage URL before caching, so both the response and the
+        # cache carry the permanent URL.
+        _persist_recipe_source_image(source)
+
         _result = {
             "source": source,
             "recipe": recipe,
@@ -4842,7 +5249,7 @@ def extract_recipe():
             _recipe_cache[webpage_key] = _result
         # ────────────────────────────────────────────────────────────────────
 
-        return jsonify(_result)
+        return jsonify(_apply_extract_recipe_image_pref(_result))
 
     except requests.exceptions.HTTPError as e:
         status = e.response.status_code if e.response is not None else 502
@@ -4897,7 +5304,7 @@ def _force_json(text: str) -> dict:
 
 
 def _extract_recipe_chunk(transcript_chunk: str) -> dict:
-    system_prompt = """You extract recipe data from cooking transcripts.
+    system_prompt = f"""You extract recipe data from cooking transcripts.
 Return ONLY valid JSON matching:
 {
   "name": "",
@@ -4924,6 +5331,7 @@ Rules:
 - Ingredients must include quantities when stated; else quantity "".
 - Instructions must be actionable, chronological, and detailed.
 - You MUST provide a best-effort numeric estimate (as strings) for nutrition macros PER SERVING: calories, protein_g, carbs_g, fat_g. Use your nutrition knowledge of typical ingredients/quantities and transcript context to approximate. Only leave a macro field \"\" if there is literally no information about ingredients.
+- {_RECIPE_NUTRITION_PROMPT_RULE}
 - Output JSON only (no markdown, no commentary)."""
 
     user_prompt = f"Transcript:\n{transcript_chunk}\n\nReturn the JSON now."
@@ -4957,7 +5365,7 @@ Rules:
 
 
 def _merge_recipe_parts(parts: list[dict]) -> dict:
-    system_prompt = """Merge multiple partial recipe JSONs into ONE final recipe JSON.
+    system_prompt = f"""Merge multiple partial recipe JSONs into ONE final recipe JSON.
 Return ONLY valid JSON matching:
 {
   "name": "",
@@ -4984,6 +5392,7 @@ Rules:
 - For meal_type: use the first non-empty from parts (one of Breakfast, Lunch, Dinner, Snack); if none, use "Dinner".
 - For cuisine: use the first non-empty cuisine from the parts; if none, use "".
 - Merge/average any provided nutrition macros (calories, protein_g, carbs_g, fat_g) into a single best-effort estimate PER SERVING. If some parts omit macros, use available information from other parts. Only leave a macro field \"\" if ALL parts lack enough information.
+- {_RECIPE_NUTRITION_PROMPT_RULE}
 - Output JSON only."""
 
     user_prompt = json.dumps({"parts": parts}, ensure_ascii=False)
@@ -5021,6 +5430,14 @@ def _yt_meta(video_url: str) -> dict:
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
+        # Instagram's graphql/query endpoint often 403s even with cookies; default
+        # retries (3) make metadata fetch swing from ~1s to ~5s. Cap retries and
+        # add a socket timeout so a blocked request fails fast. On failure,
+        # _fetch_social_reel_meta falls back to the page caption, and the video
+        # download step re-extracts anyway.
+        "extractor_retries": int(os.getenv("YTDLP_META_EXTRACTOR_RETRIES", "1")),
+        "retries": int(os.getenv("YTDLP_META_RETRIES", "1")),
+        "socket_timeout": int(os.getenv("YTDLP_META_SOCKET_TIMEOUT", "8")),
         "extractor_args": {"youtube": _yt_extractor_args()},
     }
     cookie_temp_dir = tempfile.mkdtemp()
@@ -5414,15 +5831,26 @@ def _return_video_extract_result(
     if language:
         result["language"] = language
     result = _apply_response_language(result, video_url, meta)
+    # Re-host the (ephemeral) thumbnail in MealMap Storage and rewrite the URL to
+    # the stable Storage URL *before* caching, so both the response and the cache
+    # carry the permanent URL. If the upload was started early (overlapping the
+    # LLM), resolve that in-flight Future instead of uploading synchronously.
+    _img_future = _img_persist_futures.pop(url_key, None)
+    _persist_recipe_source_image(result.get("source"), result.get("meta"), future=_img_future)
     with _recipe_cache_lock:
         _recipe_cache[url_key] = result
-    return jsonify(result), 200
+    return jsonify(_apply_extract_recipe_image_pref(result)), 200
 
 
-def _social_video_frames_for_duration(url: str, duration_sec: float | None) -> int:
+def _social_video_frames_for_duration(
+    url: str, duration_sec: float | None, *, meta: dict | None = None
+) -> int:
     """TikTok/IG: sample multiple frames when vision fallback is needed."""
     if not _is_social_video_url(url):
         return _video_frames_for_duration(duration_sec)
+    if meta and meta.get("vision_distributed_sections"):
+        n = len(meta["vision_distributed_sections"])
+        return min(max(1, n), MAX_EXTRACT_RECIPE_IMAGES)
     try:
         n = int(os.getenv("EXTRACT_RECIPE_SOCIAL_VIDEO_FRAMES", "2"))
     except ValueError:
@@ -5491,6 +5919,23 @@ def _social_recipe_is_complete(recipe: dict | None) -> bool:
     return ing_count >= 3 and inst_count >= 2
 
 
+def _recipe_missing_sections(recipe: dict | None) -> list[str]:
+    """Sections entirely absent from a recipe (for partial API responses)."""
+    if not recipe:
+        return ["ingredients", "instructions"]
+    ingredients = [
+        ing for ing in (recipe.get("ingredients") or [])
+        if isinstance(ing, dict) and (ing.get("name") or "").strip()
+    ]
+    instructions = [str(s).strip() for s in (recipe.get("instructions") or []) if str(s).strip()]
+    missing: list[str] = []
+    if not ingredients:
+        missing.append("ingredients")
+    if not instructions:
+        missing.append("instructions")
+    return missing
+
+
 _CAPTION_QTY_PATTERN = re.compile(
     r'\d+(?:\.\d+)?\s*(?:'
     r'tbsp|tsp|tablespoons?|teaspoons?|cups?|cloves?|'
@@ -5508,7 +5953,14 @@ def _caption_has_numbered_steps(caption: str) -> bool:
 
 
 def _caption_has_instructions(caption: str) -> bool:
-    """True when the post caption text itself contains cooking steps (not just ingredients)."""
+    """True when the post caption text itself contains cooking steps (not just ingredients).
+
+    Detects steps written as numbered lists, under a "how to make it"/"directions"
+    style header, OR as free-flowing action-verb sentences — including run-on
+    paragraphs with no line breaks between steps (common in TikTok/IG captions).
+    This raises recall of genuine steps; it does NOT accept invented instructions,
+    since the caption text itself must contain the step-like content.
+    """
     caption = (caption or "").strip()
     if not caption:
         return False
@@ -5516,8 +5968,11 @@ def _caption_has_instructions(caption: str) -> bool:
         return True
     if re.search(r'\b(?:step|étape|paso|langkah)\s*\d+', caption, re.IGNORECASE):
         return True
+    # Instruction-section headers creators commonly use (incl. "how to make it").
     if re.search(
-        r'\b(?:instructions?|directions?|method|préparation|preparation|étapes?|pasos?)\s*:',
+        r'\b(?:instructions?|directions?|method|steps?|'
+        r'how\s+to\s+make(?:\s+it)?|to\s+make(?:\s+it)?|here\'?s\s+how|let\'?s\s+make|'
+        r'préparation|preparation|étapes?|pasos?|c[oó]mo\s+hacer|modo\s+de\s+preparo)\b\s*:?',
         caption,
         re.IGNORECASE,
     ):
@@ -5531,18 +5986,33 @@ def _caption_has_instructions(caption: str) -> bool:
         "mélange", "ajoute", "cuire", "faire ", "verser ", "étaler ", "préchauff",
         "mezcl", "añad", "cocin", "calient", "hornea", "agrega",
     )
+    # Split on line breaks AND sentence punctuation so steps written as sentences
+    # (not just one-per-line) are counted.
+    fragments = re.split(r'(?:\r?\n|(?<=[.!?])\s+)', caption)
     action_lines = 0
-    for line in caption.splitlines():
-        line = line.strip().lstrip("•-*▪→")
-        if len(line) < 12:
+    for frag in fragments:
+        frag = frag.strip().lstrip("•-*▪→ ")
+        if len(frag) < 12:
             continue
-        lower = line.lower()
-        if re.match(r"^\d+[\.\)]\s", line):
+        lower = frag.lower()
+        if re.match(r"^\d+[\.\)]\s", frag):
             action_lines += 1
             continue
         if any(lower.startswith(v) for v in action_starts):
             action_lines += 1
-    return action_lines >= 2
+    if action_lines >= 2:
+        return True
+    # Run-on paragraph with no separators: count capitalized cooking verbs that
+    # start new steps mid-text (e.g. "...dish Add ... Stir ... Bake ..."). A high
+    # count is a strong signal the caption contains a real method.
+    cap_verbs = re.findall(
+        r'\b(?:Mix|Add|Fry|Bake|Cook|Heat|Serve|Combine|Stir|Boil|Simmer|Coat|'
+        r'Season|Place|Remove|Drain|Slice|Chop|Melt|Whisk|Pour|Spread|Reduce|'
+        r'Toss|Marinate|Preheat|Transfer|Top|Blend|Fold|Grill|Roast|Layer|Cover|'
+        r'Bring|Rest|Garnish|Sprinkle|Cut|Dice|Fill|Repeat|Flip|Knead|Divide)\b',
+        caption,
+    )
+    return len(cap_verbs) >= 3
 
 
 def _social_caption_recipe_acceptable(recipe: dict | None, caption: str) -> bool:
@@ -5580,6 +6050,40 @@ def _social_caption_recipe_acceptable(recipe: dict | None, caption: str) -> bool
     return False
 
 
+def _sanitize_partial_caption_recipe(recipe: dict | None, caption: str) -> tuple[dict | None, list[str]]:
+    """Caption-only extraction: keep the parts the caption actually contains and
+    report what's missing, instead of falling back to vision.
+
+    - Ingredients are trusted as extracted (creators list them literally).
+    - Instructions are kept only if the source caption actually contains steps
+      (prevents the LLM from inventing a method).
+
+    Returns (recipe, missing) where missing ⊆ ['ingredients', 'instructions'],
+    or (None, missing) when the caption yielded neither (caller falls to vision).
+    """
+    if not recipe:
+        return None, ["ingredients", "instructions"]
+    caption = (caption or "").strip()
+    ingredients = [
+        ing for ing in (recipe.get("ingredients") or [])
+        if isinstance(ing, dict) and (ing.get("name") or "").strip()
+    ]
+    instructions = [str(s).strip() for s in (recipe.get("instructions") or []) if str(s).strip()]
+    # Anti-hallucination: only keep instructions the caption itself contains.
+    if instructions and not _caption_has_instructions(caption):
+        instructions = []
+    recipe["ingredients"] = ingredients
+    recipe["instructions"] = instructions
+    missing = []
+    if not ingredients:
+        missing.append("ingredients")
+    if not instructions:
+        missing.append("instructions")
+    if not ingredients and not instructions:
+        return None, missing
+    return recipe, missing
+
+
 def _caption_has_full_recipe_text(caption: str) -> bool:
     """True when post metadata likely contains a full recipe (TikTok 'more' text, IG caption)."""
     caption = (caption or "").strip()
@@ -5610,12 +6114,10 @@ def _should_try_social_caption_first(meta: dict, url: str) -> bool:
         return False
     if not (_caption_looks_like_recipe(caption) or _caption_has_full_recipe_text(caption)):
         return False
-    if not _caption_has_instructions(caption):
-        print(
-            f"📝 Caption has ingredients only ({len(caption)} chars); "
-            "skipping caption LLM — will use vision for instructions"
-        )
-        return False
+    # Try the caption LLM whenever the post looks like a recipe — including
+    # ingredients-only or instructions-only captions. Partial results are
+    # returned with the missing section flagged (see _sanitize_partial_caption_recipe)
+    # instead of falling back to slow vision.
     return True
 
 
@@ -5694,7 +6196,7 @@ Rules:
 
     try:
         completion = client.chat.completions.create(
-            model=RECIPE_LLM_MODEL,
+            model=RECIPE_TEXT_MODEL,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
@@ -5706,7 +6208,7 @@ Rules:
         )
     except Exception:
         completion = client.chat.completions.create(
-            model=RECIPE_LLM_MODEL,
+            model=RECIPE_TEXT_MODEL,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
@@ -5917,7 +6419,7 @@ def _fetch_youtube_transcript(video_url: str, *, meta: dict | None = None) -> tu
 
 
 def _social_vision_max_download_seconds(meta: dict, url: str) -> int | None:
-    """Cap IG/TikTok video bytes downloaded for frame extraction (recipe text is usually early)."""
+    """Cap IG/TikTok video bytes downloaded for frame extraction."""
     try:
         cap = int(os.getenv("EXTRACT_RECIPE_SOCIAL_VISION_MAX_SECONDS", "20"))
     except ValueError:
@@ -5931,6 +6433,90 @@ def _social_vision_max_download_seconds(meta: dict, url: str) -> int | None:
     if duration > cap:
         return cap
     return None
+
+
+def _download_sections_total_seconds(specs: list[str]) -> float:
+    total = 0.0
+    for spec in specs:
+        match = re.match(r"\*(\d+(?:\.\d+)?)-(\d+(?:\.\d+)?)", (spec or "").strip())
+        if match:
+            total += max(0.0, float(match.group(2)) - float(match.group(1)))
+    return total
+
+
+def _social_vision_sample_section_specs(duration: float) -> list[str]:
+    """Sparse yt-dlp sections: legacy opening clip + optional late clips for long reels."""
+    duration = max(1.0, float(duration or 60))
+    try:
+        cap = int(os.getenv("EXTRACT_RECIPE_SOCIAL_VISION_MAX_SECONDS", "20"))
+    except ValueError:
+        cap = 20
+    try:
+        section_len = max(2.0, min(float(os.getenv("EXTRACT_RECIPE_SOCIAL_VISION_SECTION_SECONDS", "4")), 8.0))
+    except ValueError:
+        section_len = 4.0
+
+    specs: list[str] = []
+    seen: set[str] = set()
+
+    def _add(spec: str) -> None:
+        if spec and spec not in seen:
+            seen.add(spec)
+            specs.append(spec)
+
+    # Preserve legacy behaviour: always sample the opening of the reel first.
+    early_end = int(min(max(1.0, float(cap)), duration))
+    _add(f"*0-{early_end}")
+
+    if duration <= cap:
+        return specs
+
+    # Long reel: add sparse clips after the intro for recipes that start later.
+    try:
+        num_late = max(1, min(int(os.getenv("EXTRACT_RECIPE_SOCIAL_VISION_LATE_SECTIONS", "2")), 4))
+    except ValueError:
+        num_late = 2
+    try:
+        skip_intro = float(os.getenv("EXTRACT_RECIPE_SOCIAL_VISION_SKIP_INTRO_SECONDS", "0"))
+    except ValueError:
+        skip_intro = 0.0
+    if skip_intro <= 0:
+        skip_intro = min(15.0, max(8.0, duration * 0.18))
+
+    start_min = max(float(early_end), skip_intro)
+    start_max = max(start_min, duration - section_len)
+    if start_max <= start_min:
+        return specs
+
+    for i in range(num_late):
+        frac = (i + 1) / (num_late + 1)
+        start = start_min + frac * (start_max - start_min)
+        start = min(start, duration - section_len)
+        end = min(start + section_len, duration)
+        _add(f"*{int(start)}-{int(max(start + 1, end))}")
+    return specs
+
+
+def _social_vision_download_plan(meta: dict, url: str) -> tuple[list[str] | None, int | None]:
+    """Return (distributed_section_specs, legacy_max_seconds) for social vision downloads."""
+    lowered = (url or "").lower()
+    if "tiktok.com" not in lowered and "instagram.com" not in lowered:
+        return None, None
+    duration = float(meta.get("duration") or 0)
+    cap = _social_vision_max_download_seconds(meta, url)
+    distributed = (
+        os.getenv("EXTRACT_RECIPE_SOCIAL_VISION_DISTRIBUTED", "1").strip().lower()
+        not in ("0", "false", "no")
+    )
+    if distributed and cap and duration > cap:
+        sections = _social_vision_sample_section_specs(duration)
+        if len(sections) > 1:
+            print(
+                f"⚡ Distributed vision download: opening + {len(sections) - 1} late clip(s) "
+                f"across {duration:.0f}s reel"
+            )
+            return sections, None
+    return None, cap
 
 
 def _effective_vision_duration(meta: dict, url: str) -> float:
@@ -6022,13 +6608,20 @@ def _merge_video_download_meta(video_url: str, video_meta: dict | None, audio_me
     return meta
 
 
-def _download_video_to_file(video_url: str, *, fast: bool = False, max_seconds: int | None = None):
+def _download_video_to_file(
+    video_url: str,
+    *,
+    fast: bool = False,
+    max_seconds: int | None = None,
+    download_sections: list[str] | None = None,
+):
     """
     Download video (not just audio) to a temp file for frame extraction.
     Uses a single yt-dlp call (extract_info + download=True) to avoid the
     redundant separate metadata round-trip from _yt_meta().
     fast=True prefers ≤480p for quicker social-reel downloads (vision only needs rough frames).
     max_seconds: when set, only download the first N seconds (for long social reels).
+    download_sections: yt-dlp section specs (e.g. ["*20-24","*40-44"]) for sparse timeline sampling.
     Returns: (temp_dir, video_path, meta_dict). Caller must shutil.rmtree(temp_dir) when done.
     """
     temp_dir = tempfile.mkdtemp()
@@ -6044,6 +6637,14 @@ def _download_video_to_file(video_url: str, *, fast: bool = False, max_seconds: 
             "noplaylist": True,
             "quiet": True,
             "no_warnings": True,
+            # Resilience against truncated/incomplete downloads ("N bytes read,
+            # M more expected"): retry the download and its fragments, and pull
+            # in bounded HTTP chunks (Range requests) so a mid-stream cut can
+            # resume instead of failing the whole request.
+            "retries": int(os.getenv("YTDLP_DL_RETRIES", "3")),
+            "fragment_retries": int(os.getenv("YTDLP_DL_FRAGMENT_RETRIES", "3")),
+            "http_chunk_size": int(os.getenv("YTDLP_DL_HTTP_CHUNK_SIZE", str(10 * 1024 * 1024))),
+            "socket_timeout": int(os.getenv("YTDLP_DL_SOCKET_TIMEOUT", "15")),
             "extractor_args": {"youtube": _yt_extractor_args()},
         }
         # Copy cookies to a writable path (yt-dlp writes the jar back; Render
@@ -6056,7 +6657,9 @@ def _download_video_to_file(video_url: str, *, fast: bool = False, max_seconds: 
         _proxy = _ytdlp_proxy(video_url)
         if _proxy:
             ydl_opts["proxy"] = _proxy
-        if max_seconds and max_seconds > 0:
+        if download_sections:
+            ydl_opts["download_sections"] = download_sections
+        elif max_seconds and max_seconds > 0:
             ydl_opts["download_sections"] = [f"*0-{int(max_seconds)}"]
 
         # Single call: fetches metadata AND downloads in one network session
@@ -6076,7 +6679,21 @@ def _download_video_to_file(video_url: str, *, fast: bool = False, max_seconds: 
             raise RuntimeError("No video file produced by yt-dlp")
         video_path = os.path.join(temp_dir, candidates[0])
         meta = _video_meta_from_yt_info(info, video_url)
-        if max_seconds and duration and duration > max_seconds:
+        if download_sections:
+            meta["vision_distributed_sections"] = download_sections
+            meta["vision_duration"] = _download_sections_total_seconds(download_sections)
+            if len(download_sections) > 1:
+                meta["vision_distributed"] = True
+                print(
+                    f"⚡ Sparse vision clips ready (~{meta['vision_duration']:.0f}s total from "
+                    f"{len(download_sections)} section(s))"
+                )
+            else:
+                print(
+                    f"⚡ Partial video download: first {meta['vision_duration']:.0f}s "
+                    f"of {duration}s"
+                )
+        elif max_seconds and duration and duration > max_seconds:
             meta["vision_duration"] = float(max_seconds)
             print(f"⚡ Partial video download: first {max_seconds}s of {duration}s")
         return temp_dir, video_path, meta
@@ -6855,7 +7472,7 @@ def _run_frame_vision_fallback(video_url: str, meta: dict) -> tuple[dict | None,
     try:
         temp_dir, video_path, video_meta = _download_video_to_file(video_url, fast=True)
         duration = video_meta.get("duration") or 0
-        n_frames = _social_video_frames_for_duration(video_url, duration)
+        n_frames = _social_video_frames_for_duration(video_url, duration, meta=video_meta)
         frame_urls = _extract_frame_data_urls_from_video(
             video_path, duration, num_frames=n_frames
         )
@@ -6901,7 +7518,7 @@ def _run_frame_vision_fallback_from_path(
     """
     try:
         duration = float(meta.get("vision_duration") or meta.get("duration") or 0)
-        n_frames = _social_video_frames_for_duration(video_url, duration)
+        n_frames = _social_video_frames_for_duration(video_url, duration, meta=meta)
         print(f"🎬 Vision fallback: extracting {n_frames} frame(s) from {duration}s video")
         frame_urls = _extract_frame_data_urls_from_video(
             video_path, duration, num_frames=n_frames
@@ -7178,8 +7795,39 @@ def _fetch_tiktok_page_caption(url: str) -> str | None:
     return caption
 
 
+def _instaloader_import_cookies(L, cookiefile: str) -> bool:
+    """Inject Instagram cookies from a Netscape cookies.txt into instaloader's
+    session so requests are authenticated. Returns True if an Instagram
+    'sessionid' cookie was found (i.e. the session should be logged in)."""
+    try:
+        import http.cookiejar
+        cj = http.cookiejar.MozillaCookieJar()
+        cj.load(cookiefile, ignore_discard=True, ignore_expires=True)
+    except Exception as e:
+        print(f"⚠️ instaloader: could not read cookies file: {e}")
+        return False
+    found_sessionid = False
+    for c in cj:
+        if "instagram" not in (c.domain or "").lower():
+            continue
+        try:
+            L.context._session.cookies.set(c.name, c.value, domain=c.domain)
+        except Exception:
+            continue
+        if c.name == "sessionid" and c.value:
+            found_sessionid = True
+    return found_sessionid
+
+
 def _fetch_instagram_page_caption(url: str) -> str | None:
-    """Fetch full Instagram post/reel caption via instaloader."""
+    """Fetch full Instagram post/reel caption via instaloader.
+
+    Instagram blocks *anonymous* instaloader access (the source of the
+    'NoneType object is not subscriptable' errors), so we only attempt the fetch
+    when the session is authenticated — either via a loaded session file or by
+    importing the existing yt-dlp Instagram cookies. When unauthenticated we skip
+    quietly, since yt-dlp already supplies the caption via the post description.
+    """
     if (os.getenv("EXTRACT_RECIPE_INSTAGRAM_PAGE_CAPTION") or "1").strip().lower() in ("0", "false", "no"):
         return None
     if "instagram.com" not in (url or "").lower():
@@ -7187,8 +7835,29 @@ def _fetch_instagram_page_caption(url: str) -> str | None:
     shortcode = _instagram_post_shortcode(url)
     if not shortcode:
         return None
+
+    L = _make_instaloader()  # loads INSTALOADER_SESSION_FILE if configured
+
+    # If the session file didn't log us in, try the yt-dlp Instagram cookies.
+    if not getattr(L.context, "is_logged_in", False):
+        cookie_tmp = None
+        try:
+            cookie_tmp = tempfile.mkdtemp()
+            cf = _prepare_cookiefile(cookie_tmp, url)
+            if cf:
+                _instaloader_import_cookies(L, cf)
+        except Exception as e:
+            print(f"⚠️ instaloader: cookie import failed: {e}")
+        finally:
+            if cookie_tmp:
+                shutil.rmtree(cookie_tmp, ignore_errors=True)
+
+    if not getattr(L.context, "is_logged_in", False):
+        # Anonymous access is reliably blocked by Instagram — skip without noise.
+        return None
+
     try:
-        post = instaloader.Post.from_shortcode(_make_instaloader().context, shortcode)
+        post = instaloader.Post.from_shortcode(L.context, shortcode)
         caption = (post.caption or "").strip()
         if caption:
             print(f"📝 Instagram page caption fetched ({len(caption)} chars)")
@@ -7564,7 +8233,7 @@ def _extract_recipe_from_slideshow(url: str, url_key: str, slideshow: tuple[list
         with _recipe_cache_lock:
             _recipe_cache[url_key] = result
         print(f"✅ Slideshow recipe extracted in {time.time() - t0:.2f}s")
-        return jsonify(result), 200
+        return jsonify(_apply_extract_recipe_image_pref(result)), 200
     except Exception as e:
         print(f"⚠️ Slideshow extraction failed: {e}")
         return jsonify({
@@ -7647,13 +8316,15 @@ def extract_recipe_from_video_internal(video_url: str):
 
     # ── Cache check ──────────────────────────────────────────────────────────
     url_key = hashlib.sha256(video_url.encode()).hexdigest()
-    with _recipe_cache_lock:
-        if url_key in _recipe_cache:
-            print(f"⚡ Cache hit for video URL: {video_url}")
-            cached = _apply_response_language(
-                dict(_recipe_cache[url_key]), video_url, _recipe_cache[url_key].get("meta") or {}
-            )
-            return jsonify({**cached, "cached": True}), 200
+    if not _get_extract_recipe_no_cache():
+        with _recipe_cache_lock:
+            if url_key in _recipe_cache:
+                print(f"⚡ Cache hit for video URL: {video_url}")
+                cached = _apply_response_language(
+                    dict(_recipe_cache[url_key]), video_url, _recipe_cache[url_key].get("meta") or {}
+                )
+                _ensure_cached_recipe_nutrition(cached)
+                return jsonify({**_apply_extract_recipe_image_pref(cached), "cached": True}), 200
     # ─────────────────────────────────────────────────────────────────────────
 
     tiktok_photo_resp = _try_tiktok_photo_slideshow_fast_path(video_url, url_key)
@@ -7699,11 +8370,14 @@ def extract_recipe_from_video_internal(video_url: str):
                         if duration > cap:
                             max_sec = cap
                     else:
-                        max_sec = _social_vision_max_download_seconds(meta, video_url)
+                        sections, max_sec = _social_vision_download_plan(meta, video_url)
                     print("🎬 Vision fallback: downloading video...")
                     t_vdl = time.time()
                     temp_dir, video_path, dl_meta = _download_video_to_file(
-                        video_url, fast=True, max_seconds=max_sec
+                        video_url,
+                        fast=True,
+                        max_seconds=max_sec,
+                        download_sections=sections,
                     )
                     meta = _merge_video_download_meta(video_url, meta, dl_meta)
                     print(f"🎬 Vision video ready in {time.time() - t_vdl:.2f}s")
@@ -7736,19 +8410,34 @@ def extract_recipe_from_video_internal(video_url: str):
                 }), 500
             print(f"📋 Metadata fetched in {time.time() - t0:.2f}s")
 
+            # Start the thumbnail upload now so it overlaps the caption/vision LLM
+            # (resolved in _return_video_extract_result before the response).
+            if meta.get("thumbnail"):
+                _img_persist_futures[url_key] = _start_persist_image(meta["thumbnail"])
+
             extraction_method = "caption_llm"
             recipe = None
             source = None
+            missing_sections: list[str] = []
+            caption_from_partial = False
             caption_text = _video_caption_text(meta)
             if _should_try_social_caption_first(meta, video_url):
                 print(f"📝 Caption-first mode ({len(caption_text)} chars)")
                 t_cap = time.time()
                 recipe = _extract_recipe_from_video_caption(meta)
                 print(f"📝 Caption LLM finished in {time.time() - t_cap:.2f}s")
-                if _social_caption_recipe_acceptable(recipe, caption_text):
+                # Accept whatever the caption provides — ingredients-only or
+                # instructions-only included — and flag the missing section
+                # instead of falling back to slow vision.
+                recipe, missing_sections = _sanitize_partial_caption_recipe(recipe, caption_text)
+                if recipe:
                     source = _build_video_recipe_source(video_url, meta, recipe)
-                else:
-                    recipe = None
+                    caption_from_partial = True
+                    if missing_sections:
+                        print(
+                            f"📝 Caption partial — no {', '.join(missing_sections)} in caption; "
+                            "returning available info (skipping vision)"
+                        )
             else:
                 print(
                     f"📝 Caption not used for extraction ({len(caption_text)} chars); "
@@ -7756,11 +8445,17 @@ def extract_recipe_from_video_internal(video_url: str):
                 )
 
             if not _recipe_has_usable_content(recipe):
-                max_sec = _social_vision_max_download_seconds(meta, video_url)
+                # Caption yielded nothing usable → vision fallback (clear caption flags).
+                missing_sections = []
+                caption_from_partial = False
+                sections, max_sec = _social_vision_download_plan(meta, video_url)
                 t_dl = time.time()
                 try:
                     temp_dir, video_path, dl_meta = _download_video_to_file(
-                        video_url, fast=True, max_seconds=max_sec
+                        video_url,
+                        fast=True,
+                        max_seconds=max_sec,
+                        download_sections=sections,
                     )
                     meta = _merge_meta_keep_longer_description(meta, dl_meta)
                 except ValueError as ve:
@@ -7795,25 +8490,61 @@ def extract_recipe_from_video_internal(video_url: str):
                 extraction_method = vision_result.get("method") or "video_frames_vision"
 
             if recipe and source and _recipe_has_usable_content(recipe):
-                if _is_social_video_url(video_url) and not _social_recipe_is_complete(recipe):
-                    return jsonify({
-                        "error": "Failed to extract recipe from video",
-                        "user_message": (
-                            "We couldn't read the full recipe from this video. "
-                            "Please try another link or add the recipe manually."
-                        ),
-                        "message": "Incomplete recipe extraction (missing ingredients or steps).",
-                    }), 500
+                vision_partial = False
+                if (
+                    not caption_from_partial
+                    and _is_social_video_url(video_url)
+                    and not _social_recipe_is_complete(recipe)
+                ):
+                    partial_missing = _recipe_missing_sections(recipe)
+                    if partial_missing:
+                        vision_partial = True
+                        missing_sections = partial_missing
+                        print(
+                            f"🎬 Vision partial — no {', '.join(missing_sections)} in sampled frames; "
+                            "returning available info"
+                        )
+                    else:
+                        # Has both sections but below completeness threshold — keep legacy 500.
+                        return jsonify({
+                            "error": "Failed to extract recipe from video",
+                            "user_message": (
+                                "We couldn't read the full recipe from this video. "
+                                "Please try another link or add the recipe manually."
+                            ),
+                            "message": "Incomplete recipe extraction (missing ingredients or steps).",
+                        }), 500
                 lang = _finalize_recipe_for_response(recipe, meta)
                 tags = extract_recipe_tags(recipe)
+                if caption_from_partial and missing_sections:
+                    extraction_method = "caption_llm_partial"
+                    recipe["missing"] = missing_sections
+                elif vision_partial:
+                    extraction_method = "video_frames_vision_partial"
+                    if missing_sections:
+                        recipe["missing"] = missing_sections
                 _result = {
                     "source": source,
                     "recipe": recipe,
                     "tags": tags,
                     "transcript": None,
-                    "extraction": {"method": extraction_method, "confidence": 0.5},
+                    "extraction": {
+                        "method": extraction_method,
+                        "confidence": 0.45 if vision_partial else 0.5,
+                    },
                     "meta": meta,
                 }
+                if caption_from_partial and missing_sections:
+                    _result["warnings"] = [
+                        f"No {section} found in the caption." for section in missing_sections
+                    ]
+                elif vision_partial:
+                    if missing_sections:
+                        _result["warnings"] = [
+                            f"No {section} found in the video." for section in missing_sections
+                        ]
+                    else:
+                        _result["warnings"] = ["Recipe extraction may be incomplete."]
                 return _return_video_extract_result(_result, url_key, video_url, meta, language=lang)
             return jsonify({
                 "error": "Failed to extract recipe from video",
@@ -8075,11 +8806,6 @@ def extract_recipe_from_video_internal(video_url: str):
             "meta": meta,
         }
         return _return_video_extract_result(_result, url_key, video_url, meta, language=lang)
-        return jsonify({
-                "error": "Unexpected server error",
-                "user_message": DEFAULT_500_USER_MESSAGE,
-                "details": str(e),
-            }), 500
     finally:
         if temp_dir:
             shutil.rmtree(temp_dir, ignore_errors=True)

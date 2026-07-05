@@ -4153,6 +4153,21 @@ def _get_extract_recipe_include_image() -> bool:
     return str(raw).strip().lower() in ("1", "true", "yes")
 
 
+def _get_extract_recipe_no_cache() -> bool:
+    """When true, skip _recipe_cache lookup for this request."""
+    data = request.get_json(silent=True) or {}
+    raw = data.get("no_cache")
+    if raw is None:
+        raw = data.get("noCache")
+    if raw is None:
+        raw = request.form.get("no_cache") or request.args.get("no_cache")
+    if raw is None:
+        return False
+    if isinstance(raw, bool):
+        return raw
+    return str(raw).strip().lower() in ("1", "true", "yes")
+
+
 def _start_persist_image(image_url: str | None):
     """Kick off the thumbnail upload in the background so it overlaps extraction.
     Returns a Future (resolving to the Storage URL or None), or None if no URL."""
@@ -5175,12 +5190,13 @@ def extract_recipe():
     # Webpage pipeline
     # ── Cache check ──────────────────────────────────────────────────────────
     webpage_key = hashlib.sha256(url.encode()).hexdigest()
-    with _recipe_cache_lock:
-        if webpage_key in _recipe_cache:
-            print(f"⚡ Cache hit for webpage URL: {url}")
-            cached = dict(_recipe_cache[webpage_key])
-            _ensure_cached_recipe_nutrition(cached)
-            return jsonify({**_apply_extract_recipe_image_pref(cached), "cached": True})
+    if not _get_extract_recipe_no_cache():
+        with _recipe_cache_lock:
+            if webpage_key in _recipe_cache:
+                print(f"⚡ Cache hit for webpage URL: {url}")
+                cached = dict(_recipe_cache[webpage_key])
+                _ensure_cached_recipe_nutrition(cached)
+                return jsonify({**_apply_extract_recipe_image_pref(cached), "cached": True})
     # ─────────────────────────────────────────────────────────────────────────
 
     try:
@@ -5826,10 +5842,15 @@ def _return_video_extract_result(
     return jsonify(_apply_extract_recipe_image_pref(result)), 200
 
 
-def _social_video_frames_for_duration(url: str, duration_sec: float | None) -> int:
+def _social_video_frames_for_duration(
+    url: str, duration_sec: float | None, *, meta: dict | None = None
+) -> int:
     """TikTok/IG: sample multiple frames when vision fallback is needed."""
     if not _is_social_video_url(url):
         return _video_frames_for_duration(duration_sec)
+    if meta and meta.get("vision_distributed_sections"):
+        n = len(meta["vision_distributed_sections"])
+        return min(max(1, n), MAX_EXTRACT_RECIPE_IMAGES)
     try:
         n = int(os.getenv("EXTRACT_RECIPE_SOCIAL_VIDEO_FRAMES", "2"))
     except ValueError:
@@ -5896,6 +5917,23 @@ def _social_recipe_is_complete(recipe: dict | None) -> bool:
         if str(step).strip()
     )
     return ing_count >= 3 and inst_count >= 2
+
+
+def _recipe_missing_sections(recipe: dict | None) -> list[str]:
+    """Sections entirely absent from a recipe (for partial API responses)."""
+    if not recipe:
+        return ["ingredients", "instructions"]
+    ingredients = [
+        ing for ing in (recipe.get("ingredients") or [])
+        if isinstance(ing, dict) and (ing.get("name") or "").strip()
+    ]
+    instructions = [str(s).strip() for s in (recipe.get("instructions") or []) if str(s).strip()]
+    missing: list[str] = []
+    if not ingredients:
+        missing.append("ingredients")
+    if not instructions:
+        missing.append("instructions")
+    return missing
 
 
 _CAPTION_QTY_PATTERN = re.compile(
@@ -6381,7 +6419,7 @@ def _fetch_youtube_transcript(video_url: str, *, meta: dict | None = None) -> tu
 
 
 def _social_vision_max_download_seconds(meta: dict, url: str) -> int | None:
-    """Cap IG/TikTok video bytes downloaded for frame extraction (recipe text is usually early)."""
+    """Cap IG/TikTok video bytes downloaded for frame extraction."""
     try:
         cap = int(os.getenv("EXTRACT_RECIPE_SOCIAL_VISION_MAX_SECONDS", "20"))
     except ValueError:
@@ -6395,6 +6433,90 @@ def _social_vision_max_download_seconds(meta: dict, url: str) -> int | None:
     if duration > cap:
         return cap
     return None
+
+
+def _download_sections_total_seconds(specs: list[str]) -> float:
+    total = 0.0
+    for spec in specs:
+        match = re.match(r"\*(\d+(?:\.\d+)?)-(\d+(?:\.\d+)?)", (spec or "").strip())
+        if match:
+            total += max(0.0, float(match.group(2)) - float(match.group(1)))
+    return total
+
+
+def _social_vision_sample_section_specs(duration: float) -> list[str]:
+    """Sparse yt-dlp sections: legacy opening clip + optional late clips for long reels."""
+    duration = max(1.0, float(duration or 60))
+    try:
+        cap = int(os.getenv("EXTRACT_RECIPE_SOCIAL_VISION_MAX_SECONDS", "20"))
+    except ValueError:
+        cap = 20
+    try:
+        section_len = max(2.0, min(float(os.getenv("EXTRACT_RECIPE_SOCIAL_VISION_SECTION_SECONDS", "4")), 8.0))
+    except ValueError:
+        section_len = 4.0
+
+    specs: list[str] = []
+    seen: set[str] = set()
+
+    def _add(spec: str) -> None:
+        if spec and spec not in seen:
+            seen.add(spec)
+            specs.append(spec)
+
+    # Preserve legacy behaviour: always sample the opening of the reel first.
+    early_end = int(min(max(1.0, float(cap)), duration))
+    _add(f"*0-{early_end}")
+
+    if duration <= cap:
+        return specs
+
+    # Long reel: add sparse clips after the intro for recipes that start later.
+    try:
+        num_late = max(1, min(int(os.getenv("EXTRACT_RECIPE_SOCIAL_VISION_LATE_SECTIONS", "2")), 4))
+    except ValueError:
+        num_late = 2
+    try:
+        skip_intro = float(os.getenv("EXTRACT_RECIPE_SOCIAL_VISION_SKIP_INTRO_SECONDS", "0"))
+    except ValueError:
+        skip_intro = 0.0
+    if skip_intro <= 0:
+        skip_intro = min(15.0, max(8.0, duration * 0.18))
+
+    start_min = max(float(early_end), skip_intro)
+    start_max = max(start_min, duration - section_len)
+    if start_max <= start_min:
+        return specs
+
+    for i in range(num_late):
+        frac = (i + 1) / (num_late + 1)
+        start = start_min + frac * (start_max - start_min)
+        start = min(start, duration - section_len)
+        end = min(start + section_len, duration)
+        _add(f"*{int(start)}-{int(max(start + 1, end))}")
+    return specs
+
+
+def _social_vision_download_plan(meta: dict, url: str) -> tuple[list[str] | None, int | None]:
+    """Return (distributed_section_specs, legacy_max_seconds) for social vision downloads."""
+    lowered = (url or "").lower()
+    if "tiktok.com" not in lowered and "instagram.com" not in lowered:
+        return None, None
+    duration = float(meta.get("duration") or 0)
+    cap = _social_vision_max_download_seconds(meta, url)
+    distributed = (
+        os.getenv("EXTRACT_RECIPE_SOCIAL_VISION_DISTRIBUTED", "1").strip().lower()
+        not in ("0", "false", "no")
+    )
+    if distributed and cap and duration > cap:
+        sections = _social_vision_sample_section_specs(duration)
+        if len(sections) > 1:
+            print(
+                f"⚡ Distributed vision download: opening + {len(sections) - 1} late clip(s) "
+                f"across {duration:.0f}s reel"
+            )
+            return sections, None
+    return None, cap
 
 
 def _effective_vision_duration(meta: dict, url: str) -> float:
@@ -6486,13 +6608,20 @@ def _merge_video_download_meta(video_url: str, video_meta: dict | None, audio_me
     return meta
 
 
-def _download_video_to_file(video_url: str, *, fast: bool = False, max_seconds: int | None = None):
+def _download_video_to_file(
+    video_url: str,
+    *,
+    fast: bool = False,
+    max_seconds: int | None = None,
+    download_sections: list[str] | None = None,
+):
     """
     Download video (not just audio) to a temp file for frame extraction.
     Uses a single yt-dlp call (extract_info + download=True) to avoid the
     redundant separate metadata round-trip from _yt_meta().
     fast=True prefers ≤480p for quicker social-reel downloads (vision only needs rough frames).
     max_seconds: when set, only download the first N seconds (for long social reels).
+    download_sections: yt-dlp section specs (e.g. ["*20-24","*40-44"]) for sparse timeline sampling.
     Returns: (temp_dir, video_path, meta_dict). Caller must shutil.rmtree(temp_dir) when done.
     """
     temp_dir = tempfile.mkdtemp()
@@ -6528,7 +6657,9 @@ def _download_video_to_file(video_url: str, *, fast: bool = False, max_seconds: 
         _proxy = _ytdlp_proxy(video_url)
         if _proxy:
             ydl_opts["proxy"] = _proxy
-        if max_seconds and max_seconds > 0:
+        if download_sections:
+            ydl_opts["download_sections"] = download_sections
+        elif max_seconds and max_seconds > 0:
             ydl_opts["download_sections"] = [f"*0-{int(max_seconds)}"]
 
         # Single call: fetches metadata AND downloads in one network session
@@ -6548,7 +6679,21 @@ def _download_video_to_file(video_url: str, *, fast: bool = False, max_seconds: 
             raise RuntimeError("No video file produced by yt-dlp")
         video_path = os.path.join(temp_dir, candidates[0])
         meta = _video_meta_from_yt_info(info, video_url)
-        if max_seconds and duration and duration > max_seconds:
+        if download_sections:
+            meta["vision_distributed_sections"] = download_sections
+            meta["vision_duration"] = _download_sections_total_seconds(download_sections)
+            if len(download_sections) > 1:
+                meta["vision_distributed"] = True
+                print(
+                    f"⚡ Sparse vision clips ready (~{meta['vision_duration']:.0f}s total from "
+                    f"{len(download_sections)} section(s))"
+                )
+            else:
+                print(
+                    f"⚡ Partial video download: first {meta['vision_duration']:.0f}s "
+                    f"of {duration}s"
+                )
+        elif max_seconds and duration and duration > max_seconds:
             meta["vision_duration"] = float(max_seconds)
             print(f"⚡ Partial video download: first {max_seconds}s of {duration}s")
         return temp_dir, video_path, meta
@@ -7327,7 +7472,7 @@ def _run_frame_vision_fallback(video_url: str, meta: dict) -> tuple[dict | None,
     try:
         temp_dir, video_path, video_meta = _download_video_to_file(video_url, fast=True)
         duration = video_meta.get("duration") or 0
-        n_frames = _social_video_frames_for_duration(video_url, duration)
+        n_frames = _social_video_frames_for_duration(video_url, duration, meta=video_meta)
         frame_urls = _extract_frame_data_urls_from_video(
             video_path, duration, num_frames=n_frames
         )
@@ -7373,7 +7518,7 @@ def _run_frame_vision_fallback_from_path(
     """
     try:
         duration = float(meta.get("vision_duration") or meta.get("duration") or 0)
-        n_frames = _social_video_frames_for_duration(video_url, duration)
+        n_frames = _social_video_frames_for_duration(video_url, duration, meta=meta)
         print(f"🎬 Vision fallback: extracting {n_frames} frame(s) from {duration}s video")
         frame_urls = _extract_frame_data_urls_from_video(
             video_path, duration, num_frames=n_frames
@@ -8171,14 +8316,15 @@ def extract_recipe_from_video_internal(video_url: str):
 
     # ── Cache check ──────────────────────────────────────────────────────────
     url_key = hashlib.sha256(video_url.encode()).hexdigest()
-    with _recipe_cache_lock:
-        if url_key in _recipe_cache:
-            print(f"⚡ Cache hit for video URL: {video_url}")
-            cached = _apply_response_language(
-                dict(_recipe_cache[url_key]), video_url, _recipe_cache[url_key].get("meta") or {}
-            )
-            _ensure_cached_recipe_nutrition(cached)
-            return jsonify({**_apply_extract_recipe_image_pref(cached), "cached": True}), 200
+    if not _get_extract_recipe_no_cache():
+        with _recipe_cache_lock:
+            if url_key in _recipe_cache:
+                print(f"⚡ Cache hit for video URL: {video_url}")
+                cached = _apply_response_language(
+                    dict(_recipe_cache[url_key]), video_url, _recipe_cache[url_key].get("meta") or {}
+                )
+                _ensure_cached_recipe_nutrition(cached)
+                return jsonify({**_apply_extract_recipe_image_pref(cached), "cached": True}), 200
     # ─────────────────────────────────────────────────────────────────────────
 
     tiktok_photo_resp = _try_tiktok_photo_slideshow_fast_path(video_url, url_key)
@@ -8224,11 +8370,14 @@ def extract_recipe_from_video_internal(video_url: str):
                         if duration > cap:
                             max_sec = cap
                     else:
-                        max_sec = _social_vision_max_download_seconds(meta, video_url)
+                        sections, max_sec = _social_vision_download_plan(meta, video_url)
                     print("🎬 Vision fallback: downloading video...")
                     t_vdl = time.time()
                     temp_dir, video_path, dl_meta = _download_video_to_file(
-                        video_url, fast=True, max_seconds=max_sec
+                        video_url,
+                        fast=True,
+                        max_seconds=max_sec,
+                        download_sections=sections,
                     )
                     meta = _merge_video_download_meta(video_url, meta, dl_meta)
                     print(f"🎬 Vision video ready in {time.time() - t_vdl:.2f}s")
@@ -8299,11 +8448,14 @@ def extract_recipe_from_video_internal(video_url: str):
                 # Caption yielded nothing usable → vision fallback (clear caption flags).
                 missing_sections = []
                 caption_from_partial = False
-                max_sec = _social_vision_max_download_seconds(meta, video_url)
+                sections, max_sec = _social_vision_download_plan(meta, video_url)
                 t_dl = time.time()
                 try:
                     temp_dir, video_path, dl_meta = _download_video_to_file(
-                        video_url, fast=True, max_seconds=max_sec
+                        video_url,
+                        fast=True,
+                        max_seconds=max_sec,
+                        download_sections=sections,
                     )
                     meta = _merge_meta_keep_longer_description(meta, dl_meta)
                 except ValueError as ve:
@@ -8338,39 +8490,61 @@ def extract_recipe_from_video_internal(video_url: str):
                 extraction_method = vision_result.get("method") or "video_frames_vision"
 
             if recipe and source and _recipe_has_usable_content(recipe):
-                # Completeness gate applies only to VISION results. Accepted caption
-                # partials (ingredients-only / instructions-only) are returned as-is
-                # with the missing section flagged, per product requirement.
+                vision_partial = False
                 if (
                     not caption_from_partial
                     and _is_social_video_url(video_url)
                     and not _social_recipe_is_complete(recipe)
                 ):
-                    return jsonify({
-                        "error": "Failed to extract recipe from video",
-                        "user_message": (
-                            "We couldn't read the full recipe from this video. "
-                            "Please try another link or add the recipe manually."
-                        ),
-                        "message": "Incomplete recipe extraction (missing ingredients or steps).",
-                    }), 500
+                    partial_missing = _recipe_missing_sections(recipe)
+                    if partial_missing:
+                        vision_partial = True
+                        missing_sections = partial_missing
+                        print(
+                            f"🎬 Vision partial — no {', '.join(missing_sections)} in sampled frames; "
+                            "returning available info"
+                        )
+                    else:
+                        # Has both sections but below completeness threshold — keep legacy 500.
+                        return jsonify({
+                            "error": "Failed to extract recipe from video",
+                            "user_message": (
+                                "We couldn't read the full recipe from this video. "
+                                "Please try another link or add the recipe manually."
+                            ),
+                            "message": "Incomplete recipe extraction (missing ingredients or steps).",
+                        }), 500
                 lang = _finalize_recipe_for_response(recipe, meta)
                 tags = extract_recipe_tags(recipe)
                 if caption_from_partial and missing_sections:
                     extraction_method = "caption_llm_partial"
                     recipe["missing"] = missing_sections
+                elif vision_partial:
+                    extraction_method = "video_frames_vision_partial"
+                    if missing_sections:
+                        recipe["missing"] = missing_sections
                 _result = {
                     "source": source,
                     "recipe": recipe,
                     "tags": tags,
                     "transcript": None,
-                    "extraction": {"method": extraction_method, "confidence": 0.5},
+                    "extraction": {
+                        "method": extraction_method,
+                        "confidence": 0.45 if vision_partial else 0.5,
+                    },
                     "meta": meta,
                 }
                 if caption_from_partial and missing_sections:
                     _result["warnings"] = [
                         f"No {section} found in the caption." for section in missing_sections
                     ]
+                elif vision_partial:
+                    if missing_sections:
+                        _result["warnings"] = [
+                            f"No {section} found in the video." for section in missing_sections
+                        ]
+                    else:
+                        _result["warnings"] = ["Recipe extraction may be incomplete."]
                 return _return_video_extract_result(_result, url_key, video_url, meta, language=lang)
             return jsonify({
                 "error": "Failed to extract recipe from video",

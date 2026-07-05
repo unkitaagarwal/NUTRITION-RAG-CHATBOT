@@ -70,3 +70,10 @@ vector_store/
 # Temporary files
 *.tmp
 *.temp
+
+# Browser / yt-dlp cookie jars (contain session secrets)
+cookies*.txt
+*cookies*.txt
+
+# TikTok page dumps (EXTRACT_RECIPE_TIKTOK_DEBUG=1)
+debug_dumps/

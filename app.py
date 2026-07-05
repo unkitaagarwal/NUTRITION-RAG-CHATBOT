@@ -244,16 +244,15 @@ def _ytdlp_proxy(url: str) -> str | None:
 
     Direct-first strategy: the 1st attempt is proxy-free, and _ydl_extract()
     retries through the matching proxy only if the direct attempt is blocked.
-    Proxy fallback applies to YouTube and all social sites (Facebook,
-    Instagram, TikTok) — datacenter IPs (e.g. Render) get throttled/blocked
-    by TikTok's CDN even with valid cookies.
+    Proxy fallback applies to YouTube and Facebook ONLY — Instagram/TikTok
+    work fine directly (with cookies) and never use a proxy.
     Forcing the proxy on every request is opt-in:
-    YT_USE_PROXY=1 (YouTube) / SOCIAL_USE_PROXY=1 (FB/IG/TikTok).
+    YT_USE_PROXY=1 (YouTube) / SOCIAL_USE_PROXY=1 (Facebook).
     """
     try:
         if is_youtube_url(url):
             return (YT_PROXY or None) if YT_USE_PROXY else None
-        if _is_social_proxy_url(url):
+        if _is_facebook_url(url):
             return (SOCIAL_PROXY or None) if SOCIAL_USE_PROXY else None
     except Exception:
         pass
@@ -265,23 +264,16 @@ def _is_facebook_url(url: str) -> bool:
     return any(s in host for s in ("facebook.com", "fb.watch", "fb.com"))
 
 
-def _is_social_proxy_url(url: str) -> bool:
-    """Social sites that route through SOCIAL_PROXY (FB, Instagram, TikTok)."""
-    host = (urlparse(url).hostname or "").lower()
-    return _is_facebook_url(url) or any(
-        s in host for s in ("tiktok.com", "instagram.com", "instagr.am")
-    )
-
-
 def _fallback_proxy(url: str) -> str | None:
     """Proxy to retry through when a direct attempt is blocked, or None.
 
-    YouTube → YT_PROXY; FB/Instagram/TikTok → SOCIAL_PROXY (defaults to YT_PROXY).
+    YouTube → YT_PROXY; Facebook → SOCIAL_PROXY (defaults to YT_PROXY).
+    Instagram/TikTok → no proxy ever (direct + cookies is sufficient).
     """
     try:
         if is_youtube_url(url):
             return YT_PROXY or None
-        if _is_social_proxy_url(url):
+        if _is_facebook_url(url):
             return SOCIAL_PROXY or None
     except Exception:
         pass
@@ -7653,10 +7645,6 @@ def _slideshow_requests_session() -> requests.Session:
             sess.cookies = cj
         except Exception:
             pass
-    # Route TikTok page fetches through the residential proxy when enabled —
-    # datacenter IPs get served degraded/guest pages with truncated captions.
-    if SOCIAL_USE_PROXY and SOCIAL_PROXY:
-        sess.proxies = {"http": SOCIAL_PROXY, "https": SOCIAL_PROXY}
     return sess
 
 
@@ -7728,30 +7716,98 @@ def _make_instaloader() -> instaloader.Instaloader:
     return L
 
 
+def _tiktok_full_caption_from_post(post: dict) -> str:
+    """Best caption from a TikTok post dict (itemStruct or post-shaped node).
+
+    TikTok long-form descriptions ("Lead / What you'll make / Step-by-step")
+    are truncated in `desc` on the web payload; the full text is split into
+    segments under `contents[].desc` (and sometimes `contentDesc`). Join those
+    and return whichever variant is longest.
+    """
+    candidates: list[str] = []
+    desc = post.get("desc")
+    if isinstance(desc, str) and desc.strip():
+        candidates.append(desc.strip())
+    content_desc = post.get("contentDesc")
+    if isinstance(content_desc, str) and content_desc.strip():
+        candidates.append(content_desc.strip())
+    contents = post.get("contents")
+    if isinstance(contents, list):
+        parts = [
+            seg.get("desc").strip()
+            for seg in contents
+            if isinstance(seg, dict)
+            and isinstance(seg.get("desc"), str)
+            and seg.get("desc").strip()
+        ]
+        if parts:
+            candidates.append("\n".join(parts))
+    base = max(candidates, key=len) if candidates else ""
+    # On-screen text stickers (stickersOnItem[].stickerText[]) often carry the
+    # full recipe (quantities + steps) that vision would otherwise have to OCR
+    # from sampled frames. Append them so the caption path can use them.
+    sticker_lines: list[str] = []
+    stickers = post.get("stickersOnItem")
+    if isinstance(stickers, list):
+        for st in stickers:
+            if not isinstance(st, dict):
+                continue
+            for t in st.get("stickerText") or []:
+                if isinstance(t, str) and t.strip():
+                    sticker_lines.append(t.strip())
+    if sticker_lines:
+        sticker_text = "\n".join(sticker_lines)
+        base = f"{base}\n{sticker_text}" if base else sticker_text
+    return base
+
+
 def _collect_tiktok_desc_from_json(obj, best: list[str], best_lang: list[str] | None = None, locked: list[bool] | None = None) -> None:
-    """Walk TikTok page JSON; prefer itemStruct.desc (actual post) over unrelated longer strings."""
+    """Walk TikTok page JSON; prefer itemStruct (actual post) over unrelated longer strings.
+
+    Within the post node, prefer the full long-form caption (contents[]) over
+    the truncated `desc` — see _tiktok_full_caption_from_post.
+    """
     if locked is None:
         locked = [False]
     if isinstance(obj, dict):
-        desc = None
+        text = None
         item_struct = obj.get("itemStruct")
         if isinstance(item_struct, dict):
-            desc = item_struct.get("desc")
             if best_lang is not None:
                 for lk in ("textLanguage", "language", "descLanguage", "lang"):
                     code = _normalize_language_code(item_struct.get(lk))
                     if code:
                         best_lang[:] = [code]
-            if isinstance(desc, str) and desc.strip():
-                best[:] = [desc.strip()]
+            full = _tiktok_full_caption_from_post(item_struct)
+            if full:
+                # Lock on the itemStruct (the actual post). Keep/accept the
+                # longest variant of the SAME post (a post-shaped node or
+                # another script blob may carry the untruncated caption) —
+                # "same post" = one text is a prefix-extension of the other.
+                current = best[0] if best else ""
+                same_post = bool(current) and (
+                    current.startswith(full[:60]) or full.startswith(current[:60])
+                )
+                if not locked[0]:
+                    if not (same_post and len(current) > len(full)):
+                        best[:] = [full]
+                elif same_post and len(full) > len(current):
+                    best[:] = [full]
                 locked[0] = True
-        elif not locked[0] and isinstance(obj.get("desc"), str) and any(
+        elif isinstance(obj.get("desc"), str) and any(
             k in obj for k in ("id", "video", "createTime", "author", "stats")
         ):
-            desc = obj.get("desc")
-        if not locked[0] and isinstance(desc, str):
-            text = desc.strip()
-            if len(text) > len(best[0] if best else ""):
+            # Post-shaped node outside itemStruct (e.g. SIGI_STATE ItemModule).
+            text = _tiktok_full_caption_from_post(obj)
+        if isinstance(text, str):
+            text = text.strip()
+            current = best[0] if best else ""
+            if not locked[0]:
+                if len(text) > len(current):
+                    best[:] = [text]
+            elif len(text) > len(current) and text.startswith(current[:60]):
+                # Same post, fuller text (e.g. ItemModule carries the
+                # untruncated long-form caption) — safe upgrade.
                 best[:] = [text]
         for value in obj.values():
             _collect_tiktok_desc_from_json(value, best, best_lang, locked)
@@ -7792,6 +7848,25 @@ def _fetch_tiktok_page_info(url: str) -> tuple[str | None, str | None]:
             _collect_tiktok_desc_from_json(data, best, best_lang)
         caption = best[0] or None
         lang = best_lang[0] if best_lang else None
+        if (os.getenv("EXTRACT_RECIPE_TIKTOK_DEBUG") or "").strip().lower() in ("1", "true", "yes"):
+            try:
+                dump_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "debug_dumps")
+                os.makedirs(dump_dir, exist_ok=True)
+                dump_path = os.path.join(
+                    dump_dir,
+                    f"tiktok_page_{hashlib.sha256(resolved.encode()).hexdigest()[:12]}.html",
+                )
+                with open(dump_path, "w", encoding="utf-8") as fh:
+                    fh.write(resp.text)
+                probe = (caption or "")[:40]
+                occurrences = resp.text.count(probe) if probe else 0
+                print(
+                    f"🐞 TikTok debug: page dumped to {dump_path} "
+                    f"({len(resp.text)} bytes, status {resp.status_code}, "
+                    f"caption probe x{occurrences})"
+                )
+            except Exception as dbg_err:
+                print(f"🐞 TikTok debug dump failed: {dbg_err}")
         if caption:
             print(f"📝 TikTok page caption fetched ({len(caption)} chars)")
         if lang:

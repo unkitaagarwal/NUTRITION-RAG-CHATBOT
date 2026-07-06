@@ -55,10 +55,12 @@ app = Flask(__name__)
 _plan_meal_name_history = defaultdict(set)
 _plan_meal_history_lock = Lock()
 
-# In-memory cache for /extract-recipe-from-video results, keyed by SHA256 of the video URL.
-# Same video URL always produces the same recipe, so we never re-run the full pipeline.
-_recipe_cache: dict = {}
-_recipe_cache_lock = Lock()
+# Two-tier cache for /extract-recipe results, keyed by SHA256 of the URL.
+# L1 = per-worker in-memory dict (hot), L2 = Firestore (survives deploys,
+# shared across workers). See recipe_cache.py for design + invalidation.
+from recipe_cache import RecipeCache
+_recipe_cache = RecipeCache()
+_recipe_cache_lock = Lock()  # now only guards _lang_detect_cache
 _lang_detect_cache: dict[str, str] = {}
 
 # Bounded pool + registry for uploading the recipe thumbnail to Storage
@@ -3073,12 +3075,11 @@ def extract_recipe_from_video():
 
         # ── Cache check ──────────────────────────────────────────────────────────
         url_key = hashlib.sha256(video_url.encode()).hexdigest()
-        with _recipe_cache_lock:
-            if url_key in _recipe_cache:
-                print(f"⚡ Cache hit for video URL: {video_url}")
-                cached = dict(_recipe_cache[url_key])
-                _ensure_cached_recipe_nutrition(cached)
-                return jsonify({**_apply_extract_recipe_image_pref(cached), "cached": True})
+        cached = _recipe_cache.get(url_key)
+        if cached is not None:
+            print(f"⚡ Cache hit for video URL: {video_url}")
+            _ensure_cached_recipe_nutrition(cached)
+            return jsonify({**_apply_extract_recipe_image_pref(cached), "cached": True})
         # ─────────────────────────────────────────────────────────────────────────
 
         print(f"🎥 Processing video URL: {video_url}")
@@ -3191,9 +3192,8 @@ def extract_recipe_from_video():
             "message": f"Successfully extracted recipe with {len(ingredients)} ingredients and {len(instructions)} instructions"
         }
 
-        # ── Cache write ──────────────────────────────────────────────────────────
-        with _recipe_cache_lock:
-            _recipe_cache[url_key] = result
+        # ── Cache write (L1 sync + Firestore async) ──────────────────────────────
+        _recipe_cache.set(url_key, result)
         # ─────────────────────────────────────────────────────────────────────────
 
         return jsonify(result)
@@ -5191,12 +5191,11 @@ def extract_recipe():
     # ── Cache check ──────────────────────────────────────────────────────────
     webpage_key = hashlib.sha256(url.encode()).hexdigest()
     if not _get_extract_recipe_no_cache():
-        with _recipe_cache_lock:
-            if webpage_key in _recipe_cache:
-                print(f"⚡ Cache hit for webpage URL: {url}")
-                cached = dict(_recipe_cache[webpage_key])
-                _ensure_cached_recipe_nutrition(cached)
-                return jsonify({**_apply_extract_recipe_image_pref(cached), "cached": True})
+        cached = _recipe_cache.get(webpage_key)
+        if cached is not None:
+            print(f"⚡ Cache hit for webpage URL: {url}")
+            _ensure_cached_recipe_nutrition(cached)
+            return jsonify({**_apply_extract_recipe_image_pref(cached), "cached": True})
     # ─────────────────────────────────────────────────────────────────────────
 
     try:
@@ -5244,9 +5243,8 @@ def extract_recipe():
             "extraction": {"method": method, "confidence": 0.7 if method == "jsonld" else 0.5},
         }
 
-        # ── Cache write ──────────────────────────────────────────────────────
-        with _recipe_cache_lock:
-            _recipe_cache[webpage_key] = _result
+        # ── Cache write (L1 sync + Firestore async) ──────────────────────────
+        _recipe_cache.set(webpage_key, _result)
         # ────────────────────────────────────────────────────────────────────
 
         return jsonify(_apply_extract_recipe_image_pref(_result))
@@ -5837,8 +5835,7 @@ def _return_video_extract_result(
     # LLM), resolve that in-flight Future instead of uploading synchronously.
     _img_future = _img_persist_futures.pop(url_key, None)
     _persist_recipe_source_image(result.get("source"), result.get("meta"), future=_img_future)
-    with _recipe_cache_lock:
-        _recipe_cache[url_key] = result
+    _recipe_cache.set(url_key, result)
     return jsonify(_apply_extract_recipe_image_pref(result)), 200
 
 
@@ -8317,8 +8314,7 @@ def _extract_recipe_from_slideshow(url: str, url_key: str, slideshow: tuple[list
             "language": lang,
         }
         result = _apply_response_language(result, url, meta)
-        with _recipe_cache_lock:
-            _recipe_cache[url_key] = result
+        _recipe_cache.set(url_key, result)
         print(f"✅ Slideshow recipe extracted in {time.time() - t0:.2f}s")
         return jsonify(_apply_extract_recipe_image_pref(result)), 200
     except Exception as e:
@@ -8404,14 +8400,12 @@ def extract_recipe_from_video_internal(video_url: str):
     # ── Cache check ──────────────────────────────────────────────────────────
     url_key = hashlib.sha256(video_url.encode()).hexdigest()
     if not _get_extract_recipe_no_cache():
-        with _recipe_cache_lock:
-            if url_key in _recipe_cache:
-                print(f"⚡ Cache hit for video URL: {video_url}")
-                cached = _apply_response_language(
-                    dict(_recipe_cache[url_key]), video_url, _recipe_cache[url_key].get("meta") or {}
-                )
-                _ensure_cached_recipe_nutrition(cached)
-                return jsonify({**_apply_extract_recipe_image_pref(cached), "cached": True}), 200
+        cached = _recipe_cache.get(url_key)
+        if cached is not None:
+            print(f"⚡ Cache hit for video URL: {video_url}")
+            cached = _apply_response_language(cached, video_url, cached.get("meta") or {})
+            _ensure_cached_recipe_nutrition(cached)
+            return jsonify({**_apply_extract_recipe_image_pref(cached), "cached": True}), 200
     # ─────────────────────────────────────────────────────────────────────────
 
     tiktok_photo_resp = _try_tiktok_photo_slideshow_fast_path(video_url, url_key)

@@ -3942,27 +3942,14 @@ def normalize_recipe_from_jsonld(recipe_obj: dict, soup: BeautifulSoup):
     nutrition = recipe_obj.get("nutrition") or {}
     norm_nutrition = {}
     if isinstance(nutrition, dict):
+        # JSON-LD may use schema.org names (proteinContent, fiberContent, sodiumContent, ...)
         for key in _RECIPE_NUTRITION_KEYS:
-            parsed = _parse_recipe_nutrition_value(
-                nutrition.get(key) or nutrition.get(key.replace("_g", "")),
-                calories=(key == "calories"),
-            )
-            if parsed:
-                norm_nutrition[key] = parsed
-        # JSON-LD may use proteinContent, carbohydrateContent, fatContent
-        alias_map = {
-            "protein_g": ("proteinContent", "protein"),
-            "carbs_g": ("carbohydrateContent", "carbs"),
-            "fat_g": ("fatContent", "fat"),
-            "calories": ("calories",),
-        }
-        for key, aliases in alias_map.items():
-            if key in norm_nutrition:
-                continue
+            aliases = (key,) + _RECIPE_JSONLD_NUTRITION_ALIASES.get(key, ())
             for alias in aliases:
-                parsed = _parse_recipe_nutrition_value(
-                    nutrition.get(alias), calories=(key == "calories")
-                )
+                raw = nutrition.get(alias)
+                if raw is None or raw == "":
+                    continue
+                parsed = _parse_recipe_nutrition_value_with_unit(raw, key)
                 if parsed:
                     norm_nutrition[key] = parsed
                     break
@@ -4003,9 +3990,9 @@ def clean_page_text(html: str) -> str:
 def extract_recipe_from_webpage_llm(page_text: str):
     system = f"""Extract recipe data from webpage text.
 Return ONLY valid JSON:
-{
+{{
   "name": "",
-  "ingredients": [{"name":"", "quantity":""}],
+  "ingredients": [{{"name":"", "quantity":""}}],
   "instructions": ["Step 1 ...", "..."],
   "servings": "",
   "prep_time": "",
@@ -4014,18 +4001,29 @@ Return ONLY valid JSON:
   "notes": [],
   "meal_type": "",
   "cuisine": "",
-  "nutrition": {
+  "nutrition": {{
     "calories": "",
     "protein_g": "",
     "carbs_g": "",
-    "fat_g": ""
-  }
-}
+    "fat_g": "",
+    "fiber_g": "",
+    "sugar_g": "",
+    "sodium_mg": "",
+    "cholesterol_mg": "",
+    "saturated_fat_g": "",
+    "potassium_mg": "",
+    "calcium_mg": "",
+    "iron_mg": "",
+    "vitamin_a_mcg": "",
+    "vitamin_c_mg": "",
+    "vitamin_d_mcg": ""
+  }}
+}}
 Rules:
 - Don't hallucinate for the structure. If fields like servings or times are unknown, use "" or [].
 - meal_type: exactly one of Breakfast, Lunch, Dinner, Snack (infer from context).
 - Infer cuisine from recipe name, ingredients, or context when evident (e.g. Italian, Mexican, Indian, American); otherwise use "".
-- You MUST provide a best-effort numeric estimate (as strings) for nutrition macros PER SERVING: calories, protein_g, carbs_g, fat_g. Use your nutrition knowledge of typical ingredients/quantities to approximate. Only leave a macro field \"\" if there is literally no information about ingredients.
+- You MUST provide a best-effort numeric estimate (as strings) for ALL nutrition fields PER SERVING — macros (calories, protein_g, carbs_g, fat_g) AND micronutrients (fiber_g, sugar_g, sodium_mg, cholesterol_mg, saturated_fat_g, potassium_mg, calcium_mg, iron_mg, vitamin_a_mcg, vitamin_c_mg, vitamin_d_mcg). Prefer values stated on the page; otherwise use your nutrition knowledge of typical ingredients/quantities to approximate. Only leave a field \"\" if there is literally no information about ingredients.
 - {_RECIPE_NUTRITION_PROMPT_RULE}
 - Return JSON only."""
     user = f"Webpage text:\n{page_text}"
@@ -4250,7 +4248,7 @@ def extract_recipe_from_video_frames_llm(
             '{"language":"","name":"","ingredients":[{"name":"","quantity":""}],'
             '"instructions":["Step 1: ...","Step 2: ..."],'
             '"servings":"","prep_time":"","cook_time":"","total_time":"",'
-            '"notes":[],"meal_type":"","cuisine":"","nutrition":{"calories":"","protein_g":"","carbs_g":"","fat_g":""}}. '
+            '"notes":[],"meal_type":"","cuisine":"","nutrition":{"calories":"","protein_g":"","carbs_g":"","fat_g":"","fiber_g":"","sugar_g":"","sodium_mg":"","cholesterol_mg":"","saturated_fat_g":"","potassium_mg":"","calcium_mg":"","iron_mg":"","vitamin_a_mcg":"","vitamin_c_mg":"","vitamin_d_mcg":""}}. '
             f"meal_type: Breakfast|Lunch|Dinner|Snack. {_RECIPE_NUTRITION_PROMPT_RULE}{lang_rule} JSON only."
         )
         user_text = (
@@ -4259,19 +4257,19 @@ def extract_recipe_from_video_frames_llm(
         )
         # Low detail when caption already provides context — much faster than high on multiple frames.
         detail = "low" if (caption_hint and len(image_data_urls) <= 2) else "high"
-        max_tokens = 1400 if detail == "low" else 1600
+        max_tokens = 1500 if detail == "low" else 1700
     else:
         system = (
             "Extract recipe from cooking video frame(s). Return ONLY JSON: "
             '{"name":"","ingredients":[{"name":"","quantity":""}],'
             '"instructions":["..."],"servings":"","prep_time":"","cook_time":"","total_time":"",'
-            '"notes":[],"meal_type":"","cuisine":"","nutrition":{"calories":"","protein_g":"","carbs_g":"","fat_g":""}}. '
+            '"notes":[],"meal_type":"","cuisine":"","nutrition":{"calories":"","protein_g":"","carbs_g":"","fat_g":"","fiber_g":"","sugar_g":"","sodium_mg":"","cholesterol_mg":"","saturated_fat_g":"","potassium_mg":"","calcium_mg":"","iron_mg":"","vitamin_a_mcg":"","vitamin_c_mg":"","vitamin_d_mcg":""}}. '
             "Read on-screen text and visible food. meal_type: Breakfast|Lunch|Dinner|Snack. "
             f"{_RECIPE_NUTRITION_PROMPT_RULE} JSON only."
         )
         user_text = "Extract the recipe JSON from this video frame."
         detail = "low"
-        max_tokens = 900
+        max_tokens = 1000
     content = [{"type": "text", "text": user_text}]
     for url in image_data_urls:
         content.append({
@@ -4305,7 +4303,7 @@ def extract_recipe_from_slideshow_llm(
         " Combine all slides into ONE recipe. Return ONLY JSON: "
         '{"language":"","name":"","ingredients":[{"name":"","quantity":""}],'
         '"instructions":["..."],"servings":"","prep_time":"","cook_time":"","total_time":"",'
-        '"notes":[],"meal_type":"","cuisine":"","nutrition":{"calories":"","protein_g":"","carbs_g":"","fat_g":""}}. '
+        '"notes":[],"meal_type":"","cuisine":"","nutrition":{"calories":"","protein_g":"","carbs_g":"","fat_g":"","fiber_g":"","sugar_g":"","sodium_mg":"","cholesterol_mg":"","saturated_fat_g":"","potassium_mg":"","calcium_mg":"","iron_mg":"","vitamin_a_mcg":"","vitamin_c_mg":"","vitamin_d_mcg":""}}. '
         "Read every visible ingredient and cooking step across slides. "
         f"meal_type: Breakfast|Lunch|Dinner|Snack. {_RECIPE_NUTRITION_PROMPT_RULE}{lang_rule} JSON only."
     )
@@ -4341,9 +4339,9 @@ def extract_recipe_from_images_llm(image_data_urls: list):
         raise ValueError("At least one image is required")
     system = f"""Extract recipe data from the image(s). If multiple images are provided (e.g. multiple pages), combine them into ONE recipe.
 Return ONLY valid JSON:
-{
+{{
   "name": "",
-  "ingredients": [{"name":"", "quantity":""}],
+  "ingredients": [{{"name":"", "quantity":""}}],
   "instructions": ["Step 1 ...", "..."],
   "servings": "",
   "prep_time": "",
@@ -4352,18 +4350,29 @@ Return ONLY valid JSON:
   "notes": [],
   "meal_type": "",
   "cuisine": "",
-  "nutrition": {
+  "nutrition": {{
     "calories": "",
     "protein_g": "",
     "carbs_g": "",
-    "fat_g": ""
-  }
-}
+    "fat_g": "",
+    "fiber_g": "",
+    "sugar_g": "",
+    "sodium_mg": "",
+    "cholesterol_mg": "",
+    "saturated_fat_g": "",
+    "potassium_mg": "",
+    "calcium_mg": "",
+    "iron_mg": "",
+    "vitamin_a_mcg": "",
+    "vitamin_c_mg": "",
+    "vitamin_d_mcg": ""
+  }}
+}}
 Rules:
 - Don't hallucinate. If unknown, use "" or [].
 - meal_type: exactly one of Breakfast, Lunch, Dinner, Snack (infer from context).
 - Infer cuisine from recipe name, ingredients, or visible context when evident (e.g. Italian, Mexican, Indian); otherwise use "".
-- You MUST provide a best-effort numeric estimate (as strings) for nutrition macros PER SERVING: calories, protein_g, carbs_g, fat_g. Use your nutrition knowledge of typical ingredients/quantities to approximate from what you see. Only leave a macro field \"\" if there is literally no information about ingredients.
+- You MUST provide a best-effort numeric estimate (as strings) for ALL nutrition fields PER SERVING — macros (calories, protein_g, carbs_g, fat_g) AND micronutrients (fiber_g, sugar_g, sodium_mg, cholesterol_mg, saturated_fat_g, potassium_mg, calcium_mg, iron_mg, vitamin_a_mcg, vitamin_c_mg, vitamin_d_mcg). Use your nutrition knowledge of typical ingredients/quantities to approximate from what you see. Only leave a field \"\" if there is literally no information about ingredients.
 - {_RECIPE_NUTRITION_PROMPT_RULE}
 - Return JSON only. Read all text visible across the images. Merge ingredients and instructions from all pages into one recipe."""
     content = [{"type": "text", "text": "Extract the recipe from these image(s) and return the JSON. If there are multiple images, treat them as one multi-page recipe and merge into a single recipe."}]
@@ -4599,12 +4608,57 @@ def _format_minutes_label(minutes: int) -> str:
     return f"{minutes} mins"
 
 
-_RECIPE_NUTRITION_KEYS = ("calories", "protein_g", "carbs_g", "fat_g")
+_RECIPE_MACRO_KEYS = ("calories", "protein_g", "carbs_g", "fat_g")
+
+# Standard nutrition-label micronutrients returned per serving.
+_RECIPE_MICRONUTRIENT_KEYS = (
+    "fiber_g", "sugar_g", "sodium_mg", "cholesterol_mg", "saturated_fat_g",
+    "potassium_mg", "calcium_mg", "iron_mg",
+    "vitamin_a_mcg", "vitamin_c_mg", "vitamin_d_mcg",
+)
+
+_RECIPE_NUTRITION_KEYS = _RECIPE_MACRO_KEYS + _RECIPE_MICRONUTRIENT_KEYS
 
 _RECIPE_NUTRITION_PROMPT_RULE = (
-    "Nutrition macros (calories, protein_g, carbs_g, fat_g) are PER SERVING and MUST be numeric strings only "
-    '(e.g. "120", "6.5"). Never use words like variable, approximate, varies, unknown, or descriptive text.'
+    "All nutrition fields are PER SERVING and MUST be numeric strings only "
+    '(e.g. "120", "6.5"). Never use words like variable, approximate, varies, unknown, or descriptive text. '
+    "Units are fixed by the field suffix: _g grams, _mg milligrams, _mcg micrograms; calories is kcal. "
+    "Micronutrients (fiber_g, sugar_g, sodium_mg, cholesterol_mg, saturated_fat_g, potassium_mg, calcium_mg, "
+    "iron_mg, vitamin_a_mcg, vitamin_c_mg, vitamin_d_mcg) must also be best-effort numeric estimates from the ingredients."
 )
+
+# JSON-LD (schema.org NutritionInformation) aliases for nutrition keys.
+_RECIPE_JSONLD_NUTRITION_ALIASES = {
+    "calories": ("calories",),
+    "protein_g": ("proteinContent", "protein"),
+    "carbs_g": ("carbohydrateContent", "carbs", "carbohydrate"),
+    "fat_g": ("fatContent", "fat"),
+    "fiber_g": ("fiberContent", "fiber", "fibre"),
+    "sugar_g": ("sugarContent", "sugar"),
+    "sodium_mg": ("sodiumContent", "sodium"),
+    "cholesterol_mg": ("cholesterolContent", "cholesterol"),
+    "saturated_fat_g": ("saturatedFatContent", "saturatedFat", "saturated_fat"),
+    "potassium_mg": ("potassiumContent", "potassium"),
+    "calcium_mg": ("calciumContent", "calcium"),
+    "iron_mg": ("ironContent", "iron"),
+    "vitamin_a_mcg": ("vitaminAContent", "vitamin_a", "vitaminA"),
+    "vitamin_c_mg": ("vitaminCContent", "vitamin_c", "vitaminC"),
+    "vitamin_d_mcg": ("vitaminDContent", "vitamin_d", "vitaminD"),
+}
+
+# Grams-equivalent factor for each nutrition unit suffix.
+_NUTRITION_UNIT_TO_GRAMS = {"g": 1.0, "mg": 1e-3, "mcg": 1e-6, "µg": 1e-6, "ug": 1e-6}
+
+
+def _recipe_nutrition_target_unit(key: str) -> str | None:
+    """Mass unit implied by a nutrition key suffix, or None for calories."""
+    if key.endswith("_mcg"):
+        return "mcg"
+    if key.endswith("_mg"):
+        return "mg"
+    if key.endswith("_g"):
+        return "g"
+    return None
 
 _INVALID_NUTRITION_TEXT = (
     "variable", "varies", "approximate", "approx", "unknown", "n/a", "na", "tbd",
@@ -4646,6 +4700,33 @@ def _parse_recipe_nutrition_value(value, *, calories: bool = False) -> str | Non
     if number < 0:
         return None
     return _format_recipe_nutrition_number(number, calories=calories)
+
+
+def _parse_recipe_nutrition_value_with_unit(value, key: str) -> str | None:
+    """Parse a nutrition value that may carry a unit (e.g. '370 mg', '0.4 g')
+    and convert it to the unit implied by the key suffix. Used for JSON-LD values,
+    which frequently embed units. Values without an explicit unit are assumed to
+    already be in the target unit."""
+    target = _recipe_nutrition_target_unit(key)
+    if target is None or value is None or isinstance(value, (int, float)):
+        return _parse_recipe_nutrition_value(value, calories=(key == "calories"))
+
+    text = str(value).strip()
+    if not text:
+        return None
+    lower = text.lower()
+    if not re.search(r"\d", text) and any(token in lower for token in _INVALID_NUTRITION_TEXT):
+        return None
+    match = re.search(r"(\d+(?:\.\d+)?)\s*(mcg|µg|ug|mg|g)?\b", lower.replace(",", ""))
+    if not match:
+        return None
+    number = float(match.group(1))
+    if number < 0:
+        return None
+    unit = match.group(2)
+    if unit:
+        number = number * _NUTRITION_UNIT_TO_GRAMS[unit] / _NUTRITION_UNIT_TO_GRAMS[target]
+    return _format_recipe_nutrition_number(number)
 
 
 def _recipe_nutrition_macro_missing(value) -> bool:
@@ -4690,9 +4771,11 @@ def _estimate_recipe_nutrition_only_llm(recipe: dict, *, language: str | None = 
     }
     lang_rule = _metadata_language_rule(language)
     system = (
-        "Estimate per-serving nutrition macros for a recipe from its ingredients and instructions. "
+        "Estimate per-serving nutrition (macros and micronutrients) for a recipe from its ingredients and instructions. "
         "Return ONLY JSON: "
-        '{"calories":"","protein_g":"","carbs_g":"","fat_g":""}. '
+        '{"calories":"","protein_g":"","carbs_g":"","fat_g":"","fiber_g":"","sugar_g":"","sodium_mg":"",'
+        '"cholesterol_mg":"","saturated_fat_g":"","potassium_mg":"","calcium_mg":"","iron_mg":"",'
+        '"vitamin_a_mcg":"","vitamin_c_mg":"","vitamin_d_mcg":""}. '
         f"Every field MUST be a numeric string. {_RECIPE_NUTRITION_PROMPT_RULE}{lang_rule} JSON only."
     )
     user = f"Recipe:\n{json.dumps(payload, ensure_ascii=False)}\n\nReturn numeric per-serving macros."
@@ -4704,7 +4787,7 @@ def _estimate_recipe_nutrition_only_llm(recipe: dict, *, language: str | None = 
                 {"role": "user", "content": user},
             ],
             temperature=0.2,
-            max_tokens=180,
+            max_tokens=420,
             response_format={"type": "json_object"},
             timeout=EXTRACT_RECIPE_TIMEOUT,
         )
@@ -4787,7 +4870,9 @@ def _estimate_missing_recipe_metadata_llm(recipe: dict, *, language: str | None 
         "Estimate realistic home-cooking metadata for a recipe. "
         "Return ONLY JSON: "
         '{"prep_time":"","cook_time":"","total_time":"",'
-        '"calories":"","protein_g":"","carbs_g":"","fat_g":""}. '
+        '"calories":"","protein_g":"","carbs_g":"","fat_g":"","fiber_g":"","sugar_g":"","sodium_mg":"",'
+        '"cholesterol_mg":"","saturated_fat_g":"","potassium_mg":"","calcium_mg":"","iron_mg":"",'
+        '"vitamin_a_mcg":"","vitamin_c_mg":"","vitamin_d_mcg":""}. '
         "Times must be human-readable strings like \"15 mins\" or \"1 hr\" (not ISO). "
         "Infer prep_time from chopping/mixing/coating steps; cook_time from frying/baking/boiling steps. "
         "total_time should equal prep + cook. "
@@ -4802,7 +4887,7 @@ def _estimate_missing_recipe_metadata_llm(recipe: dict, *, language: str | None 
                 {"role": "user", "content": user},
             ],
             temperature=0.2,
-            max_tokens=250,
+            max_tokens=520,
             response_format={"type": "json_object"},
             timeout=EXTRACT_RECIPE_TIMEOUT,
         )
@@ -4812,7 +4897,7 @@ def _estimate_missing_recipe_metadata_llm(recipe: dict, *, language: str | None 
             val = str((data or {}).get(key) or "").strip()
             if val:
                 out[key] = val
-        for key in ("calories", "protein_g", "carbs_g", "fat_g"):
+        for key in _RECIPE_NUTRITION_KEYS:
             parsed = _parse_recipe_nutrition_value(
                 (data or {}).get(key), calories=(key == "calories")
             )
@@ -5304,9 +5389,9 @@ def _force_json(text: str) -> dict:
 def _extract_recipe_chunk(transcript_chunk: str) -> dict:
     system_prompt = f"""You extract recipe data from cooking transcripts.
 Return ONLY valid JSON matching:
-{
+{{
   "name": "",
-  "ingredients": [{"name": "...", "quantity": "..."}],
+  "ingredients": [{{"name": "...", "quantity": "..."}}],
   "instructions": ["Step 1: ...", "Step 2: ..."],
   "servings": "",
   "prep_time": "",
@@ -5315,20 +5400,31 @@ Return ONLY valid JSON matching:
   "notes": [],
   "meal_type": "",
   "cuisine": "",
-  "nutrition": {
+  "nutrition": {{
     "calories": "",
     "protein_g": "",
     "carbs_g": "",
-    "fat_g": ""
-  }
-}
+    "fat_g": "",
+    "fiber_g": "",
+    "sugar_g": "",
+    "sodium_mg": "",
+    "cholesterol_mg": "",
+    "saturated_fat_g": "",
+    "potassium_mg": "",
+    "calcium_mg": "",
+    "iron_mg": "",
+    "vitamin_a_mcg": "",
+    "vitamin_c_mg": "",
+    "vitamin_d_mcg": ""
+  }}
+}}
 Rules:
 - Don't hallucinate for the structure. If fields like servings or times are unknown, use "" or [].
 - meal_type: exactly one of Breakfast, Lunch, Dinner, Snack (infer from context).
 - Infer cuisine from recipe name, ingredients, or speaker context when evident (e.g. Italian, Mexican, Indian); otherwise use "".
 - Ingredients must include quantities when stated; else quantity "".
 - Instructions must be actionable, chronological, and detailed.
-- You MUST provide a best-effort numeric estimate (as strings) for nutrition macros PER SERVING: calories, protein_g, carbs_g, fat_g. Use your nutrition knowledge of typical ingredients/quantities and transcript context to approximate. Only leave a macro field \"\" if there is literally no information about ingredients.
+- You MUST provide a best-effort numeric estimate (as strings) for ALL nutrition fields PER SERVING — macros (calories, protein_g, carbs_g, fat_g) AND micronutrients (fiber_g, sugar_g, sodium_mg, cholesterol_mg, saturated_fat_g, potassium_mg, calcium_mg, iron_mg, vitamin_a_mcg, vitamin_c_mg, vitamin_d_mcg). Use your nutrition knowledge of typical ingredients/quantities and transcript context to approximate. Only leave a field \"\" if there is literally no information about ingredients.
 - {_RECIPE_NUTRITION_PROMPT_RULE}
 - Output JSON only (no markdown, no commentary)."""
 
@@ -5365,9 +5461,9 @@ Rules:
 def _merge_recipe_parts(parts: list[dict]) -> dict:
     system_prompt = f"""Merge multiple partial recipe JSONs into ONE final recipe JSON.
 Return ONLY valid JSON matching:
-{
+{{
   "name": "",
-  "ingredients": [{"name": "...", "quantity": "..."}],
+  "ingredients": [{{"name": "...", "quantity": "..."}}],
   "instructions": ["Step 1: ...", "Step 2: ..."],
   "servings": "",
   "prep_time": "",
@@ -5376,20 +5472,31 @@ Return ONLY valid JSON matching:
   "notes": [],
   "meal_type": "",
   "cuisine": "",
-  "nutrition": {
+  "nutrition": {{
     "calories": "",
     "protein_g": "",
     "carbs_g": "",
-    "fat_g": ""
-  }
-}
+    "fat_g": "",
+    "fiber_g": "",
+    "sugar_g": "",
+    "sodium_mg": "",
+    "cholesterol_mg": "",
+    "saturated_fat_g": "",
+    "potassium_mg": "",
+    "calcium_mg": "",
+    "iron_mg": "",
+    "vitamin_a_mcg": "",
+    "vitamin_c_mg": "",
+    "vitamin_d_mcg": ""
+  }}
+}}
 Rules:
 - Deduplicate ingredients case-insensitively; keep most specific quantity.
 - Remove duplicate steps, ensure correct chronological order.
 - Ensure steps are detailed and actionable.
 - For meal_type: use the first non-empty from parts (one of Breakfast, Lunch, Dinner, Snack); if none, use "Dinner".
 - For cuisine: use the first non-empty cuisine from the parts; if none, use "".
-- Merge/average any provided nutrition macros (calories, protein_g, carbs_g, fat_g) into a single best-effort estimate PER SERVING. If some parts omit macros, use available information from other parts. Only leave a macro field \"\" if ALL parts lack enough information.
+- Merge/average all provided nutrition fields (macros: calories, protein_g, carbs_g, fat_g; micronutrients: fiber_g, sugar_g, sodium_mg, cholesterol_mg, saturated_fat_g, potassium_mg, calcium_mg, iron_mg, vitamin_a_mcg, vitamin_c_mg, vitamin_d_mcg) into a single best-effort estimate PER SERVING. If some parts omit fields, use available information from other parts. Only leave a field \"\" if ALL parts lack enough information.
 - {_RECIPE_NUTRITION_PROMPT_RULE}
 - Output JSON only."""
 
@@ -6176,7 +6283,18 @@ Return ONLY valid JSON matching:
     "calories": "",
     "protein_g": "",
     "carbs_g": "",
-    "fat_g": ""
+    "fat_g": "",
+    "fiber_g": "",
+    "sugar_g": "",
+    "sodium_mg": "",
+    "cholesterol_mg": "",
+    "saturated_fat_g": "",
+    "potassium_mg": "",
+    "calcium_mg": "",
+    "iron_mg": "",
+    "vitamin_a_mcg": "",
+    "vitamin_c_mg": "",
+    "vitamin_d_mcg": ""
   }}
 }}
 Rules:

@@ -32,7 +32,7 @@ from datetime import datetime, timedelta, timezone
 
 # Bump when extraction/nutrition logic changes what results look like,
 # so stale pre-deploy cache entries are re-extracted instead of served.
-RECIPE_CACHE_SCHEMA_VERSION = 1
+RECIPE_CACHE_SCHEMA_VERSION = 2  # v2: nutrition includes micronutrients (fiber, sugar, sodium, vitamins, ...)
 
 _COLLECTION_NAME = os.getenv("RECIPE_CACHE_COLLECTION", "recipe_cache")
 _L2_DISABLED = str(os.getenv("RECIPE_CACHE_DISABLE_L2", "")).strip().lower() in ("1", "true", "yes")

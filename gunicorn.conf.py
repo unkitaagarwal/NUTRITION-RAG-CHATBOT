@@ -32,3 +32,23 @@ preload_app = False
 accesslog = "-"
 errorlog = "-"
 loglevel = os.getenv("GUNICORN_LOGLEVEL", "info")
+
+
+def on_starting(server):
+    """Purge the download temp root on fresh boot.
+
+    Workers killed mid-request (timeout SIGKILL, max_requests recycle past
+    graceful_timeout, OOM) never run their `finally` cleanup, and /tmp persists
+    across worker restarts — orphaned video downloads accumulate until the
+    platform's 2GB /tmp limit kills the instance. At master start nothing can
+    be mid-download, so wiping the whole root is safe. app.py's tmp janitor
+    handles dirs orphaned later, while the master keeps running.
+    """
+    import shutil
+    import tempfile
+
+    root = os.getenv(
+        "DOWNLOAD_TMP_ROOT", os.path.join(tempfile.gettempdir(), "mealmap-dl")
+    )
+    shutil.rmtree(root, ignore_errors=True)
+    server.log.info("Purged download temp root: %s", root)

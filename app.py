@@ -4255,9 +4255,16 @@ def extract_recipe_from_video_frames_llm(
             f"These are {len(image_data_urls)} frame(s) from a short-form cooking video. "
             f"Read every line of on-screen recipe text and return the full recipe JSON.{caption_hint}"
         )
-        # Low detail when caption already provides context — much faster than high on multiple frames.
-        detail = "low" if (caption_hint and len(image_data_urls) <= 2) else "high"
-        max_tokens = 1500 if detail == "low" else 1700
+        # High detail when caption lacks a real recipe — on-screen overlays need OCR fidelity.
+        caption_has_recipe = bool(
+            caption
+            and (
+                _caption_looks_like_recipe(caption)
+                or _caption_has_full_recipe_text(caption)
+            )
+        )
+        detail = "low" if (caption_has_recipe and len(image_data_urls) <= 2) else "high"
+        max_tokens = 1500 if detail == "low" else 1800
     else:
         system = (
             "Extract recipe from cooking video frame(s). Return ONLY JSON: "
@@ -5952,14 +5959,30 @@ def _social_video_frames_for_duration(
     """TikTok/IG: sample multiple frames when vision fallback is needed."""
     if not _is_social_video_url(url):
         return _video_frames_for_duration(duration_sec)
+    caption = _video_caption_text(meta or {})
+    # Short hashtag captions → recipe is usually on-screen text; sample denser.
+    needs_dense_ocr = not (
+        _caption_looks_like_recipe(caption) or _caption_has_full_recipe_text(caption)
+    )
     if meta and meta.get("vision_distributed_sections"):
         n = len(meta["vision_distributed_sections"])
+        if needs_dense_ocr:
+            try:
+                dense = int(os.getenv("EXTRACT_RECIPE_SOCIAL_OCR_FRAMES", "6"))
+            except ValueError:
+                dense = 6
+            n = max(n, dense)
         return min(max(1, n), MAX_EXTRACT_RECIPE_IMAGES)
     try:
-        n = int(os.getenv("EXTRACT_RECIPE_SOCIAL_VIDEO_FRAMES", "2"))
+        default_n = int(os.getenv("EXTRACT_RECIPE_SOCIAL_VIDEO_FRAMES", "2"))
     except ValueError:
-        n = 2
-    return min(max(1, n), MAX_EXTRACT_RECIPE_IMAGES)
+        default_n = 2
+    if needs_dense_ocr:
+        try:
+            default_n = max(default_n, int(os.getenv("EXTRACT_RECIPE_SOCIAL_OCR_FRAMES", "6")))
+        except ValueError:
+            default_n = max(default_n, 6)
+    return min(max(1, default_n), MAX_EXTRACT_RECIPE_IMAGES)
 
 
 def _video_frames_for_duration(duration_sec: float | None) -> int:
@@ -7997,6 +8020,309 @@ def _fetch_tiktok_page_caption(url: str) -> str | None:
     return caption
 
 
+def _tiktok_item_id_from_url(url: str) -> str | None:
+    """Extract numeric TikTok video/photo id from a URL (resolves short links)."""
+    resolved = _resolve_tiktok_short_url(url)
+    match = re.search(r"/(?:video|photo)/(\d+)", resolved or "", re.I)
+    if match:
+        return match.group(1)
+    match = re.search(r"/t/(\d+)", resolved or "")
+    return match.group(1) if match else None
+
+
+def _format_tiktok_recipe_card_dict(card: dict) -> str:
+    """Turn a TikTok recipe-card JSON object into caption-like recipe text."""
+    if not isinstance(card, dict):
+        return ""
+    parts: list[str] = []
+    title = (
+        card.get("title")
+        or card.get("name")
+        or card.get("recipe_name")
+        or card.get("recipeName")
+        or ""
+    )
+    if isinstance(title, str) and title.strip():
+        parts.append(title.strip())
+    about = (
+        card.get("about")
+        or card.get("description")
+        or card.get("summary")
+        or card.get("intro")
+        or ""
+    )
+    if isinstance(about, str) and about.strip():
+        parts.append(about.strip())
+
+    ingredients = (
+        card.get("ingredients")
+        or card.get("ingredient_list")
+        or card.get("ingredientList")
+        or card.get("what_you_need")
+        or []
+    )
+    if isinstance(ingredients, str):
+        ingredients = [ingredients]
+    ing_lines: list[str] = []
+    for ing in ingredients or []:
+        if isinstance(ing, str) and ing.strip():
+            ing_lines.append(f"- {ing.strip()}")
+        elif isinstance(ing, dict):
+            name = (ing.get("name") or ing.get("ingredient") or ing.get("text") or "").strip()
+            qty = (ing.get("quantity") or ing.get("amount") or "").strip()
+            if name:
+                ing_lines.append(f"- {qty} {name}".strip() if qty else f"- {name}")
+    if ing_lines:
+        parts.append("What you need")
+        parts.extend(ing_lines)
+
+    steps = (
+        card.get("steps")
+        or card.get("instructions")
+        or card.get("directions")
+        or card.get("method")
+        or card.get("step_list")
+        or []
+    )
+    if isinstance(steps, str):
+        steps = [steps]
+    step_lines: list[str] = []
+    for i, step in enumerate(steps or [], 1):
+        if isinstance(step, str) and step.strip():
+            step_lines.append(f"{i}. {step.strip()}")
+        elif isinstance(step, dict):
+            text = (step.get("text") or step.get("instruction") or step.get("step") or "").strip()
+            if text:
+                step_lines.append(f"{i}. {text}")
+    if step_lines:
+        parts.append("Step-by-step method")
+        parts.extend(step_lines)
+
+    hints = card.get("hints") or card.get("tips") or card.get("useful_hints") or []
+    if isinstance(hints, str) and hints.strip():
+        parts.append(hints.strip())
+    elif isinstance(hints, list):
+        for h in hints:
+            if isinstance(h, str) and h.strip():
+                parts.append(h.strip())
+    return "\n".join(parts).strip()
+
+
+def _walk_tiktok_recipe_card(obj) -> dict | None:
+    """Find a recipe-card shaped dict (ingredients + steps) anywhere in JSON."""
+    if isinstance(obj, dict):
+        has_ings = any(
+            k in obj for k in ("ingredients", "ingredient_list", "ingredientList", "what_you_need")
+        )
+        has_steps = any(
+            k in obj for k in ("steps", "instructions", "directions", "method", "step_list")
+        )
+        if has_ings and has_steps:
+            return obj
+        for value in obj.values():
+            found = _walk_tiktok_recipe_card(value)
+            if found:
+                return found
+    elif isinstance(obj, list):
+        for item in obj:
+            found = _walk_tiktok_recipe_card(item)
+            if found:
+                return found
+    return None
+
+
+def _fetch_tiktok_seo_recipe_card(url: str) -> str | None:
+    """Best-effort fetch of TikTok's structured recipe-card payload (SEO/web)."""
+    if (os.getenv("EXTRACT_RECIPE_TIKTOK_RECIPE_CARD") or "1").strip().lower() in (
+        "0", "false", "no",
+    ):
+        return None
+    item_id = _tiktok_item_id_from_url(url)
+    if not item_id:
+        return None
+    resolved = _resolve_tiktok_short_url(url)
+    sess = _slideshow_requests_session()
+    headers = {
+        **_slideshow_request_headers(),
+        "Accept": "application/json, text/plain, */*",
+        "Referer": resolved,
+    }
+    csrf = None
+    try:
+        csrf = sess.cookies.get("tt_csrf_token")
+    except Exception:
+        pass
+    if csrf:
+        headers["tt-csrf-token"] = csrf
+
+    from urllib.parse import quote
+
+    endpoints = [
+        f"https://www.tiktok.com/api/seo/recipe/?itemId={item_id}&aid=1988",
+        f"https://www.tiktok.com/api/seo/recipe/?itemId={item_id}&aid=1988&app_name=tiktok_web"
+        f"&device_platform=web_pc&channel=tiktok_web&cookie_enabled=true",
+        f"https://www.tiktok.com/api/seo/recipe/?item_id={item_id}&aid=1988",
+        f"https://www.tiktok.com/api/seo/recipe/?aweme_id={item_id}&aid=1988",
+        f"https://www.tiktok.com/api/seo/recipe/?url={quote(resolved, safe='')}&aid=1988",
+        f"https://www.tiktok.com/api/seo/recipe/detail/?itemId={item_id}&aid=1988",
+        f"https://www.tiktok.com/api/recipe/detail/?itemId={item_id}&aid=1988",
+    ]
+    for api in endpoints:
+        try:
+            resp = sess.get(api, headers=headers, timeout=min(12, EXTRACT_RECIPE_TIMEOUT), allow_redirects=True)
+            if resp.status_code != 200 or not (resp.text or "").strip():
+                continue
+            try:
+                data = resp.json()
+            except Exception:
+                continue
+            if not isinstance(data, dict):
+                continue
+            if data.get("status_msg") and "doesn't match" in str(data.get("status_msg")).lower():
+                continue
+            card = (
+                data.get("recipe")
+                or data.get("data")
+                or data.get("recipe_info")
+                or data.get("recipeInfo")
+                or _walk_tiktok_recipe_card(data)
+            )
+            if isinstance(card, dict):
+                text = _format_tiktok_recipe_card_dict(card)
+                if text and len(text) >= 120 and (
+                    _caption_looks_like_recipe(text) or _caption_has_full_recipe_text(text)
+                ):
+                    print(f"📝 TikTok SEO recipe card fetched ({len(text)} chars)")
+                    return text
+        except Exception as e:
+            print(f"⚠️ TikTok recipe-card endpoint failed: {e}")
+    return None
+
+
+def _comment_looks_like_recipe(text: str) -> bool:
+    text = (text or "").strip()
+    if len(text) < 80:
+        return False
+    return bool(
+        _caption_looks_like_recipe(text)
+        or _caption_has_instructions(text)
+        or _caption_has_numbered_steps(text)
+        or len(_CAPTION_QTY_PATTERN.findall(text)) >= 2
+    )
+
+
+def _fetch_tiktok_recipe_comments(url: str) -> str | None:
+    """Pull pinned/author/recipe-like comments — creators often put the recipe there."""
+    if (os.getenv("EXTRACT_RECIPE_TIKTOK_RECIPE_COMMENTS") or "1").strip().lower() in (
+        "0", "false", "no",
+    ):
+        return None
+    item_id = _tiktok_item_id_from_url(url)
+    if not item_id:
+        return None
+    resolved = _resolve_tiktok_short_url(url)
+    sess = _slideshow_requests_session()
+    headers = {
+        **_slideshow_request_headers(),
+        "Accept": "application/json, text/plain, */*",
+        "Referer": resolved,
+    }
+    csrf = None
+    try:
+        csrf = sess.cookies.get("tt_csrf_token")
+    except Exception:
+        pass
+    if csrf:
+        headers["tt-csrf-token"] = csrf
+    try:
+        resp = sess.get(
+            f"https://www.tiktok.com/api/comment/list/?aid=1988&aweme_id={item_id}&count=50&cursor=0",
+            headers=headers,
+            timeout=min(12, EXTRACT_RECIPE_TIMEOUT),
+        )
+        if resp.status_code != 200 or not (resp.text or "").strip():
+            return None
+        data = resp.json()
+    except Exception as e:
+        print(f"⚠️ TikTok recipe comments fetch failed: {e}")
+        return None
+
+    comments = data.get("comments") or []
+    if not isinstance(comments, list):
+        return None
+
+    author_handle = ""
+    try:
+        # Prefer matching the video author when present on a comment payload.
+        for c in comments:
+            user = c.get("user") or {}
+            if c.get("author_pin") or c.get("stick_position"):
+                author_handle = (user.get("unique_id") or "").lower()
+                if author_handle:
+                    break
+    except Exception:
+        pass
+
+    candidates: list[tuple[int, str]] = []
+    for c in comments:
+        if not isinstance(c, dict):
+            continue
+        text = (c.get("text") or "").strip()
+        if not text or not _comment_looks_like_recipe(text):
+            continue
+        score = len(text)
+        if c.get("author_pin") or c.get("stick_position"):
+            score += 5000
+        user = c.get("user") or {}
+        handle = (user.get("unique_id") or "").lower()
+        if author_handle and handle == author_handle:
+            score += 2000
+        if c.get("digg_count"):
+            try:
+                score += min(int(c.get("digg_count") or 0), 500)
+            except (TypeError, ValueError):
+                pass
+        candidates.append((score, text))
+
+    if not candidates:
+        return None
+    candidates.sort(reverse=True)
+    best = candidates[0][1]
+    print(f"📝 TikTok recipe comment fetched ({len(best)} chars)")
+    return best
+
+
+def _fetch_tiktok_recipe_card_text(url: str) -> str | None:
+    """
+    Enrich short TikTok captions with recipe-card / pinned-comment text.
+
+    TikTok's in-app caption UI often shows a structured recipe card that is NOT
+    in itemStruct.desc. Try SEO recipe endpoints + recipe-like comments in parallel.
+    """
+    if "tiktok.com" not in (url or "").lower():
+        return None
+    box: dict = {"seo": None, "comments": None}
+
+    def _seo():
+        box["seo"] = _fetch_tiktok_seo_recipe_card(url)
+
+    def _comments():
+        box["comments"] = _fetch_tiktok_recipe_comments(url)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        f1 = executor.submit(_seo)
+        f2 = executor.submit(_comments)
+        f1.result()
+        f2.result()
+
+    candidates = [t for t in (box["seo"], box["comments"]) if t and len(t.strip()) >= 80]
+    if not candidates:
+        return None
+    best = max(candidates, key=len)
+    print(f"📝 TikTok recipe-card enrichment ready ({len(best)} chars)")
+    return best
+
+
 def _instaloader_import_cookies(L, cookiefile: str) -> bool:
     """Inject Instagram cookies from a Netscape cookies.txt into instaloader's
     session so requests are authenticated. Returns True if an Instagram
@@ -8123,6 +8449,18 @@ def _fetch_social_reel_meta(video_url: str) -> dict:
             meta["description"] = page_caption
         else:
             print("📝 Skipping unrelated page caption (language/topic mismatch with title)")
+    # If we still only have a short hashtag caption, try recipe-card enrichment once more
+    # (covers the yt-dlp-only path when page caption fetch returned nothing useful).
+    current = (meta.get("description") or "").strip()
+    if "tiktok.com" in lowered and (
+        not current
+        or not (_caption_looks_like_recipe(current) or _caption_has_full_recipe_text(current))
+    ):
+        card_text = _fetch_tiktok_recipe_card_text(video_url)
+        if card_text and len(card_text) > len(current):
+            meta["description"] = card_text
+            meta["recipe_card"] = True
+            print(f"📝 Social meta enriched from TikTok recipe-card ({len(card_text)} chars)")
     if page_lang:
         meta["language"] = page_lang
     return meta
@@ -8704,15 +9042,13 @@ def extract_recipe_from_video_internal(video_url: str):
                             "returning available info"
                         )
                     else:
-                        # Has both sections but below completeness threshold — keep legacy 500.
-                        return jsonify({
-                            "error": "Failed to extract recipe from video",
-                            "user_message": (
-                                "We couldn't read the full recipe from this video. "
-                                "Please try another link or add the recipe manually."
-                            ),
-                            "message": "Incomplete recipe extraction (missing ingredients or steps).",
-                        }), 500
+                        # Both sections present but below completeness threshold —
+                        # return best-effort instead of failing (common for on-screen
+                        # recipe cards where OCR catches most but not all lines).
+                        vision_partial = True
+                        print(
+                            "🎬 Vision below completeness threshold — returning best-effort recipe"
+                        )
                 lang = _finalize_recipe_for_response(recipe, meta)
                 tags = extract_recipe_tags(recipe)
                 if caption_from_partial and missing_sections:

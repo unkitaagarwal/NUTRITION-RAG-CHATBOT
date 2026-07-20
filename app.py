@@ -76,6 +76,86 @@ _img_persist_futures: dict = {}
 # Initialize once
 # ---------- Config ----------
 MAX_VIDEO_SECONDS = int(os.getenv("MAX_VIDEO_SECONDS", "900"))  # 15 min default
+
+# ---------- Temp download dirs (/tmp hygiene) ----------
+# All yt-dlp/ffmpeg work happens in per-request temp dirs. Cleanup normally runs
+# in `finally` blocks, but a worker killed mid-request (gunicorn timeout SIGKILL,
+# max_requests recycle past graceful_timeout, deploys, OOM) never reaches
+# `finally`, and /tmp persists across worker restarts on the same instance —
+# orphaned dirs full of video files accumulate until the platform's 2GB /tmp
+# limit kills the instance. Fix: put every temp dir under ONE parent so stale
+# ones are identifiable, purge the parent on fresh boot (gunicorn on_starting
+# hook), and run a per-worker janitor that reaps anything older than
+# TMP_MAX_AGE_SECONDS (default 20 min — nothing legitimate outlives the 180s
+# gunicorn timeout, so this is generous).
+DOWNLOAD_TMP_ROOT = os.getenv(
+    "DOWNLOAD_TMP_ROOT", os.path.join(tempfile.gettempdir(), "mealmap-dl")
+)
+TMP_MAX_AGE_SECONDS = int(os.getenv("TMP_MAX_AGE_SECONDS", "1200"))
+
+# Safety net: never let a single yt-dlp download exceed this (skipped instead).
+# Only enforced when the remote reports a size, hence "net" not "guarantee".
+YTDLP_MAX_FILESIZE_BYTES = int(os.getenv("YTDLP_MAX_FILESIZE_MB", "500")) * 1024 * 1024
+
+
+def _mkdtemp() -> str:
+    """mkdtemp under DOWNLOAD_TMP_ROOT so stale dirs can be reaped/purged."""
+    os.makedirs(DOWNLOAD_TMP_ROOT, exist_ok=True)
+    return tempfile.mkdtemp(dir=DOWNLOAD_TMP_ROOT)
+
+
+def _reap_stale_tmp(max_age_seconds: int | None = None) -> int:
+    """Remove items under DOWNLOAD_TMP_ROOT older than max_age_seconds."""
+    max_age = TMP_MAX_AGE_SECONDS if max_age_seconds is None else max_age_seconds
+    now = time.time()
+    removed = 0
+    try:
+        entries = os.listdir(DOWNLOAD_TMP_ROOT)
+    except FileNotFoundError:
+        return 0
+    for name in entries:
+        path = os.path.join(DOWNLOAD_TMP_ROOT, name)
+        try:
+            if now - os.path.getmtime(path) < max_age:
+                continue
+            if os.path.isdir(path) and not os.path.islink(path):
+                shutil.rmtree(path, ignore_errors=True)
+            else:
+                os.unlink(path)
+            removed += 1
+        except OSError:
+            pass
+    if removed:
+        print(f"[tmp-janitor] removed {removed} stale item(s) from {DOWNLOAD_TMP_ROOT}")
+    return removed
+
+
+def _start_tmp_janitor() -> None:
+    interval = int(os.getenv("TMP_JANITOR_INTERVAL_SECONDS", "300"))
+
+    def _loop():
+        while True:
+            time.sleep(interval)
+            try:
+                _reap_stale_tmp()
+            except Exception as e:
+                print(f"[tmp-janitor] sweep failed: {e}")
+
+    Thread(target=_loop, name="tmp-janitor", daemon=True).start()
+
+
+_start_tmp_janitor()
+
+
+def _reject_too_long_filter(info_dict, *, incomplete=False):
+    """yt-dlp match_filter: skip downloads whose metadata says they exceed
+    MAX_VIDEO_SECONDS — BEFORE any bytes hit /tmp (previously the full file was
+    downloaded and only then rejected). Returning a string skips the video."""
+    dur = info_dict.get("duration")
+    if dur and dur > MAX_VIDEO_SECONDS:
+        return f"Video too long ({dur}s). Max allowed is {MAX_VIDEO_SECONDS}s"
+    return None
+
 # Cookies can be provided as: 1) file path, or 2) base64-encoded content in YTDLP_COOKIES_B64 env var
 YTDLP_COOKIES_FILE = os.path.expanduser(os.path.expandvars(os.getenv("YTDLP_COOKIES_FILE", ""))) or None  # optional, helps IG/TikTok/Facebook
 YTDLP_COOKIES_B64 = os.getenv("YTDLP_COOKIES_B64")  # alternative: base64-encoded cookies content (for Render/cloud)
@@ -121,7 +201,8 @@ def _prepare_cookiefile(temp_dir: str | None = None, video_url: str | None = Non
         if temp_dir:
             dest = os.path.join(temp_dir, "cookies.txt")
         else:
-            fd, dest = tempfile.mkstemp(suffix="_cookies.txt")
+            os.makedirs(DOWNLOAD_TMP_ROOT, exist_ok=True)
+            fd, dest = tempfile.mkstemp(suffix="_cookies.txt", dir=DOWNLOAD_TMP_ROOT)
             os.close(fd)
         if YTDLP_COOKIES_FILE and os.path.exists(YTDLP_COOKIES_FILE):
             shutil.copyfile(YTDLP_COOKIES_FILE, dest)
@@ -2851,6 +2932,8 @@ def ytdlp_base_opts(temp_dir: str, video_url: str = None):
         "socket_timeout": 20,
         "retries": 2,
         "fragment_retries": 2,
+        # Safety net against filling /tmp: skip absurdly large files outright
+        "max_filesize": YTDLP_MAX_FILESIZE_BYTES,
         # Helps for YouTube signature issues & format availability
         "extractor_args": {
             "youtube": _yt_extractor_args()
@@ -2901,12 +2984,17 @@ def download_audio_mp3(video_url: str):
     Uses a single yt-dlp call to fetch metadata + download, avoiding the
     redundant separate get_video_metadata() round-trip.
     """
-    temp_dir = tempfile.mkdtemp()
+    temp_dir = _mkdtemp()
     try:
         opts = ytdlp_base_opts(temp_dir, video_url)
+        # Reject too-long videos at the metadata stage (zero bytes downloaded)
+        opts["match_filter"] = _reject_too_long_filter
 
         # extract_info with download=True fetches metadata AND downloads in one call
         info_dict = _ydl_extract(opts, video_url, download=True)
+        if info_dict is None:
+            # match_filter skipped it → over the duration cap
+            raise ValueError(f"Video too long. Max allowed is {MAX_VIDEO_SECONDS}s")
 
         duration = info_dict.get("duration")
         title = info_dict.get("title") or ""
@@ -5552,7 +5640,7 @@ def _yt_meta(video_url: str) -> dict:
         "socket_timeout": int(os.getenv("YTDLP_META_SOCKET_TIMEOUT", "8")),
         "extractor_args": {"youtube": _yt_extractor_args()},
     }
-    cookie_temp_dir = tempfile.mkdtemp()
+    cookie_temp_dir = _mkdtemp()
     try:
         # Add cookies if available (needed for Instagram/TikTok/Facebook).
         # Copied to a writable path because yt-dlp writes the cookie jar back.
@@ -5577,7 +5665,7 @@ def _download_audio_mp3(video_url: str):
     """
     Returns: (audio_bytes, meta_dict)
     """
-    temp_dir = tempfile.mkdtemp()
+    temp_dir = _mkdtemp()
     try:
         info = _yt_meta(video_url)
         duration = info.get("duration")
@@ -5609,6 +5697,10 @@ def _download_audio_mp3(video_url: str):
                 "preferredcodec": "mp3",
                 "preferredquality": "192",
             }],
+
+            # /tmp hygiene: reject too-long videos pre-download + size safety net
+            "match_filter": _reject_too_long_filter,
+            "max_filesize": YTDLP_MAX_FILESIZE_BYTES,
         }
 
         # Cookies (very helpful for TikTok/IG/Facebook + some YouTube).
@@ -5633,7 +5725,9 @@ def _download_audio_mp3(video_url: str):
             ydl_opts["proxy"] = _proxy
             print(f"🌐 Using proxy: {_proxy}")
 
-        _ydl_extract(ydl_opts, video_url, download=True)
+        if _ydl_extract(ydl_opts, video_url, download=True) is None:
+            # match_filter skipped it → over the duration cap
+            raise ValueError(f"Video too long. Max allowed is {MAX_VIDEO_SECONDS}s")
 
         mp3s = [f for f in os.listdir(temp_dir) if f.endswith(".mp3")]
         if not mp3s:
@@ -6457,7 +6551,7 @@ def _fetch_youtube_caption_transcript(video_url: str) -> str | None:
     """Download YouTube manual/auto captions via yt-dlp (~2s vs minutes of audio+Whisper)."""
     if not _youtube_captions_enabled():
         return None
-    temp_dir = tempfile.mkdtemp()
+    temp_dir = _mkdtemp()
     try:
         ydl_opts = {
             "quiet": True,
@@ -6686,7 +6780,7 @@ def _frame_jpeg_max_width() -> int:
 
 def _extract_middle_frame_data_url(video_path: str, duration_sec: float | None) -> str | None:
     """One small JPEG at mid-reel — fastest path for short social recipe videos."""
-    out_dir = tempfile.mkdtemp()
+    out_dir = _mkdtemp()
     out_path = os.path.join(out_dir, "frame.jpg")
     ts = max(0.5, (duration_sec or 10.0) / 2.0)
     w = _frame_jpeg_max_width()
@@ -6762,7 +6856,7 @@ def _download_video_to_file(
     download_sections: yt-dlp section specs (e.g. ["*20-24","*40-44"]) for sparse timeline sampling.
     Returns: (temp_dir, video_path, meta_dict). Caller must shutil.rmtree(temp_dir) when done.
     """
-    temp_dir = tempfile.mkdtemp()
+    temp_dir = _mkdtemp()
     try:
         if fast:
             fmt = "best[height<=480]/best[height<=720]/best"
@@ -6784,6 +6878,10 @@ def _download_video_to_file(
             "http_chunk_size": int(os.getenv("YTDLP_DL_HTTP_CHUNK_SIZE", str(10 * 1024 * 1024))),
             "socket_timeout": int(os.getenv("YTDLP_DL_SOCKET_TIMEOUT", "15")),
             "extractor_args": {"youtube": _yt_extractor_args()},
+            # /tmp hygiene: reject too-long videos pre-download (previously the
+            # full file was downloaded and only then rejected) + size safety net
+            "match_filter": _reject_too_long_filter,
+            "max_filesize": YTDLP_MAX_FILESIZE_BYTES,
         }
         # Copy cookies to a writable path (yt-dlp writes the jar back; Render
         # secret files are read-only → would raise Errno 30).
@@ -6802,6 +6900,9 @@ def _download_video_to_file(
 
         # Single call: fetches metadata AND downloads in one network session
         info = _ydl_extract(ydl_opts, video_url, download=True)
+        if info is None:
+            # match_filter skipped it → over the duration cap
+            raise ValueError(f"Video too long. Max allowed is {MAX_VIDEO_SECONDS}s")
 
         duration = info.get("duration")
         title = info.get("title") or ""
@@ -7531,7 +7632,7 @@ def _extract_frame_data_urls_from_video(video_path: str, duration_sec: float | N
         if single:
             return [single]
 
-    out_dir = tempfile.mkdtemp()
+    out_dir = _mkdtemp()
     try:
         batch = _extract_frames_batch_ffmpeg(video_path, duration_sec, num_frames, out_dir)
         if batch:
@@ -7579,7 +7680,7 @@ def _is_likely_non_speech(transcript: str) -> bool:
 
 def _extract_audio_from_video_file(video_path: str) -> bytes | None:
     """Extract audio from an already-downloaded video file using ffmpeg. Returns mp3 bytes or None on failure."""
-    out_dir = tempfile.mkdtemp()
+    out_dir = _mkdtemp()
     try:
         out_path = os.path.join(out_dir, "audio.mp3")
         result = subprocess.run(
@@ -7727,7 +7828,7 @@ def _select_slideshow_slide_urls(image_urls: list[str]) -> list[str]:
 
 def _resize_image_bytes_to_jpeg_data_url(image_bytes: bytes) -> str:
     """Downscale slide bytes for faster vision LLM (same approach as video frame extraction)."""
-    out_dir = tempfile.mkdtemp()
+    out_dir = _mkdtemp()
     in_path = os.path.join(out_dir, "slide_in")
     out_path = os.path.join(out_dir, "slide.jpg")
     w = _slideshow_frame_max_width()
@@ -8370,7 +8471,7 @@ def _fetch_instagram_page_caption(url: str) -> str | None:
     if not getattr(L.context, "is_logged_in", False):
         cookie_tmp = None
         try:
-            cookie_tmp = tempfile.mkdtemp()
+            cookie_tmp = _mkdtemp()
             cf = _prepare_cookiefile(cookie_tmp, url)
             if cf:
                 _instaloader_import_cookies(L, cf)

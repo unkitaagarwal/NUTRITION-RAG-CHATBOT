@@ -4414,17 +4414,31 @@ def extract_recipe_from_slideshow_llm(
             "type": "image_url",
             "image_url": {"url": url, "detail": "low"},
         })
-    completion = client.chat.completions.create(
-        model=os.getenv("RECIPE_VISION_FAST_MODEL") or os.getenv("RECIPE_LLM_MODEL", "gpt-4o-mini"),
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": content},
-        ],
-        temperature=0.1,
-        max_tokens=900,
-        response_format={"type": "json_object"},
-        timeout=EXTRACT_RECIPE_TIMEOUT,
-    )
+    model = os.getenv("RECIPE_VISION_FAST_MODEL") or os.getenv("RECIPE_LLM_MODEL", "gpt-4o-mini")
+
+    def _call(cap: int):
+        return client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": content},
+            ],
+            temperature=0.1,
+            response_format={"type": "json_object"},
+            timeout=EXTRACT_RECIPE_TIMEOUT,
+            **_chat_completion_limit_kw(model, cap),
+        )
+
+    # The recipe JSON schema (15 nutrition fields + full instructions) regularly
+    # exceeds the old 900-token cap; a capped response is truncated mid-string
+    # and json.loads fails with "Unterminated string" → 500. Give it headroom,
+    # and if the model still hits the cap (finish_reason == "length"), retry
+    # once with double the budget instead of returning broken JSON.
+    cap = int(os.getenv("SLIDESHOW_LLM_MAX_TOKENS", "2000"))
+    completion = _call(cap)
+    if completion.choices[0].finish_reason == "length":
+        print(f"⚠️ Slideshow LLM hit the {cap}-token cap; retrying with {cap * 2}")
+        completion = _call(cap * 2)
     return json.loads(completion.choices[0].message.content)
 
 

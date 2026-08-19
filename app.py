@@ -327,15 +327,17 @@ def _ytdlp_proxy(url: str) -> str | None:
 
     Direct-first strategy: the 1st attempt is proxy-free, and _ydl_extract()
     retries through the matching proxy only if the direct attempt is blocked.
-    Proxy fallback applies to YouTube and Facebook ONLY — Instagram/TikTok
-    work fine directly (with cookies) and never use a proxy.
+    Proxy fallback applies to YouTube AND all social hosts (Facebook,
+    Instagram, TikTok) — datacenter/cloud egress IPs (e.g. Render) get served
+    anti-bot challenge pages by IG/TikTok, so the residential SOCIAL_PROXY is
+    the escape hatch when the direct attempt is blocked.
     Forcing the proxy on every request is opt-in:
-    YT_USE_PROXY=1 (YouTube) / SOCIAL_USE_PROXY=1 (Facebook).
+    YT_USE_PROXY=1 (YouTube) / SOCIAL_USE_PROXY=1 (Facebook/Instagram/TikTok).
     """
     try:
         if is_youtube_url(url):
             return (YT_PROXY or None) if YT_USE_PROXY else None
-        if _is_facebook_url(url):
+        if _is_social_proxy_host(url):
             return (SOCIAL_PROXY or None) if SOCIAL_USE_PROXY else None
     except Exception:
         pass
@@ -347,16 +349,30 @@ def _is_facebook_url(url: str) -> bool:
     return any(s in host for s in ("facebook.com", "fb.watch", "fb.com"))
 
 
+def _is_social_proxy_host(url: str) -> bool:
+    """Hosts eligible for the SOCIAL_PROXY fallback (FB + IG + TikTok)."""
+    host = (urlparse(url).hostname or "").lower()
+    return any(
+        s in host
+        for s in (
+            "facebook.com", "fb.watch", "fb.com",
+            "instagram.com",
+            "tiktok.com",
+        )
+    )
+
+
 def _fallback_proxy(url: str) -> str | None:
     """Proxy to retry through when a direct attempt is blocked, or None.
 
-    YouTube → YT_PROXY; Facebook → SOCIAL_PROXY (defaults to YT_PROXY).
-    Instagram/TikTok → no proxy ever (direct + cookies is sufficient).
+    YouTube → YT_PROXY; Facebook/Instagram/TikTok → SOCIAL_PROXY (defaults to
+    YT_PROXY, so a single residential proxy serves all sites). The proxy is
+    ONLY used on the retry after _blocked_error() — direct traffic stays free.
     """
     try:
         if is_youtube_url(url):
             return YT_PROXY or None
-        if _is_facebook_url(url):
+        if _is_social_proxy_host(url):
             return SOCIAL_PROXY or None
     except Exception:
         pass
@@ -367,27 +383,30 @@ def _blocked_error(exc: Exception) -> bool:
     """True if the yt-dlp error looks like IP-reputation blocking / anti-bot.
 
     Covers YouTube (bot-check, 429), and Facebook/Instagram/TikTok
-    (login walls, rate limits, redirect loops on datacenter IPs).
+    (login walls, rate limits, redirect loops, anti-bot challenge pages
+    on datacenter IPs). Matching is case-insensitive.
     """
-    s = str(exc)
+    s = str(exc).lower()
     return any(
         marker in s
         for marker in (
-            "Sign in to confirm",       # YouTube bot-check
-            "Too Many Requests",
-            "HTTP Error 429",
-            "HTTP Error 403",
-            "LOGIN_REQUIRED",
+            "sign in to confirm",       # YouTube bot-check
+            "too many requests",
+            "http error 429",
+            "http error 403",
+            "login_required",
             "login required",           # FB/IG login wall
             "log in",
-            "Login Required",
             "checkpoint",               # FB security checkpoint
             "rate-limit",
             "rate limit",
             "redirect loop",
-            "Cannot parse data",        # FB serving an interstitial page
-            "Restricted Video",
+            "cannot parse data",        # FB serving an interstitial page
+            "restricted video",
             "unable to extract",        # generic: site served a block page
+            # TikTok anti-bot challenge served to datacenter IPs — yt-dlp's
+            # challenge solver fails on it (yt-dlp issue #17403):
+            "unexpected response from webpage request",
         )
     )
 
@@ -6842,6 +6861,8 @@ def _merge_video_download_meta(video_url: str, video_meta: dict | None, audio_me
         meta["duration"] = audio_meta["duration"]
     if not meta.get("title") and audio_meta.get("title"):
         meta["title"] = audio_meta["title"]
+    if not meta.get("thumbnail") and audio_meta.get("thumbnail"):
+        meta["thumbnail"] = audio_meta["thumbnail"]
     if not meta.get("description") and audio_meta.get("description"):
         meta["description"] = audio_meta["description"]
     old_desc = (meta.get("description") or "").strip()
@@ -8069,12 +8090,99 @@ def _collect_tiktok_desc_from_json(obj, best: list[str], best_lang: list[str] | 
             _collect_tiktok_desc_from_json(item, best, best_lang, locked)
 
 
-def _fetch_tiktok_page_info(url: str) -> tuple[str | None, str | None]:
-    """Fetch TikTok post caption + language from page HTML (shown after tapping 'more')."""
+def _og_image_from_html(html_text: str) -> str | None:
+    """Pull og:image content from raw page HTML (handles both attribute orders)."""
+    if not html_text:
+        return None
+    for pattern in (
+        r'<meta[^>]+property=["\']og:image["\'][^>]*content=["\']([^"\']+)["\']',
+        r'<meta[^>]+content=["\']([^"\']+)["\'][^>]*property=["\']og:image["\']',
+    ):
+        match = re.search(pattern, html_text, re.I)
+        if match:
+            import html as _html_mod
+            candidate = _html_mod.unescape(match.group(1)).strip()
+            if candidate.startswith(("http://", "https://")):
+                return candidate
+    return None
+
+
+def _tiktok_cover_from_json(data) -> str | None:
+    """Find the video cover/thumbnail URL in TikTok page JSON.
+
+    Tries the known UNIVERSAL_DATA / SIGI_STATE paths first (so we don't pick
+    up music album art or related-video covers), then falls back to a bounded
+    recursive search for video cover keys.
+    """
+    def _first_url(video: dict) -> str | None:
+        for key in ("cover", "originCover", "dynamicCover"):
+            val = (video or {}).get(key)
+            if isinstance(val, str) and val.startswith(("http://", "https://")):
+                return val
+            if isinstance(val, list):
+                for item in val:
+                    if isinstance(item, str) and item.startswith(("http://", "https://")):
+                        return item
+        return None
+
+    if not isinstance(data, dict):
+        return None
+    # __UNIVERSAL_DATA_FOR_REHYDRATION__ layout
+    try:
+        video = (
+            data.get("__DEFAULT_SCOPE__", {})
+            .get("webapp.video-detail", {})
+            .get("itemInfo", {})
+            .get("itemStruct", {})
+            .get("video", {})
+        )
+        url = _first_url(video)
+        if url:
+            return url
+    except AttributeError:
+        pass
+    # SIGI_STATE layout: ItemModule → {item_id: {video: {...}}}
+    try:
+        for item in (data.get("ItemModule") or {}).values():
+            url = _first_url((item or {}).get("video") or {})
+            if url:
+                return url
+    except AttributeError:
+        pass
+
+    # Generic bounded fallback
+    def _walk(node, depth: int) -> str | None:
+        if depth > 8:
+            return None
+        if isinstance(node, dict):
+            url = _first_url(node)
+            if url:
+                return url
+            for val in node.values():
+                found = _walk(val, depth + 1)
+                if found:
+                    return found
+        elif isinstance(node, list):
+            for item in node:
+                found = _walk(item, depth + 1)
+                if found:
+                    return found
+        return None
+
+    return _walk(data, 0)
+
+
+def _fetch_tiktok_page_info(url: str) -> tuple[str | None, str | None, str | None]:
+    """Fetch TikTok post caption + language + cover thumbnail from page HTML.
+
+    The thumbnail is scraped from the page JSON (or og:image) so it survives
+    even when yt-dlp's TikTok extractor is blocked/broken (e.g. the anti-bot
+    challenge served to datacenter IPs — yt-dlp issue #17403).
+    """
     if (os.getenv("EXTRACT_RECIPE_TIKTOK_PAGE_CAPTION") or "1").strip().lower() in ("0", "false", "no"):
-        return None, None
+        return None, None, None
     if "tiktok.com" not in (url or "").lower():
-        return None, None
+        return None, None, None
     try:
         resolved = _resolve_tiktok_short_url(url)
         sess = _slideshow_requests_session()
@@ -8087,6 +8195,7 @@ def _fetch_tiktok_page_info(url: str) -> tuple[str | None, str | None]:
         resp.raise_for_status()
         best: list[str] = [""]
         best_lang: list[str] = []
+        thumbnail: str | None = None
         for pattern in (
             r'<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>(.*?)</script>',
             r'<script id="SIGI_STATE"[^>]*>(.*?)</script>',
@@ -8099,6 +8208,10 @@ def _fetch_tiktok_page_info(url: str) -> tuple[str | None, str | None]:
             except json.JSONDecodeError:
                 continue
             _collect_tiktok_desc_from_json(data, best, best_lang)
+            if not thumbnail:
+                thumbnail = _tiktok_cover_from_json(data)
+        if not thumbnail:
+            thumbnail = _og_image_from_html(resp.text)
         caption = best[0] or None
         lang = best_lang[0] if best_lang else None
         if (os.getenv("EXTRACT_RECIPE_TIKTOK_DEBUG") or "").strip().lower() in ("1", "true", "yes"):
@@ -8124,14 +8237,16 @@ def _fetch_tiktok_page_info(url: str) -> tuple[str | None, str | None]:
             print(f"📝 TikTok page caption fetched ({len(caption)} chars)")
         if lang:
             print(f"🌐 TikTok post language: {lang}")
-        return caption, lang
+        if thumbnail:
+            print("🖼️ TikTok page cover thumbnail found")
+        return caption, lang, thumbnail
     except Exception as e:
         print(f"⚠️ TikTok page caption fetch failed: {e}")
-        return None, None
+        return None, None, None
 
 
 def _fetch_tiktok_page_caption(url: str) -> str | None:
-    caption, _ = _fetch_tiktok_page_info(url)
+    caption, _, _ = _fetch_tiktok_page_info(url)
     return caption
 
 
@@ -8513,12 +8628,16 @@ def _fetch_instagram_page_caption(url: str) -> str | None:
 def _fetch_social_reel_meta(video_url: str) -> dict:
     """Parallel page fetch + yt-dlp info for TikTok/IG."""
     lowered = (video_url or "").lower()
-    page_box: dict = {"caption": None, "lang": None}
+    page_box: dict = {"caption": None, "lang": None, "thumbnail": None}
     yt_box: dict = {"meta": None, "error": None}
 
     def _fetch_page():
         if "tiktok.com" in lowered:
-            page_box["caption"], page_box["lang"] = _fetch_tiktok_page_info(video_url)
+            (
+                page_box["caption"],
+                page_box["lang"],
+                page_box["thumbnail"],
+            ) = _fetch_tiktok_page_info(video_url)
         elif "instagram.com" in lowered:
             page_box["caption"] = _fetch_instagram_page_caption(video_url)
 
@@ -8555,6 +8674,14 @@ def _fetch_social_reel_meta(video_url: str) -> dict:
             "webpage_url": video_url,
             "thumbnail": None,
         }
+
+    # Thumbnail fallback: when yt-dlp metadata failed (or returned no
+    # thumbnail), use the cover scraped from the platform page — the same
+    # request that already supplies the caption. This keeps thumbnails alive
+    # on datacenter IPs where TikTok blocks yt-dlp's webpage request.
+    if not meta.get("thumbnail") and page_box.get("thumbnail"):
+        meta["thumbnail"] = page_box["thumbnail"]
+        print("🖼️ Thumbnail recovered from page scrape (yt-dlp metadata unavailable)")
 
     existing = (meta.get("description") or "").strip()
     title = (meta.get("title") or "").strip()
@@ -8600,6 +8727,7 @@ def _enrich_social_meta_from_page(meta: dict, video_url: str) -> dict:
 def _merge_meta_keep_longer_description(meta: dict, update: dict) -> dict:
     merged = dict(meta)
     prev_lang = merged.get("language")
+    prev_thumb = merged.get("thumbnail")
     merged.update(update)
     old = (meta.get("description") or "").strip()
     new = (update.get("description") or "").strip()
@@ -8607,6 +8735,10 @@ def _merge_meta_keep_longer_description(meta: dict, update: dict) -> dict:
         merged["description"] = old
     if prev_lang:
         merged["language"] = prev_lang
+    # Don't let an update without a thumbnail (e.g. a failed/partial yt-dlp
+    # download) clobber a thumbnail we already recovered.
+    if not merged.get("thumbnail") and prev_thumb:
+        merged["thumbnail"] = prev_thumb
     return merged
 
 

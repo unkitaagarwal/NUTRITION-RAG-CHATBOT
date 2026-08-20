@@ -3826,14 +3826,60 @@ def _fetch_via_scraperapi(url: str) -> str:
     return r.text
 
 
+# Tier 1.5: retry blocked webpage fetches through the residential proxy
+# (SOCIAL_PROXY / Decodo) before spending ScraperAPI credits. Webpage-only —
+# the video pipelines (TikTok/IG/FB/YT) never call fetch_html. Disable with
+# FETCH_HTML_USE_PROXY=0.
+FETCH_HTML_USE_PROXY = (
+    (os.getenv("FETCH_HTML_USE_PROXY") or "1").strip().lower() not in ("0", "false", "no")
+)
+
+
+def _mask_proxy_url(proxy: str) -> str:
+    """Hide credentials when logging a proxy URL."""
+    try:
+        from urllib.parse import urlsplit
+        parts = urlsplit(proxy)
+        if parts.username:
+            host = parts.hostname or ""
+            port = f":{parts.port}" if parts.port else ""
+            return f"{parts.scheme}://***:***@{host}{port}"
+    except Exception:
+        pass
+    return proxy
+
+
+def _impersonated_get(url: str, timeout: int, proxy: str | None = None):
+    """GET with a real Chrome TLS fingerprint via curl_cffi so datacenter
+    fetches aren't fingerprinted as python-requests (defeats many Cloudflare/
+    Akamai configs without any paid service). Falls back to plain requests if
+    curl_cffi isn't installed. Response API is requests-compatible.
+    """
+    proxies = {"http": proxy, "https": proxy} if proxy else None
+    try:
+        from curl_cffi import requests as _cffi_requests
+        return _cffi_requests.get(
+            url,
+            headers=_BROWSER_HEADERS,
+            timeout=timeout,
+            impersonate="chrome",
+            proxies=proxies,
+        )
+    except ImportError:
+        return requests.get(url, headers=_BROWSER_HEADERS, timeout=timeout, proxies=proxies)
+
+
 def fetch_html(url: str, timeout: int | None = None) -> str:
+    """Webpage-only fetch ladder: direct (Chrome-impersonated TLS) →
+    residential proxy → ScraperAPI. Each tier runs only if the previous one
+    was blocked, so the common case stays fast and free."""
     timeout = timeout or EXTRACT_RECIPE_TIMEOUT
     last_response = None
     direct_error = None
 
-    # ── Tier 1: direct fetch with realistic browser headers ──────────────
+    # ── Tier 1: direct fetch, Chrome-impersonated TLS + browser headers ──
     try:
-        last_response = requests.get(url, headers=_BROWSER_HEADERS, timeout=timeout)
+        last_response = _impersonated_get(url, timeout)
         blocked = (
             last_response.status_code in _BLOCK_STATUSES
             or _looks_like_challenge(last_response.text)
@@ -3842,9 +3888,29 @@ def fetch_html(url: str, timeout: int | None = None) -> str:
             last_response.raise_for_status()
             return last_response.text
         print(f"[fetch_html] direct fetch blocked (status={last_response.status_code}) for {url[:120]}")
-    except requests.exceptions.RequestException as e:
+    except Exception as e:
         direct_error = e
         print(f"[fetch_html] direct fetch error for {url[:120]}: {str(e)[:200]}")
+
+    # ── Tier 1.5: residential proxy retry (much cheaper than ScraperAPI) ──
+    if FETCH_HTML_USE_PROXY and SOCIAL_PROXY:
+        try:
+            print(
+                f"[fetch_html] retrying via residential proxy "
+                f"{_mask_proxy_url(SOCIAL_PROXY)} for {url[:120]}"
+            )
+            resp = _impersonated_get(url, timeout, proxy=SOCIAL_PROXY)
+            blocked = (
+                resp.status_code in _BLOCK_STATUSES
+                or _looks_like_challenge(resp.text)
+            )
+            if not blocked:
+                resp.raise_for_status()
+                return resp.text
+            last_response = resp
+            print(f"[fetch_html] residential proxy blocked (status={resp.status_code}) for {url[:120]}")
+        except Exception as e:
+            print(f"[fetch_html] residential proxy fetch failed for {url[:120]}: {str(e)[:200]}")
 
     # ── Tier 2: ScraperAPI fallback (handles Cloudflare-protected sites) ──
     if SCRAPER_API_KEY:
@@ -3856,17 +3922,23 @@ def fetch_html(url: str, timeout: int | None = None) -> str:
     else:
         print("[fetch_html] blocked and no SCRAPER_API_KEY set — cannot fall back")
 
-    # ── All tiers exhausted — raise a clean error for /extract-recipe ─────
+    # ── All tiers exhausted — raise a clean requests.HTTPError so
+    # /extract-recipe returns its friendly WEBPAGE_FETCH_FAILED response.
+    # (Built synthetically because Tier 1/1.5 responses may be curl_cffi
+    # objects whose raise_for_status() throws a non-requests exception type.)
     if last_response is not None:
-        # Real block status (402/403/429/503) raises with the true code so the
-        # endpoint can show the right user message.
-        last_response.raise_for_status()
-        # 200 but challenge HTML: surface as a 403-style block.
+        status = last_response.status_code
+        if status < 400:
+            status = 403  # 200 with challenge HTML → surface as anti-bot block
         synthetic = requests.models.Response()
-        synthetic.status_code = 403
-        synthetic._content = last_response.content
+        synthetic.status_code = status
+        try:
+            synthetic._content = last_response.content
+        except Exception:
+            synthetic._content = b""
         raise requests.exceptions.HTTPError(
-            "Blocked by anti-bot challenge (e.g. Cloudflare)", response=synthetic
+            f"{status} Client Error: blocked or anti-bot challenge for url: {url}",
+            response=synthetic,
         )
     raise direct_error
 

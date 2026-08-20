@@ -3813,12 +3813,29 @@ def _looks_like_challenge(html: str) -> bool:
 
 
 def _fetch_via_scraperapi(url: str) -> str:
-    """Fetch a URL through ScraperAPI (renders JS + solves Cloudflare)."""
-    params = {
-        "api_key": SCRAPER_API_KEY,
-        "url": url,
-        "render": "true",  # execute JS / solve managed challenge
-    }
+    """Fetch a URL through ScraperAPI, cheapest mode first.
+
+    Stage 1: no JS render (~1 credit, typically 3-6s) — recipe sites embed
+    their JSON-LD in the server HTML, so rendering is usually unnecessary.
+    Stage 2: escalate to render=true (+ultra_premium if enabled) only when
+    stage 1 returns a challenge page. Cuts both latency and credit burn on
+    the common case.
+    """
+    base = {"api_key": SCRAPER_API_KEY, "url": url}
+
+    # Stage 1: cheap, fast, no render
+    try:
+        r = requests.get(SCRAPER_API_ENDPOINT, params=base, timeout=SCRAPER_API_TIMEOUT)
+        r.raise_for_status()
+        if not _looks_like_challenge(r.text):
+            return r.text
+        print("[fetch_html] ScraperAPI no-render returned challenge HTML; escalating to render")
+    except requests.exceptions.RequestException as e:
+        print(f"[fetch_html] ScraperAPI no-render failed ({str(e)[:120]}); escalating to render")
+
+    # Stage 2: full render (+ultra when configured)
+    params = dict(base)
+    params["render"] = "true"  # execute JS / solve managed challenge
     if SCRAPER_API_ULTRA:
         params["ultra_premium"] = "true"  # advanced anti-bot bypass
     r = requests.get(SCRAPER_API_ENDPOINT, params=params, timeout=SCRAPER_API_TIMEOUT)
@@ -3872,8 +3889,13 @@ def _impersonated_get(url: str, timeout: int, proxy: str | None = None):
 def fetch_html(url: str, timeout: int | None = None) -> str:
     """Webpage-only fetch ladder: direct (Chrome-impersonated TLS) →
     residential proxy → ScraperAPI. Each tier runs only if the previous one
-    was blocked, so the common case stays fast and free."""
-    timeout = timeout or EXTRACT_RECIPE_TIMEOUT
+    was blocked, so the common case stays fast and free.
+
+    Tiers 1/1.5 use a short FETCH_HTML_DIRECT_TIMEOUT (default 10s) — a real
+    page answers in ~1-3s, so anything slower is effectively blocked and we
+    should move down the ladder instead of burning the request budget waiting.
+    """
+    timeout = timeout or int(os.getenv("FETCH_HTML_DIRECT_TIMEOUT", "10"))
     last_response = None
     direct_error = None
 
@@ -3957,8 +3979,15 @@ def extract_jsonld_recipes(html: str):
     recipes = []
 
     for s in scripts:
+        # s.string is None when the tag's content is split across multiple
+        # nodes (common after JS rendering / entity splitting) — get_text()
+        # always returns the full payload, so JSON-LD isn't silently skipped
+        # and we don't fall back to the slow html_llm path unnecessarily.
+        raw = (s.get_text() or s.string or "").strip()
+        if not raw:
+            continue
         try:
-            data = json.loads(s.string or "")
+            data = json.loads(raw)
         except Exception:
             continue
 

@@ -271,6 +271,37 @@ def _resolve_share_url(url: str) -> str:
     except Exception as e:
         print(f"[resolve] share-url resolution failed for {url}: {e}")
         return url
+
+
+def _canonicalize_social_video_url(url: str) -> str:
+    """One recipe_cache key per video, whatever link shape the share produced.
+
+    TikTok mints a fresh /t/{code} short link AND fresh _r/_t tracking params
+    for every share action, so the raw shared string is a one-time-use cache
+    key — the same video never hits twice. Resolve short links to the
+    canonical /@user/video/{id} URL and drop query/fragment (Instagram's
+    per-share ?igsh= gets the same treatment). Non-social URLs pass through
+    untouched: query params can be meaningful on arbitrary recipe sites.
+    Best-effort — any failure returns the URL unchanged (worse cache key,
+    never a broken request).
+    """
+    try:
+        p = urlparse(url)
+        host = (p.hostname or "").lower()
+    except Exception:
+        return url
+    if not any(host == h or host.endswith("." + h) for h in ("tiktok.com", "instagram.com")):
+        return url
+    if host in ("vt.tiktok.com", "vm.tiktok.com") or re.search(r"^/t/", p.path or ""):
+        url = _resolve_tiktok_short_url(url)
+    try:
+        p = urlparse(url)
+        path = p.path.rstrip("/") or "/"
+        return p._replace(path=path, query="", fragment="").geturl()
+    except Exception:
+        return url
+
+
 LLM_MODEL = os.getenv("RECIPE_LLM_MODEL", "gpt-4o-mini")  # change if needed
 RECIPE_LLM_MODEL = os.getenv("RECIPE_LLM_MODEL", "gpt-4o-mini")
 # Model for TEXT-based recipe extraction (caption + webpage HTML). Defaults to
@@ -3179,6 +3210,8 @@ def extract_recipe_from_video():
         ok, err = validate_video_url(video_url)
         if not ok:
             return jsonify({"error": err}), 400
+
+        video_url = _canonicalize_social_video_url(video_url)
 
         # ── Cache check ──────────────────────────────────────────────────────────
         url_key = hashlib.sha256(video_url.encode()).hexdigest()
@@ -9099,6 +9132,11 @@ def extract_recipe_from_video_internal(video_url: str):
     if resolved != video_url:
         print(f"🔗 Resolved share link {video_url} -> {resolved}")
         video_url = resolved
+
+    canonical = _canonicalize_social_video_url(video_url)
+    if canonical != video_url:
+        print(f"🔗 Canonicalized {video_url} -> {canonical}")
+        video_url = canonical
 
     # ── Cache check ──────────────────────────────────────────────────────────
     url_key = hashlib.sha256(video_url.encode()).hexdigest()

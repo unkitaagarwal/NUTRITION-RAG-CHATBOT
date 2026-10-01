@@ -325,13 +325,25 @@ YT_USE_PROXY = os.getenv("YT_USE_PROXY", "0") == "1"  # opt-in escape hatch if d
 SOCIAL_USE_PROXY = os.getenv("SOCIAL_USE_PROXY", "0") == "1"  # same opt-in for FB/IG/TikTok
 
 # Player clients to impersonate for YouTube, in priority order.
-# android_vr: PO-token-free, full format access (primary).
-# web_safari / web: fallbacks if android_vr is missing a format.
-YT_PLAYER_CLIENTS = ["android_vr", "web_safari", "web"]
+# YouTube player clients, env-overridable so the working set can be chased
+# without a redeploy (which clients pass server-IP bot-checks shifts every few
+# months). Comma-separated, e.g. YT_PLAYER_CLIENTS="tv,web_safari".
+# Set YT_PLAYER_CLIENTS="default" to let yt-dlp's own (frequently updated)
+# client selection decide — usually the best choice on a current yt-dlp.
+# Historical note: android_vr was the PO-token-free client that made
+# proxy-free datacenter extraction work until YouTube closed it.
+_YT_CLIENTS_RAW = (os.getenv("YT_PLAYER_CLIENTS") or "android_vr,web_safari,web").strip()
+YT_PLAYER_CLIENTS = (
+    []
+    if _YT_CLIENTS_RAW.lower() in ("default", "auto")
+    else [c.strip() for c in _YT_CLIENTS_RAW.split(",") if c.strip()]
+)
 
 
 def _yt_extractor_args() -> dict:
-    """yt-dlp extractor_args for proxy-free YouTube extraction."""
+    """yt-dlp extractor_args for YouTube extraction."""
+    if not YT_PLAYER_CLIENTS:
+        return {}  # no override → yt-dlp's built-in client selection
     return {"player_client": list(YT_PLAYER_CLIENTS)}
 # Proxy for Facebook/Instagram/TikTok. Cloud/datacenter IPs (e.g. Render) get
 # challenged/redirect-looped by these sites even with valid cookies, so a

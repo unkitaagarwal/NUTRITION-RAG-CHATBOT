@@ -40,6 +40,7 @@ import requests
 from bs4 import BeautifulSoup
 import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import TimeoutError as FutureTimeoutError
 import hashlib
 
 
@@ -6199,7 +6200,13 @@ def _apply_response_language(payload: dict, video_url: str, meta: dict) -> dict:
 
 
 def _return_video_extract_result(
-    result: dict, url_key: str, video_url: str, meta: dict, *, language: str | None = None
+    result: dict,
+    url_key: str,
+    video_url: str,
+    meta: dict,
+    *,
+    language: str | None = None,
+    cache: bool = True,
 ) -> tuple:
     if language:
         result["language"] = language
@@ -6210,7 +6217,10 @@ def _return_video_extract_result(
     # LLM), resolve that in-flight Future instead of uploading synchronously.
     _img_future = _img_persist_futures.pop(url_key, None)
     _persist_recipe_source_image(result.get("source"), result.get("meta"), future=_img_future)
-    _recipe_cache.set(url_key, result)
+    if cache:
+        _recipe_cache.set(url_key, result)
+    else:
+        print("🗃️ Not caching partial result (video gap-fill did not finish in time)")
     return jsonify(_apply_extract_recipe_image_pref(result)), 200
 
 
@@ -6357,12 +6367,17 @@ def _caption_has_instructions(caption: str) -> bool:
     if re.search(r'\b(?:step|étape|paso|langkah)\s*\d+', caption, re.IGNORECASE):
         return True
     # Instruction-section headers creators commonly use (incl. "how to make it").
+    # The header must START a line (optionally after an emoji/bullet) and be
+    # followed by ":" / "-" or end the line. Phrases mid-sentence ("Learn how to
+    # make ...") or SEO keyword lines ("How to make coconut modak without
+    # cooking") are NOT step headers.
     if re.search(
-        r'\b(?:instructions?|directions?|method|steps?|'
+        r'^[^\w\n]{0,4}\s*(?:instructions?|directions?|method|steps?|'
         r'how\s+to\s+make(?:\s+it)?|to\s+make(?:\s+it)?|here\'?s\s+how|let\'?s\s+make|'
-        r'préparation|preparation|étapes?|pasos?|c[oó]mo\s+hacer|modo\s+de\s+preparo)\b\s*:?',
+        r'préparation|preparation|étapes?|pasos?|c[oó]mo\s+hacer|modo\s+de\s+preparo)'
+        r'\s*(?:[:：\-–—]|$)',
         caption,
-        re.IGNORECASE,
+        re.IGNORECASE | re.MULTILINE,
     ):
         return True
     action_starts = (
@@ -9217,12 +9232,124 @@ def _tiktok_photo_slideshow_error_response():
     }), 400
 
 
+# ── Caption-partial gap-fill (video frames) under a response-time budget ──────
+# Social reels whose caption lists ingredients but no method (or vice versa)
+# get the missing section from the video frames. The vision job runs in a
+# background pool; the request waits only until the response budget is nearly
+# spent. If vision is still running, the partial caption result is returned
+# (NOT cached) and the job keeps running so a retry within a few minutes gets
+# the completed result instantly.
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+
+
+EXTRACT_RECIPE_RESPONSE_BUDGET_SEC = _env_float("EXTRACT_RECIPE_RESPONSE_BUDGET_SEC", 20.0)
+# Time kept back for enrichment/nutrition, image persist and serialization.
+EXTRACT_RECIPE_FINALIZE_RESERVE_SEC = _env_float("EXTRACT_RECIPE_FINALIZE_RESERVE_SEC", 4.0)
+_GAPFILL_RESULT_TTL_SEC = _env_float("EXTRACT_RECIPE_GAPFILL_TTL_SEC", 600.0)
+_gapfill_executor = ThreadPoolExecutor(
+    max_workers=int(os.getenv("EXTRACT_RECIPE_GAPFILL_WORKERS", "4")),
+    thread_name_prefix="gapfill",
+)
+_gapfill_jobs: dict = {}  # url_key -> (Future, started_ts)
+_gapfill_lock = Lock()
+
+
+def _gapfill_enabled() -> bool:
+    return (os.getenv("EXTRACT_RECIPE_FILL_MISSING_FROM_VIDEO") or "1").strip().lower() not in (
+        "0", "false", "no",
+    )
+
+
+def _gapfill_vision_worker(video_url: str, meta: dict) -> dict | None:
+    """Download the reel and run frame+vision. Self-contained (own temp dir)."""
+    temp_dir = None
+    try:
+        t0 = time.time()
+        sections, max_sec = _social_vision_download_plan(meta, video_url)
+        temp_dir, video_path, dl_meta = _download_video_to_file(
+            video_url, fast=True, max_seconds=max_sec, download_sections=sections,
+        )
+        vmeta = _merge_meta_keep_longer_description(meta, dl_meta)
+        recipe, _src, method = _run_frame_vision_fallback_from_path(video_path, video_url, vmeta)
+        print(f"🧩 Gap-fill vision finished in {time.time() - t0:.2f}s (method={method})")
+        return recipe
+    except Exception as e:
+        print(f"⚠️ Gap-fill vision failed: {e}")
+        return None
+    finally:
+        if temp_dir:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def _get_or_start_gapfill(url_key: str, video_url: str, meta: dict):
+    """Reuse an in-flight/recent job for this URL, else start one."""
+    now = time.time()
+    with _gapfill_lock:
+        for k, (fut, ts) in list(_gapfill_jobs.items()):
+            if fut.done() and now - ts > _GAPFILL_RESULT_TTL_SEC:
+                _gapfill_jobs.pop(k, None)
+        job = _gapfill_jobs.get(url_key)
+        if job is not None:
+            fut, _ts = job
+            # Retry a finished job that produced nothing.
+            if not (fut.done() and (fut.exception() is not None or fut.result() is None)):
+                print("🧩 Reusing existing gap-fill job")
+                return fut
+        fut = _gapfill_executor.submit(_gapfill_vision_worker, video_url, dict(meta))
+        _gapfill_jobs[url_key] = (fut, now)
+        return fut
+
+
+def _ingredient_key(name: str) -> str:
+    return re.sub(r"[^a-z]", "", (name or "").lower())
+
+
+def _merge_gapfill_into_caption_recipe(recipe: dict, vision: dict, missing: list[str]) -> list[str]:
+    """Fill missing sections (and blank quantities) from the vision recipe.
+    Caption-provided content is kept as the source of truth. Returns still-missing sections."""
+    if not vision:
+        return missing
+    v_ings = [
+        i for i in (vision.get("ingredients") or [])
+        if isinstance(i, dict) and (i.get("name") or "").strip()
+    ]
+    v_steps = [str(s).strip() for s in (vision.get("instructions") or []) if str(s).strip()]
+    still = list(missing)
+    if "instructions" in still and v_steps:
+        recipe["instructions"] = v_steps
+        still.remove("instructions")
+    if "ingredients" in still and v_ings:
+        recipe["ingredients"] = v_ings
+        still.remove("ingredients")
+    elif v_ings:
+        # Caption often lists names without amounts; borrow on-screen quantities.
+        by_key = {_ingredient_key(i["name"]): i for i in v_ings}
+        for ing in recipe.get("ingredients") or []:
+            if not isinstance(ing, dict) or (ing.get("quantity") or "").strip():
+                continue
+            k = _ingredient_key(ing.get("name", ""))
+            match = by_key.get(k) or next(
+                (v for vk, v in by_key.items() if k and vk and (k in vk or vk in k)), None
+            )
+            if match and (match.get("quantity") or "").strip():
+                ing["quantity"] = match["quantity"]
+    for field in ("cook_time", "prep_time", "total_time", "servings"):
+        if not str(recipe.get(field) or "").strip() and str(vision.get(field) or "").strip():
+            recipe[field] = vision[field]
+    return still
+
+
 def extract_recipe_from_video_internal(video_url: str):
     """
     Internal helper used by unified /extract-recipe endpoint.
     Parallel audio + low-res video download → transcribe → LLM, or on-demand frame+vision fallback.
     Returns a Flask response: jsonify({...}), status_code
     """
+    t_request = time.time()
     ok, err = validate_video_url(video_url)
     if not ok:
         return jsonify({"error": err}), 400
@@ -9243,6 +9370,10 @@ def extract_recipe_from_video_internal(video_url: str):
     url_key = hashlib.sha256(video_url.encode()).hexdigest()
     if not _get_extract_recipe_no_cache():
         cached = _recipe_cache.get(url_key)
+        if cached is not None and (cached.get("extraction") or {}).get("method") == "caption_llm_partial":
+            # Legacy entry cached before video gap-fill existed — re-extract.
+            print(f"♻️ Ignoring cached caption-partial result for {video_url}")
+            cached = None
         if cached is not None:
             print(f"⚡ Cache hit for video URL: {video_url}")
             cached = _apply_response_language(cached, video_url, cached.get("meta") or {})
@@ -9343,9 +9474,15 @@ def extract_recipe_from_video_internal(video_url: str):
             source = None
             missing_sections: list[str] = []
             caption_from_partial = False
+            gapfill_status = None  # None | "filled" | "no_content" | "timeout"
             caption_text = _video_caption_text(meta)
             if _should_try_social_caption_first(meta, video_url):
                 print(f"📝 Caption-first mode ({len(caption_text)} chars)")
+                if _gapfill_enabled() and not _caption_has_instructions(caption_text):
+                    # Caption has no method → steps must come from the video.
+                    # Start vision now so it overlaps the caption LLM call.
+                    print("🧩 Caption has no steps; starting video gap-fill in parallel")
+                    _get_or_start_gapfill(url_key, video_url, meta)
                 t_cap = time.time()
                 recipe = _extract_recipe_from_video_caption(meta)
                 print(f"📝 Caption LLM finished in {time.time() - t_cap:.2f}s")
@@ -9356,10 +9493,45 @@ def extract_recipe_from_video_internal(video_url: str):
                 if recipe:
                     source = _build_video_recipe_source(video_url, meta, recipe)
                     caption_from_partial = True
+                    needs_qty = any(
+                        isinstance(i, dict) and not (i.get("quantity") or "").strip()
+                        for i in (recipe.get("ingredients") or [])
+                    )
+                    if (missing_sections or needs_qty) and _gapfill_enabled():
+                        wait_sec = (
+                            EXTRACT_RECIPE_RESPONSE_BUDGET_SEC
+                            - EXTRACT_RECIPE_FINALIZE_RESERVE_SEC
+                            - (time.time() - t_request)
+                        )
+                        print(
+                            f"🧩 Caption partial (missing={missing_sections}, blank_qty={needs_qty}); "
+                            f"filling from video, waiting up to {max(wait_sec, 0):.1f}s"
+                        )
+                        fut = _get_or_start_gapfill(url_key, video_url, meta)
+                        try:
+                            vision_recipe = fut.result(timeout=max(wait_sec, 0.05))
+                        except FutureTimeoutError:
+                            vision_recipe = None
+                            gapfill_status = "timeout" if missing_sections else None
+                            print("⏱️ Gap-fill still running; returning caption partial now")
+                        except Exception as e:
+                            vision_recipe = None
+                            print(f"⚠️ Gap-fill error: {e}")
+                        if vision_recipe is not None:
+                            before = list(missing_sections)
+                            missing_sections = _merge_gapfill_into_caption_recipe(
+                                recipe, vision_recipe, missing_sections
+                            )
+                            if before and not missing_sections:
+                                gapfill_status = "filled"
+                            elif missing_sections:
+                                gapfill_status = "no_content"
+                            else:
+                                gapfill_status = "filled"
                     if missing_sections:
                         print(
-                            f"📝 Caption partial — no {', '.join(missing_sections)} in caption; "
-                            "returning available info (skipping vision)"
+                            f"📝 Caption partial — no {', '.join(missing_sections)} found; "
+                            "returning available info"
                         )
             else:
                 print(
@@ -9440,6 +9612,8 @@ def extract_recipe_from_video_internal(video_url: str):
                 if caption_from_partial and missing_sections:
                     extraction_method = "caption_llm_partial"
                     recipe["missing"] = missing_sections
+                elif caption_from_partial and gapfill_status == "filled":
+                    extraction_method = "caption_llm+video_frames_vision"
                 elif vision_partial:
                     extraction_method = "video_frames_vision_partial"
                     if missing_sections:
@@ -9456,9 +9630,15 @@ def extract_recipe_from_video_internal(video_url: str):
                     "meta": meta,
                 }
                 if caption_from_partial and missing_sections:
+                    where = "the caption or video" if gapfill_status == "no_content" else "the caption"
                     _result["warnings"] = [
-                        f"No {section} found in the caption." for section in missing_sections
+                        f"No {section} found in {where}." for section in missing_sections
                     ]
+                    if gapfill_status == "timeout":
+                        _result["warnings"].append(
+                            "Still reading the video for the missing details — try again in a few seconds."
+                        )
+                        _result["retry_after_sec"] = 10
                 elif vision_partial:
                     if missing_sections:
                         _result["warnings"] = [
@@ -9466,7 +9646,10 @@ def extract_recipe_from_video_internal(video_url: str):
                         ]
                     else:
                         _result["warnings"] = ["Recipe extraction may be incomplete."]
-                return _return_video_extract_result(_result, url_key, video_url, meta, language=lang)
+                return _return_video_extract_result(
+                    _result, url_key, video_url, meta, language=lang,
+                    cache=(gapfill_status != "timeout"),
+                )
             return jsonify({
                 "error": "Failed to extract recipe from video",
                 "user_message": "We couldn't extract a recipe from this link. Please try another or add the recipe manually.",

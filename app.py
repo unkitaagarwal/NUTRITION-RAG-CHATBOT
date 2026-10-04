@@ -298,9 +298,48 @@ def _canonicalize_social_video_url(url: str) -> str:
     try:
         p = urlparse(url)
         path = p.path.rstrip("/") or "/"
-        return p._replace(path=path, query="", fragment="").geturl()
+        canonical = p._replace(path=path, query="", fragment="").geturl()
     except Exception:
         return url
+    return _normalize_tiktok_video_url(canonical)
+
+
+# TikTok redirects some short links (notably from datacenter IPs) to legacy
+# shapes such as https://m.tiktok.com/v/<id>.html. yt-dlp's TikTok extractor
+# only matches https://www.tiktok.com/@<user>/video/<id>; anything else falls
+# to the [generic] extractor, which TikTok answers with 403 (direct AND via
+# proxy). Rewrite every TikTok video shape to the form yt-dlp recognizes.
+# /photo/ posts are left untouched (the slideshow path handles them).
+_TIKTOK_VIDEO_ID_PATTERNS = (
+    r"^/@(?P<user>[\w.-]*)/video/(?P<id>\d{8,})",      # /@user/video/<id> (any host)
+    r"^/v/(?P<id>\d{8,})(?:\.html)?$",                  # m.tiktok.com/v/<id>.html
+    r"^/(?:share/)?video/(?P<id>\d{8,})",               # /video/<id>, /share/video/<id>
+    r"^/embed(?:/v\d)?/(?P<id>\d{8,})",                 # /embed/v2/<id>
+)
+
+
+def _normalize_tiktok_video_url(url: str) -> str:
+    try:
+        p = urlparse(url)
+        host = (p.hostname or "").lower()
+        if not (host == "tiktok.com" or host.endswith(".tiktok.com")):
+            return url
+        if host in ("vt.tiktok.com", "vm.tiktok.com"):
+            return url  # unresolved short link — leave for yt-dlp's TikTokVM extractor
+        path = p.path or ""
+        if "/photo/" in path:
+            return url
+        for pat in _TIKTOK_VIDEO_ID_PATTERNS:
+            m = re.search(pat, path)
+            if m:
+                user = (m.groupdict().get("user") or "")
+                normalized = f"https://www.tiktok.com/@{user}/video/{m.group('id')}"
+                if normalized != url:
+                    print(f"🔗 TikTok URL normalized {url} -> {normalized}")
+                return normalized
+    except Exception:
+        pass
+    return url
 
 
 LLM_MODEL = os.getenv("RECIPE_LLM_MODEL", "gpt-4o-mini")  # change if needed

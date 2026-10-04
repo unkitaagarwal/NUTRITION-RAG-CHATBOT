@@ -9250,12 +9250,30 @@ EXTRACT_RECIPE_RESPONSE_BUDGET_SEC = _env_float("EXTRACT_RECIPE_RESPONSE_BUDGET_
 # Time kept back for enrichment/nutrition, image persist and serialization.
 EXTRACT_RECIPE_FINALIZE_RESERVE_SEC = _env_float("EXTRACT_RECIPE_FINALIZE_RESERVE_SEC", 4.0)
 _GAPFILL_RESULT_TTL_SEC = _env_float("EXTRACT_RECIPE_GAPFILL_TTL_SEC", 600.0)
+# Per gunicorn worker process. Gap-fill jobs are mostly I/O (download + LLM),
+# and a job keeps running after its request times out (so a retry can reuse
+# it), so the pool must be larger than the number of concurrent requests or
+# jobs queue behind each other and every later request times out.
+# Lower this on small instances if memory/CPU is tight.
+_GAPFILL_WORKERS = max(1, int(os.getenv("EXTRACT_RECIPE_GAPFILL_WORKERS", "12")))
 _gapfill_executor = ThreadPoolExecutor(
-    max_workers=int(os.getenv("EXTRACT_RECIPE_GAPFILL_WORKERS", "4")),
+    max_workers=_GAPFILL_WORKERS,
     thread_name_prefix="gapfill",
 )
 _gapfill_jobs: dict = {}  # url_key -> (Future, started_ts)
+_gapfill_waiters: dict = {}  # url_key -> number of requests currently waiting on the job
 _gapfill_lock = Lock()
+
+
+def _gapfill_pool_stats() -> str:
+    """'running/queued/size' for logs (queued = submitted but not started)."""
+    try:
+        queued = _gapfill_executor._work_queue.qsize()
+    except Exception:
+        queued = -1
+    with _gapfill_lock:
+        running = sum(1 for f, _ in _gapfill_jobs.values() if f.running())
+    return f"running={running} queued={queued} size={_GAPFILL_WORKERS}"
 
 
 def _gapfill_enabled() -> bool:
@@ -9295,13 +9313,59 @@ def _get_or_start_gapfill(url_key: str, video_url: str, meta: dict):
         job = _gapfill_jobs.get(url_key)
         if job is not None:
             fut, _ts = job
-            # Retry a finished job that produced nothing.
-            if not (fut.done() and (fut.exception() is not None or fut.result() is None)):
-                print("🧩 Reusing existing gap-fill job")
+            # Start over only if the job was cancelled, failed, or produced nothing.
+            dead = fut.cancelled() or (
+                fut.done() and (fut.exception() is not None or fut.result() is None)
+            )
+            if not dead:
+                print("🧩 Reusing existing gap-fill job (no duplicate download)")
                 return fut
         fut = _gapfill_executor.submit(_gapfill_vision_worker, video_url, dict(meta))
         _gapfill_jobs[url_key] = (fut, now)
         return fut
+
+
+def _wait_gapfill(url_key: str, fut, timeout: float):
+    """Wait for a gap-fill job. On timeout, if nobody else is waiting and the job
+    has not started yet, cancel it so abandoned work doesn't clog the queue."""
+    with _gapfill_lock:
+        _gapfill_waiters[url_key] = _gapfill_waiters.get(url_key, 0) + 1
+    released = False
+    try:
+        return fut.result(timeout=timeout)
+    except FutureTimeoutError:
+        with _gapfill_lock:
+            left = _gapfill_waiters.get(url_key, 1) - 1
+            if left > 0:
+                _gapfill_waiters[url_key] = left
+            else:
+                _gapfill_waiters.pop(url_key, None)
+            released = True
+            if left <= 0 and not fut.running() and fut.cancel():
+                _gapfill_jobs.pop(url_key, None)
+                print("🧹 Cancelled queued gap-fill job (never started, no one waiting)")
+        raise
+    finally:
+        if not released:
+            with _gapfill_lock:
+                left = _gapfill_waiters.get(url_key, 1) - 1
+                if left > 0:
+                    _gapfill_waiters[url_key] = left
+                else:
+                    _gapfill_waiters.pop(url_key, None)
+
+
+def _await_existing_gapfill(url_key: str, timeout: float) -> dict | None:
+    """If a gap-fill job for this URL already exists, wait for its recipe instead
+    of downloading the same video a second time. None when there is no job."""
+    with _gapfill_lock:
+        job = _gapfill_jobs.get(url_key)
+    if job is None or job[0].cancelled():
+        return None
+    try:
+        return _wait_gapfill(url_key, job[0], timeout)
+    except Exception:
+        return None
 
 
 def _ingredient_key(name: str) -> str:
@@ -9505,11 +9569,12 @@ def extract_recipe_from_video_internal(video_url: str):
                         )
                         print(
                             f"🧩 Caption partial (missing={missing_sections}, blank_qty={needs_qty}); "
-                            f"filling from video, waiting up to {max(wait_sec, 0):.1f}s"
+                            f"filling from video, waiting up to {max(wait_sec, 0):.1f}s "
+                            f"[pool {_gapfill_pool_stats()}]"
                         )
                         fut = _get_or_start_gapfill(url_key, video_url, meta)
                         try:
-                            vision_recipe = fut.result(timeout=max(wait_sec, 0.05))
+                            vision_recipe = _wait_gapfill(url_key, fut, max(wait_sec, 0.05))
                         except FutureTimeoutError:
                             vision_recipe = None
                             gapfill_status = "timeout" if missing_sections else None
@@ -9538,6 +9603,18 @@ def extract_recipe_from_video_internal(video_url: str):
                     f"📝 Caption not used for extraction ({len(caption_text)} chars); "
                     "using vision"
                 )
+
+            if not _recipe_has_usable_content(recipe):
+                # A gap-fill job may already be downloading this video (started in
+                # parallel with the caption LLM). Reuse it instead of a 2nd download.
+                reused = _await_existing_gapfill(url_key, timeout=EXTRACT_RECIPE_TIMEOUT)
+                if _recipe_has_usable_content(reused):
+                    print("🧩 Using in-flight gap-fill result (skipped duplicate download)")
+                    recipe = reused
+                    missing_sections = []
+                    caption_from_partial = False
+                    source = _build_video_recipe_source(video_url, meta, recipe)
+                    extraction_method = "video_frames_vision"
 
             if not _recipe_has_usable_content(recipe):
                 # Caption yielded nothing usable → vision fallback (clear caption flags).

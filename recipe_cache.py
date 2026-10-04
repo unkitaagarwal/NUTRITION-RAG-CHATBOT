@@ -41,6 +41,32 @@ _TTL_DAYS = int(os.getenv("RECIPE_CACHE_TTL_DAYS", "90"))
 _MAX_PAYLOAD_BYTES = 900_000
 
 
+def _non_empty_items(items, key: str) -> int:
+    count = 0
+    for it in items or []:
+        if isinstance(it, dict):
+            val = it.get(key) or it.get("text") or ""
+        else:
+            val = it
+        if str(val or "").strip():
+            count += 1
+    return count
+
+
+def is_cacheable_result(result) -> bool:
+    """Only successful extractions are cached: at least one named ingredient AND
+    at least one instruction step. Partial results (missing ingredients or steps)
+    are never written, and any already in Firestore are treated as misses, so a
+    later request re-extracts instead of replaying a failure."""
+    if not isinstance(result, dict):
+        return False
+    recipe = result.get("recipe") if isinstance(result.get("recipe"), dict) else result
+    return (
+        _non_empty_items(recipe.get("ingredients"), "name") > 0
+        and _non_empty_items(recipe.get("instructions"), "instruction") > 0
+    )
+
+
 class RecipeCache:
     """Thread-safe two-tier (in-memory + Firestore) cache. Best-effort L2:
     any Firestore error degrades to L1-only behavior, never breaks a request."""
@@ -107,18 +133,28 @@ class RecipeCache:
         with self._lock:
             hit = self._l1.get(key)
         if hit is not None:
-            return dict(hit)
+            if is_cacheable_result(hit):
+                return dict(hit)
+            with self._lock:
+                self._l1.pop(key, None)
         if _L2_DISABLED:
             return None
         result = self._l2_get(key)
         if result is None:
+            return None
+        if not is_cacheable_result(result):
+            print(f"♻️ recipe_cache: ignoring incomplete cached result (re-extracting): {key[:12]}")
             return None
         with self._lock:
             self._l1[key] = result  # backfill hot layer
         return dict(result)
 
     def set(self, key: str, result: dict) -> None:
-        """Write-through: L1 now, L2 asynchronously (fire-and-forget)."""
+        """Write-through: L1 now, L2 asynchronously (fire-and-forget).
+        Incomplete results (no ingredients or no steps) are never cached."""
+        if not is_cacheable_result(result):
+            print(f"🗃️ recipe_cache: not caching incomplete result: {key[:12]}")
+            return
         with self._lock:
             self._l1[key] = result
         if not _L2_DISABLED:

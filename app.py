@@ -10035,6 +10035,50 @@ def extract_recipe_from_video_internal(video_url: str):
     ## video and webpage code ends here#####
    
 
+# ---------- /customize-recipe ----------
+# Endpoint lives in customize_recipe.py; we inject the same nutrition step
+# /extract-recipe uses so customized recipes get numbers consistent with the app.
+
+def _customize_recompute_nutrition(recipe: dict) -> dict | None:
+    """Run a customized recipe ({title, ingredients[{name,amount,unit}], steps[]})
+    through _ensure_recipe_nutrition_macros and map back to the app's shape.
+    Returns None when estimation failed, so the caller can fall back."""
+    tmp = {
+        "name": recipe.get("title") or "",
+        "servings": str(recipe.get("servings") or DEFAULT_RECIPE_SERVINGS),
+        "ingredients": [
+            " ".join(str(ing.get(k) or "").strip() for k in ("amount", "unit", "name")).strip()
+            for ing in (recipe.get("ingredients") or []) if isinstance(ing, dict)
+        ],
+        "instructions": [
+            str(st.get("instruction") or "").strip()
+            for st in (recipe.get("steps") or []) if isinstance(st, dict)
+        ],
+        "nutrition": {},  # empty => always re-estimated from the new ingredient list
+    }
+    _ensure_recipe_nutrition_macros(tmp)
+    n = tmp.get("nutrition") or {}
+    try:
+        out = {
+            "calories": float(n.get("calories") or 0),
+            "protein": float(n.get("protein_g") or 0),
+            "carbs": float(n.get("carbs_g") or 0),
+            "fat": float(n.get("fat_g") or 0),
+        }
+    except (TypeError, ValueError):
+        return None
+    if out["calories"] <= 0:
+        return None  # estimator failed and filled zeros
+    return out
+
+
+from customize_recipe import create_customize_recipe_blueprint
+
+app.register_blueprint(
+    create_customize_recipe_blueprint(recompute_nutrition=_customize_recompute_nutrition)
+)
+
+
 if __name__ == "__main__":
     # Disable Flask's built-in debugger when running in VS Code debugger
     # Set FLASK_DEBUG environment variable to enable Flask debug mode separately

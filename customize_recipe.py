@@ -8,7 +8,7 @@ The handler runs seven steps in order and stops at the first failure:
     1. Authenticate   Firebase ID token -> uid                       (401)
     2. Validate       headers, sizes, shapes                         (400)
     3. Check limit    meal_plan_chef_users/{uid}/usage/customize_{d} (403/429)
-    4. Call Claude    forced tool call -> status/message/recipe/changes (502)
+    4. Call Claude    structured JSON: status/message/edits/changes   (502)
     5. Recompute      nutrition via the same step /extract-recipe uses
     6. Count the use  only when status == "updated"
     7. Log + return   uid, requestId, model, tokens, latency         (200)
@@ -61,12 +61,14 @@ FREE_DAILY_LIMIT = _env_int("CUSTOMIZE_FREE_DAILY_LIMIT", 3)        # 0 => premi
 PREMIUM_DAILY_LIMIT = _env_int("CUSTOMIZE_PREMIUM_DAILY_LIMIT", 50)
 USAGE_TZ = os.getenv("CUSTOMIZE_USAGE_TZ", "UTC")  # which "today" the counter uses
 
-CLAUDE_MODEL = os.getenv("CUSTOMIZE_CLAUDE_MODEL", "claude-sonnet-5-5")
+# Haiku 4.5 for both chips and chat (cost/latency). Set CUSTOMIZE_CLAUDE_MODEL=claude-sonnet-5-5
+# to send typed chat requests to Sonnet instead.
+CLAUDE_MODEL = os.getenv("CUSTOMIZE_CLAUDE_MODEL", "claude-haiku-4-5-20251001")
 CLAUDE_PRESET_MODEL = os.getenv("CUSTOMIZE_CLAUDE_PRESET_MODEL", "claude-haiku-4-5-20251001")
 # Preset chip taps use Haiku (faster, cheaper); typed chat uses Sonnet.
 # Set CUSTOMIZE_USE_PRESET_MODEL=0 to send presets to Sonnet too.
 USE_PRESET_MODEL = (os.getenv("CUSTOMIZE_USE_PRESET_MODEL") or "1").strip().lower() in ("1", "true", "yes")
-CLAUDE_MAX_TOKENS = _env_int("CUSTOMIZE_CLAUDE_MAX_TOKENS", 4096)
+CLAUDE_MAX_TOKENS = _env_int("CUSTOMIZE_CLAUDE_MAX_TOKENS", 3000)  # edits only, so much smaller
 
 USERS_COLLECTION = os.getenv("CUSTOMIZE_USERS_COLLECTION", "meal_plan_chef_users")
 
@@ -93,89 +95,96 @@ SYSTEM_PROMPT = (
     # Output-format guidance (not part of the product prompt above):
     "\n\nRespond only with JSON matching the required schema. "
     "assistantMessage is plain text (no markdown), at most about 600 characters. "
-    "When status is updated, return the FULL updated recipe (every ingredient and step, "
-    "not just the changed ones) and 1-5 changes; otherwise set recipe and changes to null. "
-    "Use a change of kind 'kept' to reassure the user about something preserved "
+    "Return ONLY what changes, never the whole recipe. Ingredients and steps are numbered "
+    "by their field n. In edits.ingredientOps / edits.stepOps use: "
+    "{op:'update', n, ...new values} to change item n (give all of name, amount, unit for "
+    "ingredients, or instruction for steps); {op:'remove', n} to delete item n; "
+    "{op:'add', n, ...} to insert a new item after item n (n=0 inserts at the start). "
+    "Every n refers to the ORIGINAL numbering. Include a top-level edits field "
+    "(title, description, servings, prepMinutes, cookMinutes, difficulty, cuisine, "
+    "dietaryTags) only if it changes; omit unchanged ones. If servings change, update "
+    "every affected ingredient amount. Always include edits.nutrition: your per-serving "
+    "estimate for the updated recipe. "
+    "When status is updated, also return 1-5 changes; otherwise set edits and changes "
+    "to null. Use a change of kind 'kept' to reassure the user about something preserved "
     "(e.g. still vegetarian). Amounts are strings."
 )
 
-_INGREDIENT_SCHEMA = {
+_INGREDIENT_OP_SCHEMA = {
     "type": "object",
     "properties": {
+        "op": {"type": "string", "enum": ["update", "remove", "add"]},
+        "n": {"type": "integer"},
         "name": {"type": "string"},
         "amount": {"type": "string"},
         "unit": {"type": "string"},
     },
-    "required": ["name", "amount", "unit"],
+    "required": ["op", "n"],
     "additionalProperties": False,
 }
-_STEP_SCHEMA = {
+_STEP_OP_SCHEMA = {
     "type": "object",
     "properties": {
-        "order": {"type": "integer"},
+        "op": {"type": "string", "enum": ["update", "remove", "add"]},
+        "n": {"type": "integer"},
         "instruction": {"type": "string"},
     },
-    "required": ["order", "instruction"],
+    "required": ["op", "n"],
     "additionalProperties": False,
 }
-CUSTOMIZATION_TOOL = {
-    "name": "submit_customization",
-    "description": "Return the result of customizing the recipe.",
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "status": {"type": "string", "enum": sorted(ALLOWED_STATUSES)},
-            "assistantMessage": {"type": "string"},
-            "recipe": {
-                "type": ["object", "null"],
-                "properties": {
-                    "title": {"type": "string"},
-                    "description": {"type": "string"},
-                    "servings": {"type": "integer"},
-                    "prepMinutes": {"type": "integer"},
-                    "cookMinutes": {"type": "integer"},
-                    "difficulty": {"type": "string"},
-                    "cuisine": {"type": "string"},
-                    "dietaryTags": {"type": "array", "items": {"type": "string"}},
-                    "ingredients": {"type": "array", "items": _INGREDIENT_SCHEMA},
-                    "steps": {"type": "array", "items": _STEP_SCHEMA},
-                    "nutrition": {
-                        "type": "object",
-                        "description": "Your per-serving estimate (the server recomputes it).",
-                        "properties": {
-                            "calories": {"type": "number"},
-                            "protein": {"type": "number"},
-                            "carbs": {"type": "number"},
-                            "fat": {"type": "number"},
-                        },
-                        "required": ["calories", "protein", "carbs", "fat"],
-                        "additionalProperties": False,
-                    },
-                },
-                "required": ["title", "ingredients", "steps"],
-                "additionalProperties": False,
-            },
-            "changes": {
-                "type": ["array", "null"],
-                "items": {
+# Claude's response format (structured outputs via output_config.format). Claude
+# returns only the edits; the server merges them into the client's recipe.
+OUTPUT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "status": {"type": "string", "enum": sorted(ALLOWED_STATUSES)},
+        "assistantMessage": {"type": "string"},
+        "edits": {
+            "type": ["object", "null"],
+            "properties": {
+                "title": {"type": "string"},
+                "description": {"type": "string"},
+                "servings": {"type": "integer"},
+                "prepMinutes": {"type": "integer"},
+                "cookMinutes": {"type": "integer"},
+                "difficulty": {"type": "string"},
+                "cuisine": {"type": "string"},
+                "dietaryTags": {"type": "array", "items": {"type": "string"}},
+                "ingredientOps": {"type": "array", "items": _INGREDIENT_OP_SCHEMA},
+                "stepOps": {"type": "array", "items": _STEP_OP_SCHEMA},
+                "nutrition": {
                     "type": "object",
+                    "description": "Per-serving estimate for the updated recipe (the server recomputes it).",
                     "properties": {
-                        "kind": {"type": "string", "enum": sorted(ALLOWED_CHANGE_KINDS)},
-                        "title": {"type": "string"},
-                        "detail": {"type": "string"},
+                        "calories": {"type": "number"},
+                        "protein": {"type": "number"},
+                        "carbs": {"type": "number"},
+                        "fat": {"type": "number"},
                     },
-                    "required": ["kind", "title", "detail"],
+                    "required": ["calories", "protein", "carbs", "fat"],
                     "additionalProperties": False,
                 },
             },
+            "required": ["ingredientOps", "stepOps", "nutrition"],
+            "additionalProperties": False,
         },
-        "required": ["status", "assistantMessage", "recipe", "changes"],
-        "additionalProperties": False,
+        "changes": {
+            "type": ["array", "null"],
+            "items": {
+                "type": "object",
+                "properties": {
+                    "kind": {"type": "string", "enum": sorted(ALLOWED_CHANGE_KINDS)},
+                    "title": {"type": "string"},
+                    "detail": {"type": "string"},
+                },
+                "required": ["kind", "title", "detail"],
+                "additionalProperties": False,
+            },
+        },
     },
+    "required": ["status", "assistantMessage", "edits", "changes"],
+    "additionalProperties": False,
 }
-# Claude's response format (structured outputs). Sonnet 5.5 rejects forced
-# tool_choice, so we use output_config.format = json_schema on every model.
-OUTPUT_SCHEMA = CUSTOMIZATION_TOOL["input_schema"]
 
 
 # ── Errors ────────────────────────────────────────────────────────────────────
@@ -387,12 +396,26 @@ def _pick_model(mode: str) -> str:
     return CLAUDE_PRESET_MODEL if (mode == "preset" and USE_PRESET_MODEL) else CLAUDE_MODEL
 
 
+def _numbered_recipe(recipe: dict) -> dict:
+    """The recipe as Claude sees it: ingredients and steps numbered 1..n by field `n`."""
+    view = {k: v for k, v in recipe.items() if k not in ("ingredients", "steps")}
+    view["ingredients"] = [
+        {"n": i + 1, "name": ing.get("name"), "amount": ing.get("amount"), "unit": ing.get("unit")}
+        for i, ing in enumerate(recipe.get("ingredients") or [])
+    ]
+    view["steps"] = [
+        {"n": i + 1, "instruction": st.get("instruction")}
+        for i, st in enumerate(recipe.get("steps") or [])
+    ]
+    return view
+
+
 def _build_user_content(body: dict) -> str:
     """User content: recipe as JSON, then history, then prompt (spec step 4)."""
     history_lines = [f"{t['role']}: {t['text']}" for t in body["history"]]
     history_text = "\n".join(history_lines) if history_lines else "(none)"
     return (
-        "<recipe>\n" + json.dumps(body["recipe"], ensure_ascii=False) + "\n</recipe>\n\n"
+        "<recipe>\n" + json.dumps(_numbered_recipe(body["recipe"]), ensure_ascii=False) + "\n</recipe>\n\n"
         "<history>\n" + history_text + "\n</history>\n\n"
         "<request>\n" + body["prompt"].strip() + "\n</request>"
     )
@@ -401,16 +424,13 @@ def _build_user_content(body: dict) -> str:
 def _tool_input_from_response(resp) -> dict:
     """Return Claude's JSON answer (structured-output text block)."""
     for block in getattr(resp, "content", None) or []:
-        btype = getattr(block, "type", None)
-        if btype == "text" and (getattr(block, "text", "") or "").strip():
+        if getattr(block, "type", None) == "text" and (getattr(block, "text", "") or "").strip():
             try:
                 data = json.loads(block.text)
             except json.JSONDecodeError:
                 raise ApiError(502, "model_error", "The model returned invalid JSON.")
             if isinstance(data, dict):
                 return data
-        if btype == "tool_use" and isinstance(getattr(block, "input", None), dict):
-            return block.input  # tolerated for older call styles
     raise ApiError(502, "model_error", "The model did not return a customization.")
 
 
@@ -426,8 +446,66 @@ def _num(v, *, integer: bool = False):
     return int(round(f)) if abs(f - round(f)) < 0.05 else round(f, 1)
 
 
+def _clean_ingredient(op: dict) -> dict | None:
+    name = op.get("name")
+    if not _is_str(name) or not name.strip():
+        return None
+    return {
+        "name": name.strip(),
+        "amount": "" if op.get("amount") is None else str(op.get("amount")).strip(),
+        "unit": "" if op.get("unit") is None else str(op.get("unit")).strip(),
+    }
+
+
+def _clean_step(op: dict) -> dict | None:
+    text = op.get("instruction")
+    if not _is_str(text) or not text.strip():
+        return None
+    return {"instruction": text.strip()}
+
+
+def _apply_ops(items: list, ops, clean) -> tuple[list, int]:
+    """Apply update/remove/add ops (n = 1-based ORIGINAL position) to a list.
+
+    Updates merge into the original item (so extra client fields survive), adds go
+    after original item n (0 = start; out of range = end). Returns (new list, applied).
+    """
+    total = len(items)
+    updates: dict[int, dict] = {}
+    removed: set[int] = set()
+    adds: dict[int, list] = {}
+    applied = 0
+    for op in ops or []:
+        if not isinstance(op, dict):
+            continue
+        kind, n = op.get("op"), op.get("n")
+        if not isinstance(n, int) or isinstance(n, bool):
+            continue
+        if kind == "remove" and 1 <= n <= total:
+            removed.add(n)
+            applied += 1
+        elif kind == "update" and 1 <= n <= total:
+            new = clean(op)
+            if new:
+                updates[n] = new
+                applied += 1
+        elif kind == "add":
+            new = clean(op)
+            if new:
+                adds.setdefault(n if 0 <= n <= total else total, []).append(new)
+                applied += 1
+    out = list(adds.get(0, []))
+    for i, item in enumerate(items, start=1):
+        if i not in removed:
+            merged = dict(item) if isinstance(item, dict) else {}
+            merged.update(updates.get(i, {}))
+            out.append(merged)
+        out.extend(adds.get(i, []))
+    return out, applied
+
+
 def _normalize_model_output(out: dict, original_recipe: dict) -> dict:
-    """Validate Claude's tool input and coerce it to the response shape."""
+    """Validate Claude's JSON and merge its edits into a copy of the client's recipe."""
     status = out.get("status")
     if status not in ALLOWED_STATUSES:
         raise ApiError(502, "model_error", "The model returned an invalid status.")
@@ -440,43 +518,35 @@ def _normalize_model_output(out: dict, original_recipe: dict) -> dict:
         return {"status": status, "assistantMessage": message, "recipe": None, "changes": None,
                 "_model_nutrition": None}
 
-    new = out.get("recipe")
-    if not isinstance(new, dict):
-        raise ApiError(502, "model_error", "The model returned no recipe.")
-    ingredients = new.get("ingredients")
-    steps = new.get("steps")
-    if not isinstance(ingredients, list) or not ingredients or not isinstance(steps, list) or not steps:
-        raise ApiError(502, "model_error", "The model returned an incomplete recipe.")
+    edits = out.get("edits")
+    if not isinstance(edits, dict):
+        raise ApiError(502, "model_error", "The model returned no edits.")
 
-    # Start from the client's recipe so fields we don't model (ids, image URLs, …) survive.
+    # Start from the client's recipe so everything not edited survives untouched.
     recipe = copy.deepcopy(original_recipe)
+    applied = 0
     for key in ("title", "description", "difficulty", "cuisine"):
-        if _is_str(new.get(key)) and new[key].strip():
-            recipe[key] = new[key].strip()
+        if _is_str(edits.get(key)) and edits[key].strip() and edits[key].strip() != recipe.get(key):
+            recipe[key] = edits[key].strip()
+            applied += 1
     for key in ("servings", "prepMinutes", "cookMinutes"):
-        n = _num(new.get(key), integer=True)
-        if n is not None:
+        n = _num(edits.get(key), integer=True)
+        if n is not None and n != recipe.get(key):
             recipe[key] = n
-    if isinstance(new.get("dietaryTags"), list):
-        recipe["dietaryTags"] = [t for t in new["dietaryTags"] if _is_str(t) and t.strip()]
+            applied += 1
+    if isinstance(edits.get("dietaryTags"), list):
+        recipe["dietaryTags"] = [t for t in edits["dietaryTags"] if _is_str(t) and t.strip()]
+        applied += 1
 
-    clean_ings = []
-    for ing in ingredients[:MAX_INGREDIENTS]:
-        if not isinstance(ing, dict) or not _is_str(ing.get("name")) or not ing["name"].strip():
-            continue
-        clean_ings.append({
-            "name": ing["name"].strip(),
-            "amount": "" if ing.get("amount") is None else str(ing.get("amount")).strip(),
-            "unit": "" if ing.get("unit") is None else str(ing.get("unit")).strip(),
-        })
-    clean_steps = []
-    for st in steps[:MAX_STEPS]:
-        if isinstance(st, dict) and _is_str(st.get("instruction")) and st["instruction"].strip():
-            clean_steps.append(st["instruction"].strip())
-    if not clean_ings or not clean_steps:
-        raise ApiError(502, "model_error", "The model returned an incomplete recipe.")
-    recipe["ingredients"] = clean_ings
-    recipe["steps"] = [{"order": i + 1, "instruction": s} for i, s in enumerate(clean_steps)]
+    ingredients, n_ing = _apply_ops(recipe.get("ingredients") or [], edits.get("ingredientOps"), _clean_ingredient)
+    steps, n_steps = _apply_ops(recipe.get("steps") or [], edits.get("stepOps"), _clean_step)
+    applied += n_ing + n_steps
+    if not ingredients or not steps:
+        raise ApiError(502, "model_error", "The model removed every ingredient or step.")
+    if applied == 0:
+        raise ApiError(502, "model_error", "The model reported an update but changed nothing.")
+    recipe["ingredients"] = ingredients[:MAX_INGREDIENTS]
+    recipe["steps"] = [{**st, "order": i + 1} for i, st in enumerate(steps[:MAX_STEPS])]
 
     changes = []
     for ch in out.get("changes") or []:
@@ -492,7 +562,7 @@ def _normalize_model_output(out: dict, original_recipe: dict) -> dict:
     if not changes:
         changes = [{"kind": "general", "title": "Updated recipe", "detail": "Applied your requested change"}]
 
-    model_nutrition = new.get("nutrition") if isinstance(new.get("nutrition"), dict) else None
+    model_nutrition = edits.get("nutrition") if isinstance(edits.get("nutrition"), dict) else None
     return {"status": status, "assistantMessage": message, "recipe": recipe, "changes": changes,
             "_model_nutrition": model_nutrition}
 
@@ -567,7 +637,8 @@ def create_customize_recipe_blueprint(
                 fut.set_result(None)  # waiters fall through and run their own attempt
 
     def _run_model_and_nutrition(body: dict, model: str, deadline: float) -> dict:
-        remaining = max(1.0, deadline - time.monotonic())
+        t0 = time.monotonic()
+        remaining = max(1.0, deadline - t0)
         resp = claude_call(
             model=model,
             system=SYSTEM_PROMPT,
@@ -583,10 +654,13 @@ def create_customize_recipe_blueprint(
         }
         if getattr(resp, "stop_reason", None) == "max_tokens":
             raise ApiError(502, "model_error", "The model response was cut off.")
+        claude_ms = int((time.monotonic() - t0) * 1000)
         result = _normalize_model_output(_tool_input_from_response(resp), body["recipe"])
+        nutrition_ms = 0
 
         if result["status"] == "updated":
             recomputed = None
+            t1 = time.monotonic()
             if recompute_nutrition is not None:
                 try:
                     recomputed = recompute_nutrition(result["recipe"])
@@ -595,8 +669,11 @@ def create_customize_recipe_blueprint(
             result["recipe"]["nutrition"] = _final_nutrition(
                 recomputed, result["_model_nutrition"], body["recipe"].get("nutrition"),
             )
+            nutrition_ms = int((time.monotonic() - t1) * 1000)
+            result["_nutrition_source"] = "recomputed" if recomputed else "model_or_original"
         result.pop("_model_nutrition", None)
         result["_tokens"] = tokens
+        result["_timings"] = {"claudeMs": claude_ms, "nutritionMs": nutrition_ms}
         return result
 
     @bp.route("/customize-recipe", methods=["POST"])
@@ -624,6 +701,7 @@ def create_customize_recipe_blueprint(
             auth_header = request.headers.get("Authorization") or ""
             if not auth_header.lower().startswith("bearer ") or not auth_header[7:].strip():
                 raise ApiError(401, "unauthenticated", "Missing Firebase ID token.")
+            t_auth = time.monotonic()
             try:
                 uid = verify_token(auth_header[7:].strip())
             except Exception as e:
@@ -632,6 +710,8 @@ def create_customize_recipe_blueprint(
             if not uid:
                 raise ApiError(401, "unauthenticated", "Invalid Firebase ID token.")
             log["uid"] = uid
+            timings: dict[str, int] = {"authMs": int((time.monotonic() - t_auth) * 1000)}
+            log["timings"] = timings
 
             # 2. Validate
             if request.content_length is not None and request.content_length > MAX_BODY_BYTES:
@@ -658,6 +738,7 @@ def create_customize_recipe_blueprint(
             dedupe_fut = fut
 
             # 3. Check the limit
+            t_fs = time.monotonic()
             db = get_db()
             premium = bool(is_premium(db, uid))
             limit = PREMIUM_DAILY_LIMIT if premium else FREE_DAILY_LIMIT
@@ -665,6 +746,7 @@ def create_customize_recipe_blueprint(
             if limit <= 0:
                 raise ApiError(403, "premium_required", "Recipe customization is a premium feature.")
             used = int(read_usage(db, uid))
+            timings["firestoreReadMs"] = int((time.monotonic() - t_fs) * 1000)
             if used >= limit:
                 msg = (f"You've used today's {limit} free customizations." if not premium
                        else f"You've used today's {limit} customizations. Come back tomorrow!")
@@ -686,18 +768,23 @@ def create_customize_recipe_blueprint(
                 print(f"[customize-recipe] Claude call failed: {type(e).__name__}: {e}")
                 raise ApiError(502, "model_error", "We couldn't customize this recipe. Please try again.")
             tokens = result.pop("_tokens", {}) or {}
+            timings.update(result.pop("_timings", {}) or {})
+            if "_nutrition_source" in result:
+                log["nutritionSource"] = result.pop("_nutrition_source")
             log["inputTokens"] = tokens.get("input")
             log["outputTokens"] = tokens.get("output")
             log["status"] = result["status"]
 
             # 6. Count the use (only when updated)
             if result["status"] == "updated":
+                t_inc = time.monotonic()
                 try:
                     used = int(increment_usage(db, uid, request_id))
                 except Exception as e:
                     # The user already paid the latency; don't fail the response.
                     print(f"[customize-recipe] usage increment failed: {type(e).__name__}: {e}")
                     used += 1
+                timings["usageWriteMs"] = int((time.monotonic() - t_inc) * 1000)
 
             # 7. Log and return
             payload = {

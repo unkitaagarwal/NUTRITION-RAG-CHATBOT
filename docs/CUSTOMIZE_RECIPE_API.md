@@ -8,10 +8,14 @@ registered at the bottom of `app.py`, which injects the nutrition step `/extract
   MealMap/RecipeVault Firebase app; override with `CUSTOMIZE_FIREBASE_APP`).
 - Headers: `Content-Type: application/json`, `Authorization: Bearer <token>`,
   `X-Client` (`ios-app` | `android-app` | `ios-share-extension`), `X-Request-Id` (UUID).
-- Claude, structured outputs (`output_config.format` = JSON schema; Sonnet 5.5 rejects forced `tool_choice`): preset chip taps use Haiku 4.5
-  (`claude-haiku-4-5-20251001`); typed chat uses `claude-sonnet-5-5`. Set
-  `CUSTOMIZE_USE_PRESET_MODEL=0` to send presets to Sonnet too. Override model IDs with
-  `CUSTOMIZE_CLAUDE_PRESET_MODEL` / `CUSTOMIZE_CLAUDE_MODEL`.
+- Claude, structured outputs (`output_config.format` = JSON schema; Sonnet 5.5 rejects forced
+  `tool_choice`). Default model is Haiku 4.5 (`claude-haiku-4-5-20251001`) for both preset chips
+  and chat; set `CUSTOMIZE_CLAUDE_MODEL=claude-sonnet-5-5` to send chat to Sonnet.
+- Claude returns **only the edits**, not the whole recipe: ingredients and steps are sent numbered
+  (`n`), and Claude replies with `ingredientOps` / `stepOps` (`update` / `remove` / `add` after `n`,
+  all against the original numbering) plus any changed top-level fields. The server merges them
+  into the client's recipe, renumbers steps and returns the full recipe as before — the
+  response shape for the app is unchanged.
 - Steps 4–5 (Claude + nutrition) must finish in 45 s, else `504 timeout`.
 - Usage counter: `meal_plan_chef_users/{uid}/usage/customize_{yyyy-mm-dd}` (`count`,
   `requestIds`), incremented only for `status = updated`, once per `X-Request-Id`.

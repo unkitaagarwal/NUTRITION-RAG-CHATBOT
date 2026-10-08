@@ -332,6 +332,46 @@ def persist_extract_recipe_image(image_url: str | None) -> str | None:
     return firebase_url
 
 
+_ASK_RECIPES_IMG_PREFIX = (os.getenv("ASK_RECIPES_IMG_PREFIX") or "ask-recipes-img").strip().strip("/")
+
+
+def upload_ask_recipe_image_bytes(data: bytes, recipe_id: str, content_type: str = "image/png") -> str | None:
+    """Upload a generated /ask-recipes image to the MealMap (meal-plan-chef) Storage bucket
+    — the same project the RecipeVault app saves recipes in — at ask-recipes-img/{id}.png.
+
+    The object is permanent (not tied to the 30-day ask_recipes_cache TTL), so the returned
+    firebasestorage.googleapis.com URL can be stored on a saved recipe indefinitely.
+    Returns None on skip/failure.
+    """
+    if not data or not isinstance(data, (bytes, bytearray)):
+        return None
+    if len(data) > _MEAL_IMAGE_MAX_BYTES:
+        print("[ask-recipes-image] upload skipped: image too large")
+        return None
+    ct = (content_type or "image/png").split(";")[0].strip().lower()
+    ext = ".jpg" if ("jpeg" in ct or "jpg" in ct) else (".webp" if "webp" in ct else ".png")
+    try:
+        bucket = _mealmap_storage_bucket()
+    except Exception as e:
+        print(f"[ask-recipes-image] MealMap storage bucket unavailable: {e}")
+        return None
+    object_name = f"{_ASK_RECIPES_IMG_PREFIX}/{_sanitize_storage_segment(recipe_id)}{ext}"
+    blob = bucket.blob(object_name)
+    try:
+        blob.cache_control = "public, max-age=31536000"
+        blob.upload_from_string(bytes(data), content_type=ct)
+        print(f"[ask-recipes-image] uploaded to MealMap Storage: {object_name}")
+    except Exception as e:
+        print(f"[ask-recipes-image] upload failed: {e}")
+        return None
+    try:
+        blob.make_public()
+    except Exception as e:
+        print(f"[ask-recipes-image] make_public skipped (ok if Storage Rules grant read): {e}")
+    encoded_name = object_name.replace("/", "%2F")
+    return f"https://firebasestorage.googleapis.com/v0/b/{bucket.name}/o/{encoded_name}?alt=media"
+
+
 def save_recommend_meal_image_record(
     plan_id: str,
     day_index: int,

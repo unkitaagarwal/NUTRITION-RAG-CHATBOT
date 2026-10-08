@@ -14,6 +14,7 @@ from firebase_utils import (
     save_recommend_meal_image_record,
     recommend_meal_image_storage_path,
     persist_extract_recipe_image,
+    upload_ask_recipe_image_bytes,
 )
 from dotenv import load_dotenv
 import os
@@ -1292,20 +1293,24 @@ def _generate_meal_image_b64(
     fast_mode: bool = True,
     log_prefix: str = "meal-image",
     log_context: str = "",
+    model: str = "gpt-image-1",
+    size: str = "1024x1024",
+    quality: str = "low",
 ) -> str | None:
     """
     Shared meal image generation (same as /recommend-meals):
-    gpt-image-1, 1024x1024, quality=low; returns base64 for Firebase upload.
+    defaults gpt-image-1, 1024x1024, quality=low; returns base64 for Firebase upload.
+    Callers may override model/size/quality (e.g. /ask-recipes reads them from env).
     """
     ctx = f" {log_context}" if log_context else ""
     try:
         prompt = _meal_image_prompt_for_recommend(name, description, fast_mode=fast_mode)
         print(f"[{log_prefix}] generating image{ctx} prompt={prompt!r}")
         img = client.images.generate(
-            model="gpt-image-1",
+            model=model,
             prompt=prompt,
-            size="1024x1024",
-            quality="low",
+            size=size,
+            quality=quality,
             n=1,
         )
         if not (img and img.data):
@@ -10069,6 +10074,14 @@ def _customize_recompute_nutrition(recipe: dict) -> dict | None:
         return None
     if out["calories"] <= 0:
         return None  # estimator failed and filled zeros
+    # Micronutrients come from the same estimate (no extra call); same keys/units as
+    # /extract-recipe: fiber_g, sugar_g, sodium_mg, cholesterol_mg, saturated_fat_g,
+    # potassium_mg, calcium_mg, iron_mg, vitamin_a_mcg, vitamin_c_mg, vitamin_d_mcg.
+    for key in _RECIPE_MICRONUTRIENT_KEYS:
+        try:
+            out[key] = float(n.get(key) or 0)
+        except (TypeError, ValueError):
+            pass
     return out
 
 
@@ -10076,6 +10089,86 @@ from customize_recipe import create_customize_recipe_blueprint
 
 app.register_blueprint(
     create_customize_recipe_blueprint(recompute_nutrition=_customize_recompute_nutrition)
+)
+
+
+# ---------- /ask-recipes ----------
+# Endpoint lives in ask_recipes.py (auth/limits shared with customize_recipe.py). We
+# inject the same nutrition step and the meal-image generator /recommend-meals uses.
+
+# Image model settings for /ask-recipes (configurable in .env / Render).
+ASK_RECIPES_IMAGE_MODEL = (os.getenv("ASK_RECIPES_IMAGE_MODEL") or "gpt-image-1-mini").strip()
+ASK_RECIPES_IMAGE_SIZE = (os.getenv("ASK_RECIPES_IMAGE_SIZE") or "1024x1024").strip()
+ASK_RECIPES_IMAGE_QUALITY = (os.getenv("ASK_RECIPES_IMAGE_QUALITY") or "low").strip()
+# Shrink before upload: ~1-2 MB PNG -> ~100-150 KB WebP/JPEG; faster cards, less storage/egress.
+ASK_RECIPES_IMAGE_MAX_PX = int(os.getenv("ASK_RECIPES_IMAGE_MAX_PX", "768"))          # 0 = keep original
+ASK_RECIPES_IMAGE_FORMAT = (os.getenv("ASK_RECIPES_IMAGE_FORMAT") or "webp").strip().lower()  # webp | jpeg
+ASK_RECIPES_IMAGE_ENCODE_QUALITY = int(os.getenv("ASK_RECIPES_IMAGE_ENCODE_QUALITY", "80"))
+
+
+def _shrink_image_bytes(raw: bytes, max_px: int, fmt: str, quality: int) -> tuple[bytes, str]:
+    """Resize so the longest side is <= max_px and re-encode as WebP or JPEG.
+    Returns (bytes, content_type); falls back to the original PNG on any problem."""
+    if max_px <= 0:
+        return raw, "image/png"
+    try:
+        from PIL import Image
+        img = Image.open(io.BytesIO(raw))
+        img.load()
+        if img.mode not in ("RGB", "L"):
+            img = img.convert("RGB")
+        if max(img.size) > max_px:
+            img.thumbnail((max_px, max_px), Image.LANCZOS)
+        out = io.BytesIO()
+        if fmt == "jpeg" or fmt == "jpg":
+            img.save(out, "JPEG", quality=quality, optimize=True, progressive=True)
+            ctype = "image/jpeg"
+        else:
+            img.save(out, "WEBP", quality=quality, method=4)
+            ctype = "image/webp"
+        data = out.getvalue()
+        if not data or len(data) >= len(raw):
+            return raw, "image/png"
+        return data, ctype
+    except Exception as e:
+        print(f"[ask-recipes-image] resize failed, uploading original PNG: {type(e).__name__}: {e}")
+        return raw, "image/png"
+
+
+def _ask_recipes_generate_image(recipe_id: str, recipe: dict) -> str | None:
+    """gpt-image-1 (low quality) -> MealMap (meal-plan-chef) Storage ask-recipes-img/{id}.png.
+    Returns the permanent Firebase Storage URL, or None."""
+    b64 = _generate_meal_image_b64(
+        recipe.get("title") or "",
+        recipe.get("description") or "",
+        fast_mode=True,
+        log_prefix="ask-recipes-image",
+        log_context=recipe_id,
+        model=ASK_RECIPES_IMAGE_MODEL,
+        size=ASK_RECIPES_IMAGE_SIZE,
+        quality=ASK_RECIPES_IMAGE_QUALITY,
+    )
+    if not b64:
+        return None
+    try:
+        raw = base64.b64decode(b64)
+    except Exception as e:
+        print(f"[ask-recipes-image] b64 decode failed for {recipe_id}: {e}")
+        return None
+    data, ctype = _shrink_image_bytes(
+        raw, ASK_RECIPES_IMAGE_MAX_PX, ASK_RECIPES_IMAGE_FORMAT, ASK_RECIPES_IMAGE_ENCODE_QUALITY
+    )
+    print(f"[ask-recipes-image] {recipe_id}: {len(raw) // 1024} KB PNG -> {len(data) // 1024} KB {ctype}")
+    return upload_ask_recipe_image_bytes(data, recipe_id, ctype)
+
+
+from ask_recipes import create_ask_recipes_blueprint
+
+app.register_blueprint(
+    create_ask_recipes_blueprint(
+        recompute_nutrition=_customize_recompute_nutrition,
+        generate_image=_ask_recipes_generate_image,
+    )
 )
 
 

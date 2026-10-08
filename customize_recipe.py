@@ -73,7 +73,10 @@ CLAUDE_MAX_TOKENS = _env_int("CUSTOMIZE_CLAUDE_MAX_TOKENS", 3000)  # edits only,
 USERS_COLLECTION = os.getenv("CUSTOMIZE_USERS_COLLECTION", "meal_plan_chef_users")
 
 ALLOWED_MODES = {"preset", "chat"}
+# Spec presets (reference only): chips can change in the app, so any well-formed id is accepted.
 ALLOWED_PRESETS = {"spicier", "more_protein", "healthier", "dairy_free", "under_20", "kid_friendly"}
+import re as _re
+_PRESET_ID_RE = _re.compile(r"^[A-Za-z0-9_-]{1,50}$")
 ALLOWED_SOURCES = {"recipe_detail", "recipe_ready", "share_extension"}
 ALLOWED_CLIENTS = {"ios-app", "android-app", "ios-share-extension"}
 ALLOWED_STATUSES = {"updated", "clarify", "declined"}
@@ -93,6 +96,12 @@ SYSTEM_PROMPT = (
     "Write assistantMessage in a friendly tone: say what changed in 1-2 sentences, "
     "then ask whether they'd like to see a preview."
     # Output-format guidance (not part of the product prompt above):
+    "\n\nPrefer applying the change. Use status clarify ONLY when the request cannot be acted "
+    "on at all (e.g. 'change it', 'make it better', 'hmm'). Requests that name a goal, diet, "
+    "ingredient, audience, flavour, time or amount (e.g. 'make it toddler-friendly', 'less salty', "
+    "'add more vegetables', 'lower calorie', 'no onions') are clear enough: make sensible "
+    "assumptions, apply the change, and say briefly what you assumed in assistantMessage. "
+    "If the history shows you already asked a question, apply the change using the user's answer."
     "\n\nRespond only with JSON matching the required schema. "
     "assistantMessage is plain text (no markdown), at most about 600 characters. "
     "Return ONLY what changes, never the whole recipe. Ingredients and steps are numbered "
@@ -244,14 +253,15 @@ def _default_claude_call(*, model: str, system: str, messages: list,
 
 # ── Usage / premium (Firestore) ───────────────────────────────────────────────
 
-def _usage_doc_id(now: datetime | None = None) -> str:
+def _usage_doc_id(now: datetime | None = None, prefix: str = "customize") -> str:
     now = now or datetime.now(ZoneInfo(USAGE_TZ))
-    return f"customize_{now.strftime('%Y-%m-%d')}"
+    return f"{prefix}_{now.strftime('%Y-%m-%d')}"
 
 
-def _usage_ref(db, uid: str):
+def _usage_ref(db, uid: str, prefix: str = "customize"):
+    """meal_plan_chef_users/{uid}/usage/{prefix}_{yyyy-mm-dd} (shared with /ask-recipes)."""
     return (db.collection(USERS_COLLECTION).document(uid)
-              .collection("usage").document(_usage_doc_id()))
+              .collection("usage").document(_usage_doc_id(prefix=prefix)))
 
 
 def _is_premium(db, uid: str) -> bool:
@@ -261,8 +271,8 @@ def _is_premium(db, uid: str) -> bool:
     return data.get("is_premium_user") is True
 
 
-def _read_usage_count(db, uid: str) -> int:
-    snap = _usage_ref(db, uid).get()
+def _read_usage_count(db, uid: str, prefix: str = "customize") -> int:
+    snap = _usage_ref(db, uid, prefix).get()
     if not snap.exists:
         return 0
     try:
@@ -271,11 +281,11 @@ def _read_usage_count(db, uid: str) -> int:
         return 0
 
 
-def _increment_usage(db, uid: str, request_id: str) -> int:
+def _increment_usage(db, uid: str, request_id: str, prefix: str = "customize") -> int:
     """Increment today's counter once per X-Request-Id. Returns the new count."""
     from google.cloud import firestore as gcf
 
-    ref = _usage_ref(db, uid)
+    ref = _usage_ref(db, uid, prefix)
 
     @gcf.transactional
     def _txn(transaction):
@@ -331,8 +341,9 @@ def _validate_body(raw: bytes) -> dict:
     mode = body.get("mode")
     if mode not in ALLOWED_MODES:
         bad("mode must be 'preset' or 'chat'.")
-    if mode == "preset" and body.get("presetId") not in ALLOWED_PRESETS:
-        bad("presetId is required for preset mode and must be one of: " + ", ".join(sorted(ALLOWED_PRESETS)) + ".")
+    pid = body.get("presetId")
+    if mode == "preset" and (not _is_str(pid) or not _PRESET_ID_RE.match(pid)):
+        bad("presetId is required for preset mode (letters, numbers, _ or -, max 50).")
     if body.get("presetId") is not None and not _is_str(body.get("presetId")):
         bad("presetId must be a string.")
 
@@ -342,8 +353,11 @@ def _validate_body(raw: bytes) -> dict:
     if len(prompt) > MAX_PROMPT_CHARS:
         bad(f"prompt must be at most {MAX_PROMPT_CHARS} characters.")
 
-    if body.get("source") not in ALLOWED_SOURCES:
-        bad("source must be recipe_detail, recipe_ready or share_extension.")
+    # source is for analytics only, and new entry points (e.g. Ask RecipeVault results) appear
+    # without a server change, so accept any well-formed value.
+    src = body.get("source")
+    if not _is_str(src) or not _PRESET_ID_RE.match(src):
+        bad("source is required (letters, numbers, _ or -, max 50).")
     if body.get("recipeId") is not None and not _is_str(body.get("recipeId")):
         bad("recipeId must be a string or null.")
 
@@ -414,10 +428,12 @@ def _build_user_content(body: dict) -> str:
     """User content: recipe as JSON, then history, then prompt (spec step 4)."""
     history_lines = [f"{t['role']}: {t['text']}" for t in body["history"]]
     history_text = "\n".join(history_lines) if history_lines else "(none)"
+    preset_note = ("\n(This is a preset chip: always apply the change, never clarify.)"
+                   if body.get("mode") == "preset" else "")
     return (
         "<recipe>\n" + json.dumps(_numbered_recipe(body["recipe"]), ensure_ascii=False) + "\n</recipe>\n\n"
         "<history>\n" + history_text + "\n</history>\n\n"
-        "<request>\n" + body["prompt"].strip() + "\n</request>"
+        "<request>\n" + body["prompt"].strip() + preset_note + "\n</request>"
     )
 
 
@@ -547,6 +563,15 @@ def _normalize_model_output(out: dict, original_recipe: dict) -> dict:
         raise ApiError(502, "model_error", "The model reported an update but changed nothing.")
     recipe["ingredients"] = ingredients[:MAX_INGREDIENTS]
     recipe["steps"] = [{**st, "order": i + 1} for i, st in enumerate(steps[:MAX_STEPS])]
+    # Recipes from /ask-recipes carry derived fields; keep them in sync with the edits.
+    if any(isinstance(i, dict) and "display" in i for i in recipe["ingredients"]):
+        for ing in recipe["ingredients"]:
+            ing.setdefault("note", "")
+            text = " ".join(str(ing.get(k) or "").strip() for k in ("amount", "unit", "name")
+                            if str(ing.get(k) or "").strip())
+            ing["display"] = f"{text} ({ing['note']})" if ing.get("note") else text
+    if "totalMinutes" in recipe:
+        recipe["totalMinutes"] = int(recipe.get("prepMinutes") or 0) + int(recipe.get("cookMinutes") or 0)
 
     changes = []
     for ch in out.get("changes") or []:
@@ -567,6 +592,15 @@ def _normalize_model_output(out: dict, original_recipe: dict) -> dict:
             "_model_nutrition": model_nutrition}
 
 
+# Per-serving micronutrients passed through from the nutrition step (same keys/units as
+# /extract-recipe; the suffix is the unit).
+MICRONUTRIENT_KEYS = (
+    "fiber_g", "sugar_g", "sodium_mg", "cholesterol_mg", "saturated_fat_g",
+    "potassium_mg", "calcium_mg", "iron_mg",
+    "vitamin_a_mcg", "vitamin_c_mg", "vitamin_d_mcg",
+)
+
+
 def _final_nutrition(recomputed: dict | None, model_nutrition: dict | None, original: dict) -> dict:
     """Prefer the server recompute; fall back to Claude's estimate, then the original."""
     for candidate in (recomputed, model_nutrition):
@@ -579,7 +613,8 @@ def _final_nutrition(recomputed: dict | None, model_nutrition: dict | None, orig
             "fat": _num(candidate.get("fat")),
         }
         if all(v is not None for v in vals.values()) and vals["calories"] > 0:
-            return {"basis": "per_serving", **vals}
+            micros = {k: _num(candidate.get(k)) for k in MICRONUTRIENT_KEYS}
+            return {"basis": "per_serving", **vals, **{k: v for k, v in micros.items() if v is not None}}
     out = dict(original or {})
     out["basis"] = "per_serving"
     return out
@@ -800,6 +835,8 @@ def create_customize_recipe_blueprint(
 
         except ApiError as err:
             log["error"] = err.code
+            if err.http == 400:
+                log["errorMessage"] = err.message  # which field failed validation
             return respond(_error_body(request_id, err), err.http)
         except Exception as e:
             log["error"] = "internal_error"

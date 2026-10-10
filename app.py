@@ -479,31 +479,111 @@ def _blocked_error(exc: Exception) -> bool:
             # TikTok anti-bot challenge served to datacenter IPs — yt-dlp's
             # challenge solver fails on it (yt-dlp issue #17403):
             "unexpected response from webpage request",
+            # Instagram served an empty/HTML body to the logged-in API call
+            # (stale or flagged session cookies) — newer yt-dlp makes this fatal:
+            "failed to parse json",
         )
     )
 
 
-def _ydl_extract(ydl_opts: dict, video_url: str, *, download: bool):
-    """Run yt-dlp extract_info with direct-first / proxy-fallback.
+# Instagram errors that mean "the session cookies are stale/flagged". Newer
+# yt-dlp (> 2026.06.09) makes the logged-in /api/v1/media/<id>/info/ call FATAL
+# and only falls back to logged-out extraction on a login *redirect*. A dead
+# session usually gets an empty 200 body instead → "Failed to parse JSON".
+# Retrying WITHOUT cookies lets yt-dlp use its logged-out path (works for
+# public reels/posts).
+_IG_STALE_COOKIE_MARKERS = (
+    "failed to parse json",
+    "cookies are no longer valid",
+    "empty media response",
+    "rate-limit reached or login required",
+)
 
-    1st attempt: direct connection (proxy-free; YouTube uses the android_vr
-    client). If the site blocks the host IP (common on cloud egress IPs) and a
-    fallback proxy is configured for that site (YT_PROXY for YouTube,
-    SOCIAL_PROXY for FB/IG/TikTok), retry ONCE through the proxy. This keeps
-    proxy bandwidth (and cost) at zero unless the direct path is blocked.
+
+def _is_instagram_url(url: str) -> bool:
+    host = (urlparse(url or "").hostname or "").lower()
+    return host == "instagram.com" or host.endswith(".instagram.com")
+
+
+def _ig_stale_cookie_error(exc: Exception) -> bool:
+    s = str(exc).lower()
+    return any(m in s for m in _IG_STALE_COOKIE_MARKERS)
+
+
+def _proxy_config_error(exc: Exception) -> bool:
+    """Proxy itself is broken (bad credentials / plan expired / unreachable)."""
+    s = str(exc).lower()
+    return (
+        "407 proxy authentication required" in s
+        or "unable to connect to proxy" in s
+        or "tunnel connection failed" in s
+    )
+
+
+# When the proxy returns 407 etc., stop trying it for a while instead of
+# paying a doomed retry on every metadata + download call.
+_PROXY_DISABLED_UNTIL = 0.0
+_PROXY_DISABLE_SECONDS = int(os.getenv("PROXY_DISABLE_SECONDS", "600"))
+
+
+def _ydl_extract(ydl_opts: dict, video_url: str, *, download: bool):
+    """Run yt-dlp extract_info with direct-first / cookie-less / proxy fallback.
+
+    1. Direct connection with the given options (cookies if configured).
+    2. Instagram only: if the error looks like stale/flagged session cookies,
+       retry ONCE without cookies (yt-dlp's logged-out path).
+    3. If the site blocks the host IP and a fallback proxy is configured
+       (YT_PROXY for YouTube, SOCIAL_PROXY for FB/IG/TikTok), retry ONCE via
+       the proxy — unless the proxy recently failed with a config error (407).
     """
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+    global _PROXY_DISABLED_UNTIL
+
+    # Plain-text errors: no ANSI colour codes in logs / API "details".
+    ydl_opts = {**ydl_opts, "color": {"stdout": "no_color", "stderr": "no_color"}}
+
+    def _run(opts: dict):
+        with yt_dlp.YoutubeDL(opts) as ydl:
             return ydl.extract_info(video_url, download=download)
+
+    try:
+        return _run(ydl_opts)
     except Exception as e:
-        proxy = _fallback_proxy(video_url)
-        if proxy and not ydl_opts.get("proxy") and _blocked_error(e):
-            print(f"⚠️ Direct attempt blocked ({str(e)[:80]}...); retrying via proxy")
-            opts = dict(ydl_opts)
-            opts["proxy"] = proxy
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                return ydl.extract_info(video_url, download=download)
-        raise
+        last_err = e
+
+    # 2) Instagram stale-cookie → logged-out retry
+    if (
+        _is_instagram_url(video_url)
+        and ydl_opts.get("cookiefile")
+        and _ig_stale_cookie_error(last_err)
+    ):
+        print(f"🍪 Instagram cookies look stale/flagged ({str(last_err)[:80]}...); retrying without cookies")
+        no_cookie_opts = {k: v for k, v in ydl_opts.items() if k != "cookiefile"}
+        try:
+            return _run(no_cookie_opts)
+        except Exception as e2:
+            last_err = e2
+            ydl_opts = no_cookie_opts  # proxy attempt (if any) also goes cookie-less
+
+    # 3) Proxy fallback
+    proxy = _fallback_proxy(video_url)
+    if proxy and not ydl_opts.get("proxy") and _blocked_error(last_err):
+        if time.time() < _PROXY_DISABLED_UNTIL:
+            print("⚠️ Proxy fallback skipped (proxy recently failed auth/connection)")
+            raise last_err
+        print(f"⚠️ Direct attempt blocked ({str(last_err)[:80]}...); retrying via proxy")
+        try:
+            return _run({**ydl_opts, "proxy": proxy})
+        except Exception as e3:
+            if _proxy_config_error(e3):
+                _PROXY_DISABLED_UNTIL = time.time() + _PROXY_DISABLE_SECONDS
+                print(
+                    f"❌ PROXY CONFIG ERROR via {_mask_proxy_url(proxy)}: {str(e3)[:160]} "
+                    f"— disabling proxy fallback for {_PROXY_DISABLE_SECONDS}s. "
+                    "Check proxy credentials / plan / traffic quota."
+                )
+                raise last_err  # surface the real site error, not the proxy one
+            raise
+    raise last_err
 
 vector_db = Chroma(persist_directory="./vector_store", embedding_function=OpenAIEmbeddings())
 retriever = vector_db.as_retriever(search_kwargs={"k": 3})  # Reduced from 5 to 3 for faster retrieval

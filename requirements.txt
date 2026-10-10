@@ -139,7 +139,9 @@ zstandard==0.24.0
 # [curl-cffi] enables browser TLS impersonation — required by yt-dlp's TikTok
 # extractor to solve TikTok's anti-bot challenge ("Unexpected response from
 # webpage request" on datacenter IPs without it).
-yt-dlp[default,curl-cffi]>=2026.03.17
+# Pinned to the version tested with the Instagram stale-cookie fallback in
+# _ydl_extract(). Upgrade deliberately: bump, test IG/TikTok/YouTube locally, then deploy.
+yt-dlp[default,curl-cffi]==2026.8.19
 instaloader>=4.15.1
 langchain-openai
 langchain-chroma

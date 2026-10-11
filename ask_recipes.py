@@ -67,6 +67,26 @@ RESULTS_CACHE_HOURS = _env_int("ASK_RECIPES_RESULTS_CACHE_HOURS", 24)        # 0
 IMAGE_LIBRARY_COLLECTION = os.getenv("ASK_RECIPES_IMAGE_LIBRARY_COLLECTION", "ask_recipes_image_library")
 IMAGE_GIVEUP_SECONDS = _env_int("ASK_RECIPES_IMAGE_GIVEUP_SECONDS", 180)
 
+
+def _env_flag(name: str, default: str) -> bool:
+    return (os.getenv(name) or default).strip().lower() in ("1", "true", "yes")
+
+
+# Speed: one quick call picks the dishes, then each recipe is written by its own call in
+# parallel (latency ~ plan + one recipe instead of all recipes in sequence).
+PARALLEL_GENERATION = _env_flag("ASK_RECIPES_PARALLEL", "1")
+PLAN_MAX_TOKENS = _env_int("ASK_RECIPES_PLAN_MAX_TOKENS", 900)
+# Nutrition: Claude's per-serving estimate (incl. micronutrients) by default; set 1 to also run
+# the /extract-recipe nutrition step (gpt-4o-mini) — adds 1-3 s.
+RECOMPUTE_NUTRITION = _env_flag("ASK_RECIPES_RECOMPUTE_NUTRITION", "0")
+# Prefetch: after returning results, generate the next "Show more like these" batch in the
+# background so that tap is answered instantly.
+PREFETCH_ENABLED = _env_flag("ASK_RECIPES_PREFETCH", "1")
+PREFETCH_COLLECTION = os.getenv("ASK_RECIPES_PREFETCH_COLLECTION", "ask_recipes_prefetch")
+PREFETCH_MINUTES = _env_int("ASK_RECIPES_PREFETCH_MINUTES", 30)
+PREFETCH_TIMEOUT_SECONDS = _env_int("ASK_RECIPES_PREFETCH_TIMEOUT_SECONDS", 60)
+MORE_PROMPT = "Show more like these"
+
 CACHE_COLLECTION = os.getenv("ASK_RECIPES_CACHE_COLLECTION", "ask_recipes_cache")
 CACHE_TTL_DAYS = _env_int("ASK_RECIPES_CACHE_TTL_DAYS", 30)
 IMAGES_ENABLED = (os.getenv("ASK_RECIPES_IMAGES") or "1").strip().lower() in ("1", "true", "yes")
@@ -151,11 +171,14 @@ _RECIPE_SCHEMA = {
         "steps": {"type": "array", "items": _STEP_SCHEMA},
         "nutrition": {
             "type": "object",
+            "description": "Per-serving estimate. Units: grams for protein/carbs/fat and *_g, "
+                           "milligrams for *_mg, micrograms for *_mcg, kcal for calories.",
             "properties": {
                 "calories": {"type": "number"}, "protein": {"type": "number"},
                 "carbs": {"type": "number"}, "fat": {"type": "number"},
+                **{k: {"type": "number"} for k in cr.MICRONUTRIENT_KEYS},
             },
-            "required": ["calories", "protein", "carbs", "fat"],
+            "required": ["calories", "protein", "carbs", "fat", *cr.MICRONUTRIENT_KEYS],
             "additionalProperties": False,
         },
     },
@@ -187,6 +210,40 @@ OUTPUT_SCHEMA = {
     "required": ["status", "assistantMessage", "recipes", "followUps"],
     "additionalProperties": False,
 }
+
+
+_FOLLOW_UPS_SCHEMA = OUTPUT_SCHEMA["properties"]["followUps"]
+# Step 1 of parallel generation: status, message, follow-ups and the dish list only.
+PLAN_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "status": {"type": "string", "enum": sorted(ALLOWED_STATUSES)},
+        "assistantMessage": {"type": "string"},
+        "dishes": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {"title": {"type": "string"}, "angle": {"type": "string"}},
+                "required": ["title", "angle"],
+                "additionalProperties": False,
+            },
+        },
+        "followUps": _FOLLOW_UPS_SCHEMA,
+    },
+    "required": ["status", "assistantMessage", "dishes", "followUps"],
+    "additionalProperties": False,
+}
+PLAN_SYSTEM_PROMPT = SYSTEM_PROMPT + (
+    "\n\nTHIS STEP: choose the dishes only. Return dishes with exactly count distinct entries, each "
+    "a recipe title and a one-line angle (main ingredients, cuisine, why it fits the request and "
+    "preferences). Do not write ingredients or steps; there is no recipes field in this step. "
+    "When status is not results, return dishes as []."
+)
+RECIPE_SYSTEM_PROMPT = SYSTEM_PROMPT + (
+    "\n\nTHIS STEP: write ONE complete recipe — the dish named at the end of the last message — "
+    "as a single recipe object matching the schema. Keep the given title. Include the full "
+    "per-serving nutrition estimate, micronutrients included."
+)
 
 
 # ── Validation ────────────────────────────────────────────────────────────────
@@ -577,6 +634,29 @@ def _backfill_saved_recipe_image(db, uid: str, recipe_id: str, url: str) -> int:
     return updated
 
 
+def _prefs_key(body: dict) -> str:
+    import hashlib
+    return hashlib.sha256(json.dumps(body["preferences"], sort_keys=True).encode()).hexdigest()[:16]
+
+
+def _is_more_prompt(prompt: str) -> bool:
+    return " ".join((prompt or "").lower().split()).rstrip(".!") == MORE_PROMPT.lower()
+
+
+def _prefetch_get(db, conversation_id: str) -> dict | None:
+    snap = db.collection(PREFETCH_COLLECTION).document(conversation_id).get()
+    return (snap.to_dict() or None) if snap.exists else None
+
+
+def _prefetch_put(db, conversation_id: str, entry: dict) -> None:
+    db.collection(PREFETCH_COLLECTION).document(conversation_id).set({
+        **entry, "expireAt": datetime.now(timezone.utc) + timedelta(minutes=PREFETCH_MINUTES)})
+
+
+def _prefetch_delete(db, conversation_id: str) -> None:
+    db.collection(PREFETCH_COLLECTION).document(conversation_id).delete()
+
+
 def _default_suggestions(db) -> list[dict]:
     try:
         col, doc = SUGGESTIONS_CONFIG_DOC.split("/", 1)
@@ -610,12 +690,26 @@ def create_ask_recipes_blueprint(
     results_cache_put: Callable[[Any, str, dict], None] = _results_cache_put,
     image_library_lookup: Callable[[Any, list], dict] = _image_library_lookup,
     image_library_store: Callable[[Any, str, str, str], None] = _image_library_store,
+    prefetch_get: Callable[[Any, str], dict | None] = _prefetch_get,
+    prefetch_put: Callable[[Any, str, dict], None] = _prefetch_put,
+    prefetch_delete: Callable[[Any, str], None] = _prefetch_delete,
     timeout_seconds: float | None = None,
     images_enabled: bool | None = None,
+    parallel: bool | None = None,
+    prefetch: bool | None = None,
+    recompute: bool | None = None,
 ) -> Blueprint:
     bp = Blueprint("ask_recipes", __name__)
     budget = TIMEOUT_SECONDS if timeout_seconds is None else timeout_seconds
     images_on = (IMAGES_ENABLED if images_enabled is None else images_enabled) and generate_image is not None
+    parallel_on = PARALLEL_GENERATION if parallel is None else parallel
+    prefetch_on = PREFETCH_ENABLED if prefetch is None else prefetch
+    recompute_on = (RECOMPUTE_NUTRITION if recompute is None else recompute) and recompute_nutrition is not None
+    gen_pool = ThreadPoolExecutor(max_workers=_env_int("ASK_RECIPES_GEN_WORKERS", 15),
+                                  thread_name_prefix="ask-gen")
+    prefetch_pool = ThreadPoolExecutor(max_workers=_env_int("ASK_RECIPES_PREFETCH_WORKERS", 4),
+                                       thread_name_prefix="ask-prefetch")
+    prefetch_running: dict[str, Future] = {}  # conversationId -> background job on this worker
 
     executor = ThreadPoolExecutor(max_workers=_env_int("ASK_RECIPES_WORKERS", 8), thread_name_prefix="ask-recipes")
     nutrition_pool = ThreadPoolExecutor(max_workers=_env_int("ASK_RECIPES_NUTRITION_WORKERS", 10),
@@ -696,41 +790,82 @@ def create_ask_recipes_blueprint(
             except Exception as e:
                 print(f"[ask-recipes] saved-recipe image backfill failed for {recipe_id}: {type(e).__name__}: {e}")
 
-    def _run_model_and_nutrition(body: dict, messages: list, deadline: float) -> dict:
-        t0 = time.monotonic()
+    def _call(system: str, messages: list, schema: dict, max_tokens: int, deadline: float):
         resp = claude_call(
-            model=CLAUDE_MODEL,
-            system=SYSTEM_PROMPT,
-            messages=messages,
-            output_config={"format": {"type": "json_schema", "schema": OUTPUT_SCHEMA}},
-            max_tokens=_max_tokens(body["count"]),
-            timeout=max(1.0, deadline - t0),
+            model=CLAUDE_MODEL, system=system, messages=messages,
+            output_config={"format": {"type": "json_schema", "schema": schema}},
+            max_tokens=max_tokens, timeout=max(1.0, deadline - time.monotonic()),
         )
-        claude_ms = int((time.monotonic() - t0) * 1000)
         usage = getattr(resp, "usage", None)
-        tokens = {"input": getattr(usage, "input_tokens", None), "output": getattr(usage, "output_tokens", None)}
+        tokens = (getattr(usage, "input_tokens", None) or 0, getattr(usage, "output_tokens", None) or 0)
         if getattr(resp, "stop_reason", None) == "max_tokens":
             raise ApiError(502, "model_error", "The model response was cut off.")
-        out = _parse_model_json(resp)
+        return _parse_model_json(resp), tokens
 
+    def _head(out: dict) -> tuple[str, str]:
         status = out.get("status")
         if status not in ALLOWED_STATUSES:
             raise ApiError(502, "model_error", "The model returned an invalid status.")
         message = out.get("assistantMessage")
         if not _is_str(message) or not message.strip():
             raise ApiError(502, "model_error", "The model returned an empty message.")
-        result = {"status": status, "assistantMessage": message.strip()[:MAX_ASSISTANT_MESSAGE_CHARS],
-                  "recipes": [], "followUps": [], "_tokens": tokens,
+        return status, message.strip()[:MAX_ASSISTANT_MESSAGE_CHARS]
+
+    def _generate_parallel(body: dict, messages: list, deadline: float):
+        """Plan the dishes (one small call), then write each recipe in its own parallel call."""
+        plan, (tin, tout) = _call(PLAN_SYSTEM_PROMPT, messages, PLAN_SCHEMA,
+                                  PLAN_MAX_TOKENS, deadline)
+        status, message = _head(plan)
+        if status != "results":
+            return status, message, [], [], (tin, tout)
+        dishes = [d for d in (plan.get("dishes") or [])
+                  if isinstance(d, dict) and _is_str(d.get("title")) and d["title"].strip()][:body["count"]]
+        if not dishes:
+            raise ApiError(502, "model_error", "The model returned no dishes.")
+
+        def write(dish):
+            others = "; ".join(d["title"] for d in dishes if d is not dish) or "none"
+            msgs = [dict(m) for m in messages]
+            msgs[-1]["content"] += (f"\n\nWrite the full recipe for: {dish['title'].strip()} — "
+                                    f"{str(dish.get('angle') or '').strip()}\n"
+                                    f"Other dishes in this set (do not duplicate them): {others}")
+            return _call(RECIPE_SYSTEM_PROMPT, msgs, _RECIPE_SCHEMA, TOKENS_PER_RECIPE, deadline)
+
+        futures = [gen_pool.submit(write, d) for d in dishes]
+        raws = []
+        for f in futures:
+            try:
+                raw, (i, o) = f.result(timeout=max(0.5, deadline - time.monotonic()))
+                raws.append(raw)
+                tin, tout = tin + i, tout + o
+            except Exception as e:  # one failed recipe shouldn't sink the others
+                if cr._is_timeout_exception(e) or isinstance(e, FutureTimeoutError):
+                    print(f"[ask-recipes] a recipe call timed out: {type(e).__name__}")
+                else:
+                    print(f"[ask-recipes] a recipe call failed: {type(e).__name__}: {e}")
+        return status, message, raws, plan.get("followUps"), (tin, tout)
+
+    def _run_model_and_nutrition(body: dict, messages: list, deadline: float) -> dict:
+        t0 = time.monotonic()
+        if parallel_on and body["count"] > 1:
+            status, message, raws, follow_ups, (tin, tout) = _generate_parallel(body, messages, deadline)
+        else:
+            out, (tin, tout) = _call(SYSTEM_PROMPT, messages, OUTPUT_SCHEMA, _max_tokens(body["count"]), deadline)
+            status, message = _head(out)
+            raws, follow_ups = out.get("recipes") or [], out.get("followUps")
+        claude_ms = int((time.monotonic() - t0) * 1000)
+        result = {"status": status, "assistantMessage": message, "recipes": [], "followUps": [],
+                  "_tokens": {"input": tin, "output": tout},
                   "_timings": {"claudeMs": claude_ms, "nutritionMs": 0}, "_dropped": 0}
         if status != "results":
             return result
 
         servings = body["preferences"]["servings"]
         allergy_terms = _allergy_terms(body["preferences"]["allergies"])
-        recipes, dropped = [], 0
-        for raw in out.get("recipes") or []:
+        recipes, dropped, seen = [], 0, set()
+        for raw in raws:
             r = _normalize_recipe(raw, servings)
-            if r is None:
+            if r is None or _slug(r["title"]) in seen:
                 dropped += 1
                 continue
             names = " | ".join(i["name"].lower() + " " + i["note"].lower() for i in r["ingredients"])
@@ -738,6 +873,7 @@ def create_ask_recipes_blueprint(
                 print(f"[ask-recipes] dropped recipe containing an allergen: {r['title']!r}")
                 dropped += 1
                 continue
+            seen.add(_slug(r["title"]))
             recipes.append(r)
             if len(recipes) == body["count"]:
                 break
@@ -745,10 +881,10 @@ def create_ask_recipes_blueprint(
             raise ApiError(502, "model_error", "The model returned no usable recipes.")
         result["_dropped"] = dropped
 
-        # Step 6: nutrition for every recipe, in parallel.
+        # Step 6: nutrition. Default: Claude's estimate (macros + micronutrients), no extra call.
         t1 = time.monotonic()
         futures = {}
-        if recompute_nutrition is not None:
+        if recompute_on:
             for idx, r in enumerate(recipes):
                 futures[idx] = nutrition_pool.submit(recompute_nutrition, r)
         for idx, r in enumerate(recipes):
@@ -761,8 +897,72 @@ def create_ask_recipes_blueprint(
             r["nutrition"] = cr._final_nutrition(recomputed, r.pop("_model_nutrition"), {})
         result["_timings"]["nutritionMs"] = int((time.monotonic() - t1) * 1000)
         result["recipes"] = recipes
-        result["followUps"] = _normalize_follow_ups(out.get("followUps"))
+        result["followUps"] = _normalize_follow_ups(follow_ups)
         return result
+
+    def _start_prefetch(db, uid: str, conversation_id: str, body: dict, shown: list[dict],
+                        message: str, titles: dict[str, str]) -> None:
+        """Generate the next "Show more like these" batch in the background."""
+        new_ids = [r["id"] for r in shown]
+        next_body = {
+            "mode": "follow_up", "suggestionId": None, "prompt": MORE_PROMPT,
+            "conversationId": conversation_id,
+            "history": (body["history"] + [
+                {"role": "user", "text": body["prompt"], "recipeIds": []},
+                {"role": "assistant", "text": message, "recipeIds": new_ids},
+            ])[-MAX_HISTORY:],
+            "excludeRecipeIds": (body["excludeRecipeIds"] + new_ids)[-MAX_EXCLUDE:],
+            "count": body["count"], "preferences": body["preferences"],
+        }
+        all_titles = {**titles, **{r["id"]: r["title"] for r in shown}}
+        base = {"uid": uid, "basedOn": new_ids, "count": body["count"], "prefsKey": _prefs_key(body)}
+        _safe(prefetch_put, db, conversation_id, {**base, "state": "generating"})
+
+        def run():
+            started = time.monotonic()
+            try:
+                res = _run_model_and_nutrition(next_body, _build_messages(next_body, all_titles),
+                                               started + PREFETCH_TIMEOUT_SECONDS)
+                tok = res.pop("_tokens", {}) or {}
+                res.pop("_timings", None)
+                res.pop("_dropped", None)
+                if res["status"] == "results":
+                    prefetch_put(db, conversation_id, {**base, "state": "ready", "result": res})
+                    print(f"[ask-recipes] prefetched {len(res['recipes'])} recipe(s) for {conversation_id} "
+                          f"in {int((time.monotonic() - started) * 1000)} ms, tokens {tok}")
+                else:
+                    _safe(prefetch_delete, db, conversation_id)
+            except Exception as e:
+                print(f"[ask-recipes] prefetch failed for {conversation_id}: {type(e).__name__}: {e}")
+                _safe(prefetch_delete, db, conversation_id)
+            finally:
+                prefetch_running.pop(conversation_id, None)
+
+        prefetch_running[conversation_id] = prefetch_pool.submit(run)
+
+    def _take_prefetch(db, uid: str, body: dict, deadline: float) -> dict | None:
+        """Return a ready prefetched batch for this "Show more" tap, waiting briefly if it is
+        still being generated (on this worker or another)."""
+        conv = body["conversationId"]
+        wait_until = min(time.monotonic() + 25, deadline - 5)
+        fut = prefetch_running.get(conv)
+        if fut is not None and not fut.done():
+            try:
+                fut.result(timeout=max(0.0, wait_until - time.monotonic()))
+            except Exception:
+                pass
+        entry = _safe(prefetch_get, db, conv)
+        while entry and entry.get("state") == "generating" and time.monotonic() < wait_until:
+            time.sleep(0.5)
+            entry = _safe(prefetch_get, db, conv)
+        if not entry or entry.get("state") != "ready" or entry.get("uid") != uid:
+            return None
+        if (entry.get("count") != body["count"] or entry.get("prefsKey") != _prefs_key(body)
+                or not set(entry.get("basedOn") or []) <= set(body["excludeRecipeIds"])):
+            return None
+        _safe(prefetch_delete, db, conv)
+        res = entry.get("result") or {}
+        return res if res.get("recipes") else None
 
     @bp.route("/ask-recipes", methods=["POST"])
     def ask_recipes():
@@ -849,6 +1049,17 @@ def create_ask_recipes_blueprint(
                 timings["resultsCacheMs"] = int((time.monotonic() - t) * 1000)
             log["cacheHit"] = bool(cached)
 
+            # "Show more like these" already generated in the background? Serve it.
+            prefetched = None
+            if (prefetch_on and not cached and body["mode"] == "follow_up" and body["conversationId"]
+                    and _is_more_prompt(body["prompt"])):
+                t = time.monotonic()
+                prefetched = _take_prefetch(db, uid, body, deadline)
+                timings["prefetchWaitMs"] = int((time.monotonic() - t) * 1000)
+            log["prefetchHit"] = bool(prefetched)
+            if prefetched:
+                cached = prefetched
+
             # 5 + 6. Claude, then nutrition (within the 45 s budget)
             log["model"] = CLAUDE_MODEL
             if cached:
@@ -928,6 +1139,15 @@ def create_ask_recipes_blueprint(
                     print(f"[ask-recipes] usage increment failed: {type(e).__name__}: {e}")
                     used += 1
                 timings["usageWriteMs"] = int((time.monotonic() - t) * 1000)
+
+            # Prepare the next "Show more like these" batch while the user reads these (only if
+            # they still have a use left today, so we don't pay for a batch they can't open).
+            if prefetch_on and result["status"] == "results" and recipes and used < limit:
+                try:
+                    _start_prefetch(db, uid, conversation_id, body, recipes, result["assistantMessage"], titles)
+                    log["prefetchStarted"] = True
+                except Exception as e:
+                    print(f"[ask-recipes] could not start prefetch: {type(e).__name__}: {e}")
 
             payload = {
                 "requestId": request_id,

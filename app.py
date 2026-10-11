@@ -7154,9 +7154,15 @@ def _download_video_to_file(
     fast: bool = False,
     max_seconds: int | None = None,
     download_sections: list[str] | None = None,
+    video_only: bool = False,
 ):
     """
     Download video (not just audio) to a temp file for frame extraction.
+    video_only=True prefers a video-only (DASH) stream — enough for frame
+    extraction. Use it for YouTube vision: the combined audio+video formats
+    (e.g. itag 18) are frequently 403'd / missing for the android_vr client,
+    while adaptive streams (the same kind the audio download uses) work.
+    Do NOT use it when the caller needs audio from the file.
     Uses a single yt-dlp call (extract_info + download=True) to avoid the
     redundant separate metadata round-trip from _yt_meta().
     fast=True prefers ≤480p for quicker social-reel downloads (vision only needs rough frames).
@@ -7166,7 +7172,13 @@ def _download_video_to_file(
     """
     temp_dir = _mkdtemp()
     try:
-        if fast:
+        if video_only:
+            # Adaptive video-only first; fall back to combined formats last.
+            fmt = (
+                "bestvideo[height<=480][ext=mp4]/bestvideo[height<=480]/"
+                "bestvideo[height<=720]/best[height<=480]/best"
+            )
+        elif fast:
             fmt = "best[height<=480]/best[height<=720]/best"
         else:
             fmt = "best[height<=720]/best"
@@ -8017,7 +8029,9 @@ def _run_frame_vision_fallback(video_url: str, meta: dict) -> tuple[dict | None,
     """
     temp_dir = None
     try:
-        temp_dir, video_path, video_meta = _download_video_to_file(video_url, fast=True)
+        temp_dir, video_path, video_meta = _download_video_to_file(
+            video_url, fast=True, video_only=is_youtube_url(video_url)
+        )
         duration = video_meta.get("duration") or 0
         n_frames = _social_video_frames_for_duration(video_url, duration, meta=video_meta)
         frame_urls = _extract_frame_data_urls_from_video(
@@ -9605,6 +9619,10 @@ def extract_recipe_from_video_internal(video_url: str):
                 return
             if not video_path:
                 try:
+                    # Both must be defined for every URL type: the YouTube branch
+                    # below never sets `sections`, which raised UnboundLocalError
+                    # and silently killed the vision fallback for YouTube.
+                    sections = None
                     max_sec = None
                     if is_youtube_url(video_url):
                         duration = float(meta.get("duration") or 0)
@@ -9620,10 +9638,12 @@ def extract_recipe_from_video_internal(video_url: str):
                         fast=True,
                         max_seconds=max_sec,
                         download_sections=sections,
+                        video_only=is_youtube_url(video_url),
                     )
                     meta = _merge_video_download_meta(video_url, meta, dl_meta)
                     print(f"🎬 Vision video ready in {time.time() - t_vdl:.2f}s")
                 except Exception as e:
+                    print(f"⚠️ Vision fallback download failed: {type(e).__name__}: {str(e)[:300]}")
                     vision_result["error"] = str(e)
                     vision_result["done"] = True
                     return
@@ -9635,6 +9655,7 @@ def extract_recipe_from_video_internal(video_url: str):
                 vision_result["source"] = source
                 vision_result["method"] = method
             except Exception as e:
+                print(f"⚠️ Vision fallback failed: {type(e).__name__}: {str(e)[:300]}")
                 vision_result["error"] = str(e)
             vision_result["done"] = True
 
@@ -9855,6 +9876,7 @@ def extract_recipe_from_video_internal(video_url: str):
                 "error": "Failed to extract recipe from video",
                 "user_message": "We couldn't extract a recipe from this link. Please try another or add the recipe manually.",
                 "message": "Frame+vision extraction failed.",
+                "details": vision_result.get("error"),
             }), 500
 
         transcript_text = ""
@@ -9994,6 +10016,7 @@ def extract_recipe_from_video_internal(video_url: str):
                 "error": "Failed to extract recipe from video",
                 "user_message": "We couldn't extract a recipe from this link. Please try another or add the recipe manually.",
                 "message": "No usable transcript and frame+vision fallback failed.",
+                "details": vision_result.get("error"),
             }), 500
 
         # 4) LLM extraction from transcript (chunking + merge)

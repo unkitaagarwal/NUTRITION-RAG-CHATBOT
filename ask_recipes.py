@@ -76,9 +76,19 @@ def _env_flag(name: str, default: str) -> bool:
 # parallel (latency ~ plan + one recipe instead of all recipes in sequence).
 PARALLEL_GENERATION = _env_flag("ASK_RECIPES_PARALLEL", "1")
 PLAN_MAX_TOKENS = _env_int("ASK_RECIPES_PLAN_MAX_TOKENS", 900)
-# Nutrition: Claude's per-serving estimate (incl. micronutrients) by default; set 1 to also run
-# the /extract-recipe nutrition step (gpt-4o-mini) — adds 1-3 s.
+# Nutrition mode (ASK_RECIPES_NUTRITION_MODE):
+#   background (default) — respond with Claude's estimate + nutritionStatus "pending", then run the
+#                          /extract-recipe nutrition step (gpt-4o-mini) in the background; the app
+#                          polls GET /ask-recipes/nutrition/{id} (like images). No added latency.
+#   sync                 — run that step before responding (+1-3 s). (= old RECOMPUTE_NUTRITION=1)
+#   claude               — Claude's estimate only, no extra step.
 RECOMPUTE_NUTRITION = _env_flag("ASK_RECIPES_RECOMPUTE_NUTRITION", "0")
+NUTRITION_MODE = (os.getenv("ASK_RECIPES_NUTRITION_MODE")
+                  or ("sync" if RECOMPUTE_NUTRITION else "background")).strip().lower()
+if NUTRITION_MODE not in ("background", "sync", "claude"):
+    NUTRITION_MODE = "background"
+NUTRITION_GIVEUP_SECONDS = _env_int("ASK_RECIPES_NUTRITION_GIVEUP_SECONDS", 120)
+SAVED_NUTRITION_FIELD = os.getenv("ASK_RECIPES_SAVED_NUTRITION_FIELD", "nutrition")
 # Prefetch: after returning results, generate the next "Show more like these" batch in the
 # background so that tap is answered instantly.
 PREFETCH_ENABLED = _env_flag("ASK_RECIPES_PREFETCH", "1")
@@ -243,6 +253,35 @@ RECIPE_SYSTEM_PROMPT = SYSTEM_PROMPT + (
     "\n\nTHIS STEP: write ONE complete recipe — the dish named at the end of the last message — "
     "as a single recipe object matching the schema. Keep the given title. Include the full "
     "per-serving nutrition estimate, micronutrients included."
+)
+
+# Background-nutrition mode: Claude doesn't write nutrition at all (less output, faster); the
+# /extract-recipe nutrition step fills it in afterwards and the app polls for it.
+_NUTRITION_PROMPT_BIT = ("nutrition is your "
+                         "per-serving estimate (the server recomputes it). ")
+assert _NUTRITION_PROMPT_BIT in SYSTEM_PROMPT
+SYSTEM_PROMPT_LEAN = SYSTEM_PROMPT.replace(
+    _NUTRITION_PROMPT_BIT, "Do not include nutrition; the server calculates it. ")
+_RECIPE_SCHEMA_LEAN = {
+    **_RECIPE_SCHEMA,
+    "properties": {k: v for k, v in _RECIPE_SCHEMA["properties"].items() if k != "nutrition"},
+    "required": [k for k in _RECIPE_SCHEMA["required"] if k != "nutrition"],
+}
+OUTPUT_SCHEMA_LEAN = {
+    **OUTPUT_SCHEMA,
+    "properties": {**OUTPUT_SCHEMA["properties"],
+                   "recipes": {"type": "array", "items": _RECIPE_SCHEMA_LEAN}},
+}
+PLAN_SYSTEM_PROMPT_LEAN = SYSTEM_PROMPT_LEAN + PLAN_SYSTEM_PROMPT[len(SYSTEM_PROMPT):]
+RECIPE_SYSTEM_PROMPT_LEAN = SYSTEM_PROMPT_LEAN + (
+    "\n\nTHIS STEP: write ONE complete recipe — the dish named at the end of the last message — "
+    "as a single recipe object matching the schema. Keep the given title."
+)
+# Last-resort fallback when the nutrition step fails twice: a small Claude estimate.
+NUTRITION_ONLY_SCHEMA = _RECIPE_SCHEMA["properties"]["nutrition"]
+NUTRITION_FALLBACK_PROMPT = (
+    "Estimate realistic per-serving nutrition for the recipe the user sends (ingredients and "
+    "servings given). Respond only with JSON matching the schema."
 )
 
 
@@ -603,6 +642,7 @@ def _cache_store(db, uid: str, conversation_id: str, recipes: list[dict]) -> Non
         batch.set(db.collection(CACHE_COLLECTION).document(r["id"]), {
             "uid": uid, "conversationId": conversation_id, "recipe": r,
             "imageUrl": r["imageUrl"], "imageStatus": r["imageStatus"],
+            "nutritionStatus": r.get("nutritionStatus") or "ready",
             "createdAt": gcf.SERVER_TIMESTAMP, "expireAt": expire,
         })
     batch.commit()
@@ -615,10 +655,15 @@ def _cache_image_update(db, recipe_id: str, url: str | None) -> None:
     }, merge=True)
 
 
-def _backfill_saved_recipe_image(db, uid: str, recipe_id: str, url: str) -> int:
-    """If the user saved this recipe before its image finished, write the Storage URL onto
-    the saved copy so it is never lost. Finds the saved doc either by document id == recipe
-    id, or by an `askRecipeId` field. Only fills an empty image field. Returns docs updated."""
+def _cache_nutrition_update(db, recipe_id: str, nutrition: dict) -> None:
+    db.collection(CACHE_COLLECTION).document(recipe_id).set({
+        "nutritionStatus": "ready",
+        "recipe": {"nutrition": nutrition, "nutritionStatus": "ready"},
+    }, merge=True)
+
+
+def _saved_recipe_docs(db, uid: str, recipe_id: str) -> list:
+    """Saved copies of an /ask-recipes recipe: doc id == recipe id, or askRecipeId field."""
     col = db.collection(cr.USERS_COLLECTION).document(uid).collection(SAVED_RECIPES_SUBCOLLECTION)
     refs = {}
     snap = col.document(recipe_id).get()
@@ -626,8 +671,26 @@ def _backfill_saved_recipe_image(db, uid: str, recipe_id: str, url: str) -> int:
         refs[snap.reference.path] = snap
     for s in col.where("askRecipeId", "==", recipe_id).limit(5).stream():
         refs[s.reference.path] = s
+    return list(refs.values())
+
+
+def _backfill_saved_recipe_nutrition(db, uid: str, recipe_id: str, nutrition: dict) -> int:
+    """If the user saved the recipe while nutrition was still pending, write the final values
+    onto the saved copy (only when it isn't already marked ready). Returns docs updated."""
     updated = 0
-    for s in refs.values():
+    for s in _saved_recipe_docs(db, uid, recipe_id):
+        if (s.to_dict() or {}).get("nutritionStatus") != "ready":
+            s.reference.set({SAVED_NUTRITION_FIELD: nutrition, "nutritionStatus": "ready"}, merge=True)
+            updated += 1
+    return updated
+
+
+def _backfill_saved_recipe_image(db, uid: str, recipe_id: str, url: str) -> int:
+    """If the user saved this recipe before its image finished, write the Storage URL onto
+    the saved copy so it is never lost. Finds the saved doc either by document id == recipe
+    id, or by an `askRecipeId` field. Only fills an empty image field. Returns docs updated."""
+    updated = 0
+    for s in _saved_recipe_docs(db, uid, recipe_id):
         if not (s.to_dict() or {}).get(SAVED_IMAGE_FIELD):
             s.reference.set({SAVED_IMAGE_FIELD: url, "imageStatus": "ready"}, merge=True)
             updated += 1
@@ -685,6 +748,8 @@ def create_ask_recipes_blueprint(
     cache_store: Callable[[Any, str, str, list], None] = _cache_store,
     cache_image_update: Callable[[Any, str, str | None], None] = _cache_image_update,
     backfill_saved_image: Callable[[Any, str, str, str], int] = _backfill_saved_recipe_image,
+    cache_nutrition_update: Callable[[Any, str, dict], None] = _cache_nutrition_update,
+    backfill_saved_nutrition: Callable[[Any, str, str, dict], int] = _backfill_saved_recipe_nutrition,
     load_suggestions: Callable[[Any], list] = _default_suggestions,
     results_cache_get: Callable[[Any, str], dict | None] = _results_cache_get,
     results_cache_put: Callable[[Any, str, dict], None] = _results_cache_put,
@@ -698,13 +763,23 @@ def create_ask_recipes_blueprint(
     parallel: bool | None = None,
     prefetch: bool | None = None,
     recompute: bool | None = None,
+    nutrition_mode: str | None = None,
 ) -> Blueprint:
     bp = Blueprint("ask_recipes", __name__)
     budget = TIMEOUT_SECONDS if timeout_seconds is None else timeout_seconds
     images_on = (IMAGES_ENABLED if images_enabled is None else images_enabled) and generate_image is not None
     parallel_on = PARALLEL_GENERATION if parallel is None else parallel
     prefetch_on = PREFETCH_ENABLED if prefetch is None else prefetch
-    recompute_on = (RECOMPUTE_NUTRITION if recompute is None else recompute) and recompute_nutrition is not None
+    mode = nutrition_mode or ("sync" if recompute else ("claude" if recompute is False else NUTRITION_MODE))
+    if recompute_nutrition is None:
+        mode = "claude"
+    recompute_on = mode == "sync"                  # recompute before responding
+    nutrition_bg = mode == "background"            # recompute after responding; app polls
+    nutrition_results: dict[str, tuple[str, dict | None]] = {}  # recipe id -> (uid, final nutrition)
+    sys_full, sys_plan, sys_recipe = ((SYSTEM_PROMPT_LEAN, PLAN_SYSTEM_PROMPT_LEAN, RECIPE_SYSTEM_PROMPT_LEAN)
+                                      if nutrition_bg else (SYSTEM_PROMPT, PLAN_SYSTEM_PROMPT, RECIPE_SYSTEM_PROMPT))
+    schema_full, schema_recipe = ((OUTPUT_SCHEMA_LEAN, _RECIPE_SCHEMA_LEAN) if nutrition_bg
+                                  else (OUTPUT_SCHEMA, _RECIPE_SCHEMA))
     gen_pool = ThreadPoolExecutor(max_workers=_env_int("ASK_RECIPES_GEN_WORKERS", 15),
                                   thread_name_prefix="ask-gen")
     prefetch_pool = ThreadPoolExecutor(max_workers=_env_int("ASK_RECIPES_PREFETCH_WORKERS", 4),
@@ -790,6 +865,46 @@ def create_ask_recipes_blueprint(
             except Exception as e:
                 print(f"[ask-recipes] saved-recipe image backfill failed for {recipe_id}: {type(e).__name__}: {e}")
 
+    def _valid(n) -> bool:
+        return isinstance(n, dict) and (cr._num(n.get("calories"), integer=True) or 0) > 0
+
+    def _claude_nutrition(recipe: dict) -> dict | None:
+        payload = {k: recipe.get(k) for k in ("title", "servings", "ingredients")}
+        out, _ = _call(NUTRITION_FALLBACK_PROMPT,
+                       [{"role": "user", "content": json.dumps(payload, ensure_ascii=False)}],
+                       NUTRITION_ONLY_SCHEMA, 500, time.monotonic() + 30)
+        return out
+
+    def _nutrition_bg(recipe_id: str, recipe: dict, db, uid: str) -> None:
+        """Fill in nutrition after the response is sent: the /extract-recipe nutrition step
+        (retried once); if both attempts fail, a small Claude estimate; else null."""
+        final, source = None, None
+        for attempt in (1, 2):
+            try:
+                recomputed = recompute_nutrition(recipe)
+                if _valid(recomputed):
+                    final, source = cr._final_nutrition(recomputed, None, {}), "recomputed"
+                    break
+                print(f"[ask-recipes] nutrition step returned nothing for {recipe_id} (attempt {attempt})")
+            except Exception as e:
+                print(f"[ask-recipes] nutrition step failed for {recipe_id} (attempt {attempt}): "
+                      f"{type(e).__name__}: {e}")
+        if final is None:
+            try:
+                est = _claude_nutrition(recipe)
+                if _valid(est):
+                    final, source = cr._final_nutrition(None, est, {}), "claude_fallback"
+            except Exception as e:
+                print(f"[ask-recipes] nutrition fallback failed for {recipe_id}: {type(e).__name__}: {e}")
+        if source != "recomputed":
+            print(f"[ask-recipes] nutrition for {recipe_id}: {source or 'unavailable'}")
+        nutrition_results[recipe_id] = (uid, final)
+        _safe(cache_nutrition_update, db, recipe_id, final)
+        if final:
+            n = _safe(backfill_saved_nutrition, db, uid, recipe_id, final)
+            if n:
+                print(f"[ask-recipes] nutrition backfilled onto {n} saved recipe(s) for {recipe_id}")
+
     def _call(system: str, messages: list, schema: dict, max_tokens: int, deadline: float):
         resp = claude_call(
             model=CLAUDE_MODEL, system=system, messages=messages,
@@ -813,7 +928,7 @@ def create_ask_recipes_blueprint(
 
     def _generate_parallel(body: dict, messages: list, deadline: float):
         """Plan the dishes (one small call), then write each recipe in its own parallel call."""
-        plan, (tin, tout) = _call(PLAN_SYSTEM_PROMPT, messages, PLAN_SCHEMA,
+        plan, (tin, tout) = _call(sys_plan, messages, PLAN_SCHEMA,
                                   PLAN_MAX_TOKENS, deadline)
         status, message = _head(plan)
         if status != "results":
@@ -829,7 +944,7 @@ def create_ask_recipes_blueprint(
             msgs[-1]["content"] += (f"\n\nWrite the full recipe for: {dish['title'].strip()} — "
                                     f"{str(dish.get('angle') or '').strip()}\n"
                                     f"Other dishes in this set (do not duplicate them): {others}")
-            return _call(RECIPE_SYSTEM_PROMPT, msgs, _RECIPE_SCHEMA, TOKENS_PER_RECIPE, deadline)
+            return _call(sys_recipe, msgs, schema_recipe, TOKENS_PER_RECIPE, deadline)
 
         futures = [gen_pool.submit(write, d) for d in dishes]
         raws = []
@@ -850,7 +965,7 @@ def create_ask_recipes_blueprint(
         if parallel_on and body["count"] > 1:
             status, message, raws, follow_ups, (tin, tout) = _generate_parallel(body, messages, deadline)
         else:
-            out, (tin, tout) = _call(SYSTEM_PROMPT, messages, OUTPUT_SCHEMA, _max_tokens(body["count"]), deadline)
+            out, (tin, tout) = _call(sys_full, messages, schema_full, _max_tokens(body["count"]), deadline)
             status, message = _head(out)
             raws, follow_ups = out.get("recipes") or [], out.get("followUps")
         claude_ms = int((time.monotonic() - t0) * 1000)
@@ -894,7 +1009,8 @@ def create_ask_recipes_blueprint(
                     recomputed = futures[idx].result(timeout=max(0.5, deadline - time.monotonic()))
                 except Exception as e:
                     print(f"[ask-recipes] nutrition recompute failed: {type(e).__name__}: {e}")
-            r["nutrition"] = cr._final_nutrition(recomputed, r.pop("_model_nutrition"), {})
+            model_n = r.pop("_model_nutrition")
+            r["nutrition"] = None if nutrition_bg else cr._final_nutrition(recomputed, model_n, {})
         result["_timings"]["nutritionMs"] = int((time.monotonic() - t1) * 1000)
         result["recipes"] = recipes
         result["followUps"] = _normalize_follow_ups(follow_ups)
@@ -1107,8 +1223,10 @@ def create_ask_recipes_blueprint(
                 recipes.append({"id": rid, "title": r["title"], "description": r["description"],
                                 "imageUrl": url,
                                 "imageStatus": "pending" if (images_on and not url) else "ready",
+                                "nutritionStatus": "pending" if nutrition_bg else "ready",
                                 **{k: v for k, v in r.items()
-                                   if k not in ("id", "title", "description", "imageUrl", "imageStatus")}})
+                                   if k not in ("id", "title", "description", "imageUrl", "imageStatus",
+                                                "nutritionStatus")}})
             log["imagesReused"] = sum(1 for r in recipes if r["imageUrl"])
             for r in recipes:
                 issued[r["id"]] = (uid, r["imageUrl"])
@@ -1119,6 +1237,9 @@ def create_ask_recipes_blueprint(
                 except Exception as e:
                     print(f"[ask-recipes] cache write failed: {type(e).__name__}: {e}")
                 timings["cacheWriteMs"] = int((time.monotonic() - t) * 1000)
+                if nutrition_bg:
+                    for r in recipes:
+                        nutrition_pool.submit(_nutrition_bg, r["id"], dict(r), db, uid)
                 if images_on:
                     for r in recipes:
                         if r["imageStatus"] != "pending":
@@ -1204,6 +1325,32 @@ def create_ask_recipes_blueprint(
                     if url:
                         _safe(backfill_saved_image, db, uid, recipe_id, url)
             return jsonify({"recipeId": recipe_id, "imageStatus": status, "imageUrl": url}), 200
+        except ApiError as err:
+            return jsonify(_error_body(request_id, err)), err.http
+
+    @bp.route("/ask-recipes/nutrition/<recipe_id>", methods=["GET"])
+    def ask_recipes_nutrition(recipe_id: str):
+        """Poll background nutrition: {recipeId, nutritionStatus, nutrition}. While pending,
+        nutrition holds Claude's estimate so the app always has numbers to show."""
+        request_id = (request.headers.get("X-Request-Id") or "").strip() or str(uuid.uuid4())
+        try:
+            uid = _authenticate()
+            done = nutrition_results.get(recipe_id)
+            if done and done[0] == uid:  # finished on this worker
+                return jsonify({"recipeId": recipe_id, "nutritionStatus": "ready", "nutrition": done[1]}), 200
+            snap = get_db().collection(CACHE_COLLECTION).document(recipe_id).get()
+            data = (snap.to_dict() or {}) if snap.exists else {}
+            if not data or data.get("uid") != uid:
+                raise ApiError(404, "not_found", "Recipe not found.")
+            nutrition = (data.get("recipe") or {}).get("nutrition")
+            status = data.get("nutritionStatus") or "ready"
+            if status == "pending":
+                created = data.get("createdAt")
+                age = (datetime.now(timezone.utc) - created).total_seconds() if isinstance(created, datetime) else 0
+                if age > NUTRITION_GIVEUP_SECONDS:  # the background job was lost: keep the estimate
+                    status = "ready"
+                    _safe(cache_nutrition_update, get_db(), recipe_id, nutrition)
+            return jsonify({"recipeId": recipe_id, "nutritionStatus": status, "nutrition": nutrition}), 200
         except ApiError as err:
             return jsonify(_error_body(request_id, err)), err.http
 

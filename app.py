@@ -368,7 +368,7 @@ SOCIAL_USE_PROXY = os.getenv("SOCIAL_USE_PROXY", "0") == "1"  # same opt-in for 
 # Player clients to impersonate for YouTube, in priority order.
 # android_vr: PO-token-free, full format access (primary).
 # web_safari / web: fallbacks if android_vr is missing a format.
-YT_PLAYER_CLIENTS = ["android_vr", "web_safari", "web"]
+YT_PLAYER_CLIENTS = ["default", "web_safari"]
 
 
 def _yt_extractor_args() -> dict:

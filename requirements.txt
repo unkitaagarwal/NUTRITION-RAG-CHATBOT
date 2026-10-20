@@ -142,6 +142,7 @@ zstandard==0.24.0
 # Pinned to the version tested with the Instagram stale-cookie fallback in
 # _ydl_extract(). Upgrade deliberately: bump, test IG/TikTok/YouTube locally, then deploy.
 yt-dlp[default,curl-cffi]==2026.8.19
+deno
 instaloader>=4.15.1
 langchain-openai
 langchain-chroma

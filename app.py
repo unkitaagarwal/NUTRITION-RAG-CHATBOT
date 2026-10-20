@@ -381,6 +381,7 @@ def _yt_extractor_args() -> dict:
 # Falls back to YT_PROXY so a single Decodo residential proxy serves all sites.
 SOCIAL_PROXY = os.getenv("SOCIAL_PROXY") or os.getenv("YTDLP_PROXY") or YT_PROXY
 print(f"[startup] yt-dlp version: {getattr(yt_dlp.version, '__version__', 'unknown')}")
+print(f"[startup] deno: {shutil.which('deno') or 'NOT FOUND'}")
 print(
     f"[startup] proxies: YT_PROXY={'set' if YT_PROXY else 'none'} "
     f"({'ENABLED via YT_USE_PROXY' if YT_USE_PROXY else 'NOT USED — YouTube goes direct via android_vr client'}), "

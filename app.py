@@ -161,6 +161,10 @@ def _reject_too_long_filter(info_dict, *, incomplete=False):
 # Cookies can be provided as: 1) file path, or 2) base64-encoded content in YTDLP_COOKIES_B64 env var
 YTDLP_COOKIES_FILE = os.path.expanduser(os.path.expandvars(os.getenv("YTDLP_COOKIES_FILE", ""))) or None  # optional, helps IG/TikTok/Facebook
 YTDLP_COOKIES_B64 = os.getenv("YTDLP_COOKIES_B64")  # alternative: base64-encoded cookies content (for Render/cloud)
+# YouTube-only cookies (use a throwaway Google account). Kept separate from the
+# IG/TikTok/FB cookies above. Unset = YouTube runs cookie-free as before.
+YT_COOKIES_FILE = os.path.expanduser(os.path.expandvars(os.getenv("YT_COOKIES_FILE", ""))) or None
+YT_COOKIES_B64 = os.getenv("YT_COOKIES_B64")
 
 # Startup diagnostic: confirm whether yt-dlp cookies are actually available on this instance.
 # Facebook/IG/TikTok return "302 redirect loop" when cookies are missing/expired (bounced to login).
@@ -173,6 +177,7 @@ try:
     elif YTDLP_COOKIES_B64:
         _cookie_status = "B64"
     print(f"[startup] yt-dlp cookies: {_cookie_status}")
+    print(f"[startup] YouTube cookies: {'FILE' if YT_COOKIES_FILE and os.path.exists(YT_COOKIES_FILE) else 'B64' if YT_COOKIES_B64 else 'NONE'}")
 except Exception as _e:
     print(f"[startup] cookie check failed: {_e}")
 
@@ -180,11 +185,10 @@ except Exception as _e:
 def _prepare_cookiefile(temp_dir: str | None = None, video_url: str | None = None) -> str | None:
     """Return a WRITABLE cookies.txt path for yt-dlp, or None if no cookies configured.
 
-    NEVER passes cookies for YouTube URLs: when yt-dlp is given cookies, it
-    SKIPS player clients that don't support cookie auth (incl. android_vr) and
-    falls back to the web client, which triggers "Sign in to confirm you're
-    not a bot" from datacenter IPs. Cookie-free android_vr is what makes
-    proxy-free YouTube extraction work, so cookies stay IG/TikTok/FB-only.
+    YouTube URLs only ever get YT_COOKIES_FILE / YT_COOKIES_B64 (a throwaway
+    Google account), never the IG/TikTok/FB cookies. With those unset, YouTube
+    runs cookie-free. Data-center IPs (Render) get "Sign in to confirm you're
+    not a bot" without cookies, so set them in production.
 
     IMPORTANT: yt-dlp writes the (refreshed) cookie jar BACK to `cookiefile`
     after a download. Render secret files are mounted read-only at /etc/secrets,
@@ -195,9 +199,12 @@ def _prepare_cookiefile(temp_dir: str | None = None, video_url: str | None = Non
     Pass `temp_dir` (the per-download temp dir) when available so the copy is
     cleaned up automatically; otherwise a standalone temp file is created.
     """
-    if not (YTDLP_COOKIES_FILE or YTDLP_COOKIES_B64):
-        return None
     if video_url and is_youtube_url(video_url):
+        # YouTube uses its own (optional) cookies — never the IG/TikTok/FB ones.
+        cookies_file, cookies_b64 = YT_COOKIES_FILE, YT_COOKIES_B64
+    else:
+        cookies_file, cookies_b64 = YTDLP_COOKIES_FILE, YTDLP_COOKIES_B64
+    if not (cookies_file or cookies_b64):
         return None
     try:
         if temp_dir:
@@ -206,12 +213,12 @@ def _prepare_cookiefile(temp_dir: str | None = None, video_url: str | None = Non
             os.makedirs(DOWNLOAD_TMP_ROOT, exist_ok=True)
             fd, dest = tempfile.mkstemp(suffix="_cookies.txt", dir=DOWNLOAD_TMP_ROOT)
             os.close(fd)
-        if YTDLP_COOKIES_FILE and os.path.exists(YTDLP_COOKIES_FILE):
-            shutil.copyfile(YTDLP_COOKIES_FILE, dest)
+        if cookies_file and os.path.exists(cookies_file):
+            shutil.copyfile(cookies_file, dest)
             return dest
-        if YTDLP_COOKIES_B64:
+        if cookies_b64:
             with open(dest, "w") as f:
-                f.write(base64.b64decode(YTDLP_COOKIES_B64).decode("utf-8"))
+                f.write(base64.b64decode(cookies_b64).decode("utf-8"))
             return dest
     except Exception as e:
         print(f"[cookies] failed to prepare writable cookie file: {e}")

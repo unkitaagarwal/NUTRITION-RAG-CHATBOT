@@ -583,6 +583,7 @@ def _ydl_extract(ydl_opts: dict, video_url: str, *, download: bool):
                     "Check proxy credentials / plan / traffic quota."
                 )
                 raise last_err  # surface the real site error, not the proxy one
+            print(f"❌ Proxy attempt also failed: {str(e3)[:300]}")
             raise
     raise last_err
 

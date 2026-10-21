@@ -391,7 +391,7 @@ print(f"[startup] yt-dlp version: {getattr(yt_dlp.version, '__version__', 'unkno
 print(f"[startup] deno: {shutil.which('deno') or 'NOT FOUND'}")
 print(
     f"[startup] proxies: YT_PROXY={'set' if YT_PROXY else 'none'} "
-    f"({'ENABLED via YT_USE_PROXY' if YT_USE_PROXY else 'NOT USED — YouTube goes direct via android_vr client'}), "
+    f"({'ENABLED via YT_USE_PROXY' if YT_USE_PROXY else 'fallback only — YouTube tries direct first'}), "
     f"SOCIAL_PROXY={'set' if SOCIAL_PROXY else 'none'}"
 )
 PROFILE_VIDEO_DOWNLOADS_DIR = os.getenv("PROFILE_VIDEO_DOWNLOADS_DIR", "./downloads/profile_videos")

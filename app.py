@@ -3352,7 +3352,7 @@ def extract_recipe_from_video():
         cached = _recipe_cache.get(url_key)
         if cached is not None:
             print(f"⚡ Cache hit for video URL: {video_url}")
-            _ensure_cached_recipe_nutrition(cached)
+            _ensure_cached_recipe_complete(cached)
             return jsonify({**_apply_extract_recipe_image_pref(cached), "cached": True})
         # ─────────────────────────────────────────────────────────────────────────
 
@@ -5369,10 +5369,201 @@ def _fill_missing_recipe_metadata(recipe: dict, *, language: str | None = None) 
             recipe["total_time"] = _format_minutes_label(total_m)
 
 
+# Seconds allowed for the "write the missing steps" LLM call. Kept short because it can
+# run inside the social-video response budget (EXTRACT_RECIPE_RESPONSE_BUDGET_SEC).
+EXTRACT_RECIPE_STEPS_TIMEOUT = float(os.getenv("EXTRACT_RECIPE_STEPS_TIMEOUT", "12"))
+
+
+def _clean_instruction_list(raw, *, strip_numbering: bool = False) -> list[str]:
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, list):
+        return []
+    out = []
+    for step in raw:
+        if isinstance(step, dict):
+            step = step.get("text") or step.get("instruction") or ""
+        text = str(step or "").strip()
+        if strip_numbering:
+            text = re.sub(r"^(?:step\s*\d+\s*[:.)-]?|\d+[.)])\s+", "", text, flags=re.I).strip()
+        if text:
+            out.append(text)
+    return out
+
+
+def _recipe_ingredient_lines(recipe: dict) -> list[str]:
+    lines = []
+    for ing in recipe.get("ingredients") or []:
+        if isinstance(ing, dict):
+            name = str(ing.get("name") or "").strip()
+            qty = str(ing.get("quantity") or "").strip()
+            if name:
+                lines.append(f"{qty} {name}".strip())
+        elif str(ing).strip():
+            lines.append(str(ing).strip())
+    return lines
+
+
+def _generate_recipe_instructions_llm(recipe: dict, *, language: str | None = None) -> list[str]:
+    """Write cooking steps for a recipe whose source had none (name + ingredients only)."""
+    payload = {
+        "name": recipe.get("name") or "",
+        "description": recipe.get("description") or "",
+        "servings": str(recipe.get("servings") or ""),
+        "ingredients": _recipe_ingredient_lines(recipe),
+        "notes": recipe.get("notes") or [],
+    }
+    if language and language != "en":
+        lang_rule = f" Write every step in {_LANGUAGE_NAMES.get(language, language)}."
+    else:
+        lang_rule = " Write the steps in the same language as the recipe name."
+    system = (
+        "The source of this recipe had no cooking instructions. Write clear, realistic "
+        "home-cooking steps for it, based on the recipe name and its ingredients. "
+        "Use every listed ingredient and do not introduce major new ingredients "
+        "(salt, pepper, oil or water are fine). If no ingredients are given, write the "
+        "standard method for the dish named. Write 3-8 steps, one action per step, include "
+        "temperatures and times where useful, and do not number the steps."
+        f"{lang_rule} Return ONLY JSON: {{\"instructions\": [\"...\", \"...\"]}}"
+    )
+    user = f"Recipe:\n{json.dumps(payload, ensure_ascii=False)}"
+    try:
+        completion = client.chat.completions.create(
+            model=RECIPE_LLM_MODEL,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            temperature=0.3,
+            max_tokens=700,
+            response_format={"type": "json_object"},
+            timeout=EXTRACT_RECIPE_STEPS_TIMEOUT,
+        )
+        data = json.loads(completion.choices[0].message.content.strip())
+        return _clean_instruction_list((data or {}).get("instructions"), strip_numbering=True)
+    except Exception as e:
+        print(f"⚠️ Recipe step generation failed: {type(e).__name__}: {e}")
+        return []
+
+
+def _fallback_recipe_instructions(recipe: dict) -> list[str]:
+    """Last resort when the LLM is unavailable: generic but non-blank steps."""
+    name = (recipe.get("name") or "").strip() or "the dish"
+    ingredients = _recipe_ingredient_lines(recipe)
+    steps = []
+    if ingredients:
+        steps.append("Gather and prepare the ingredients: " + ", ".join(ingredients) + ".")
+    else:
+        steps.append(f"Gather and prepare the ingredients for {name}.")
+    steps.append(f"Cook {name} using your preferred method until done, tasting and adjusting the seasoning as you go.")
+    steps.append("Serve warm.")
+    return steps
+
+
+def _ensure_recipe_instructions(recipe: dict, *, language: str | None = None) -> bool:
+    """Guarantee recipe["instructions"] is non-blank. Returns True if steps were generated.
+
+    Applies to every /extract-recipe source (webpage, image, social video, YouTube,
+    slideshow, cache hits). Steps the source provided are never replaced.
+    """
+    if not recipe:
+        return False
+    if _clean_instruction_list(recipe.get("instructions")):
+        return False  # the source has steps; leave them exactly as extracted
+    if not (recipe.get("name") or "").strip() and not _recipe_ingredient_lines(recipe):
+        # Nothing to base steps on; leave as-is (caller treats this as no recipe).
+        recipe["instructions"] = []
+        return False
+    t0 = time.time()
+    steps = _generate_recipe_instructions_llm(recipe, language=language)
+    method = "llm"
+    if not steps:
+        steps = _fallback_recipe_instructions(recipe)
+        method = "template"
+    recipe["instructions"] = steps
+    recipe["instructions_generated"] = True
+    missing = recipe.get("missing")
+    if isinstance(missing, list) and "instructions" in missing:
+        missing = [m for m in missing if m != "instructions"]
+        if missing:
+            recipe["missing"] = missing
+        else:
+            recipe.pop("missing", None)
+    print(
+        f"🪄 Source had no steps; generated {len(steps)} ({method}) for "
+        f"{(recipe.get('name') or '')[:60]!r} in {time.time() - t0:.2f}s"
+    )
+    return True
+
+
+def _ensure_recipe_single_language(recipe: dict, language: str | None) -> None:
+    """Translate ingredients/steps that came out in a different language from the recipe.
+
+    Happens on social videos with bilingual captions or on-screen text in another language
+    (e.g. English ingredients from the caption, Spanish steps read off the video frames).
+    Uses the free keyword detector; it defaults to "en" when unsure, so for non-English
+    targets only a clear third-language detection triggers a translation.
+    """
+    target = _normalize_language_code(language)
+    if not recipe or not target:
+        return
+    ings = [i for i in (recipe.get("ingredients") or []) if isinstance(i, dict) and (i.get("name") or "").strip()]
+    steps = [str(st).strip() for st in (recipe.get("instructions") or []) if str(st).strip()]
+
+    def _off(text: str) -> str | None:
+        if not text.strip():
+            return None
+        found = _normalize_language_code(_detect_text_language(text))
+        if not found or found == target:
+            return None
+        if target != "en" and found == "en":
+            return None  # "en" is the detector's fallback, not a reliable signal
+        return found
+
+    ing_lang = _off(" ".join(f"{i.get('quantity') or ''} {i['name']}" for i in ings))
+    step_lang = _off(" ".join(steps))
+    if not ing_lang and not step_lang:
+        return
+    t0 = time.time()
+    translated = _translate_recipe_sections_llm(
+        ings if ing_lang else [], steps if step_lang else [], target,
+    )
+    if translated is None:
+        return
+    if ing_lang:
+        recipe["ingredients"] = translated[0]
+    if step_lang:
+        recipe["instructions"] = translated[1]
+    print(
+        f"🌐 Unified recipe language to {target} "
+        f"(ingredients={ing_lang or '-'}, steps={step_lang or '-'}) in {time.time() - t0:.2f}s"
+    )
+
+
+def _ensure_cached_recipe_complete(payload: dict) -> None:
+    """Cache hits: older entries may predate the never-blank-steps rule."""
+    recipe = payload.get("recipe")
+    if isinstance(recipe, dict):
+        lang = _normalize_language_code(payload.get("language") or recipe.get("language"))
+        _ensure_recipe_single_language(recipe, lang)
+        if _ensure_recipe_instructions(recipe, language=lang):
+            # Drop stale "No instructions found" warnings; no UI message for generated steps.
+            warnings = [w for w in (payload.get("warnings") or []) if "instructions" not in str(w)]
+            if warnings:
+                payload["warnings"] = warnings
+            else:
+                payload.pop("warnings", None)
+    _ensure_cached_recipe_nutrition(payload)
+
+
 def _enrich_recipe_response(recipe: dict, *, language: str | None = None) -> None:
     """Set meal_type, cuisine, diet_flags, description, and inferred metadata on recipe."""
     if not recipe:
         return
+    # One language for the whole recipe (video paths pass the response language).
+    _ensure_recipe_single_language(recipe, language)
+    # Steps first, so time inference and nutrition below can use them.
+    _ensure_recipe_instructions(recipe, language=language)
     is_english = not language or language == "en"
     if is_english:
         recipe["meal_type"] = normalize_meal_type(recipe.get("meal_type"))
@@ -5588,6 +5779,7 @@ def bulk_import_recipes():
             "isFavorite": False,
             "nutrition": recipe.get("nutrition") or {},
             "steps": steps,
+            "stepsGenerated": bool(recipe.get("instructions_generated")),
             "sourceUrl": source.get("url") or url,
             "cuisine": recipe.get("cuisine", ""),
             "dietFlags": recipe.get("diet_flags", []),
@@ -5675,7 +5867,7 @@ def extract_recipe():
         cached = _recipe_cache.get(webpage_key)
         if cached is not None:
             print(f"⚡ Cache hit for webpage URL: {url}")
-            _ensure_cached_recipe_nutrition(cached)
+            _ensure_cached_recipe_complete(cached)
             return jsonify({**_apply_extract_recipe_image_pref(cached), "cached": True})
     # ─────────────────────────────────────────────────────────────────────────
 
@@ -9519,11 +9711,86 @@ def _ingredient_key(name: str) -> str:
     return re.sub(r"[^a-z]", "", (name or "").lower())
 
 
+def _translate_recipe_sections_llm(ingredients: list, instructions: list, target_lang: str) -> tuple[list, list] | None:
+    """Translate ingredient names/quantities and steps into target_lang. None on failure."""
+    label = _LANGUAGE_NAMES.get(target_lang, target_lang)
+    payload = {
+        "ingredients": [
+            {"name": str(i.get("name") or ""), "quantity": str(i.get("quantity") or "")}
+            for i in ingredients
+        ],
+        "instructions": [str(s) for s in instructions],
+    }
+    system = (
+        f"Translate this recipe data into {label}. Keep the same JSON shape, the same number of "
+        "items and the same order. Translate ingredient names, quantity units and steps; keep "
+        "numbers as they are. Keep any 'Step N:' style prefix but translate it. Return ONLY JSON: "
+        '{"ingredients":[{"name":"","quantity":""}],"instructions":[""]}'
+    )
+    try:
+        completion = client.chat.completions.create(
+            model=RECIPE_LLM_MODEL,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+            ],
+            temperature=0,
+            max_tokens=1500,
+            response_format={"type": "json_object"},
+            timeout=EXTRACT_RECIPE_STEPS_TIMEOUT,
+        )
+        data = json.loads(completion.choices[0].message.content.strip()) or {}
+        t_ings = data.get("ingredients") or []
+        t_steps = data.get("instructions") or []
+        if len(t_ings) != len(ingredients) or len(t_steps) != len(instructions):
+            print("⚠️ Gap-fill translation changed item counts; keeping original language")
+            return None
+        out_ings = []
+        for orig, tr in zip(ingredients, t_ings):
+            item = dict(orig)
+            if isinstance(tr, dict) and str(tr.get("name") or "").strip():
+                item["name"] = str(tr["name"]).strip()
+                item["quantity"] = str(tr.get("quantity") or "").strip()
+            out_ings.append(item)
+        out_steps = [str(t).strip() or str(o) for o, t in zip(instructions, t_steps)]
+        return out_ings, out_steps
+    except Exception as e:
+        print(f"⚠️ Gap-fill translation failed: {type(e).__name__}: {e}")
+        return None
+
+
+def _align_gapfill_language(recipe: dict, vision: dict) -> dict:
+    """Caption and video are extracted separately and can land in different languages
+    (e.g. bilingual caption read as English, Spanish on-screen text read as Spanish).
+    Return the vision recipe translated into the caption recipe's language when they differ."""
+    target = _normalize_language_code(recipe.get("language"))
+    v_ings = [
+        i for i in (vision.get("ingredients") or [])
+        if isinstance(i, dict) and (i.get("name") or "").strip()
+    ]
+    v_steps = [str(s).strip() for s in (vision.get("instructions") or []) if str(s).strip()]
+    if not target or not (v_ings or v_steps):
+        return vision
+    source = _normalize_language_code(vision.get("language"))
+    if not source:
+        sample = " ".join(v_steps) or " ".join(i["name"] for i in v_ings)
+        source = _normalize_language_code(_detect_text_language(sample))
+    if not source or source == target:
+        return vision
+    t0 = time.time()
+    translated = _translate_recipe_sections_llm(v_ings, v_steps, target)
+    if translated is None:
+        return vision
+    print(f"🌐 Gap-fill result translated {source} → {target} in {time.time() - t0:.2f}s")
+    return {**vision, "ingredients": translated[0], "instructions": translated[1], "language": target}
+
+
 def _merge_gapfill_into_caption_recipe(recipe: dict, vision: dict, missing: list[str]) -> list[str]:
     """Fill missing sections (and blank quantities) from the vision recipe.
     Caption-provided content is kept as the source of truth. Returns still-missing sections."""
     if not vision:
         return missing
+    vision = _align_gapfill_language(recipe, vision)
     v_ings = [
         i for i in (vision.get("ingredients") or [])
         if isinstance(i, dict) and (i.get("name") or "").strip()
@@ -9588,7 +9855,7 @@ def extract_recipe_from_video_internal(video_url: str):
         if cached is not None:
             print(f"⚡ Cache hit for video URL: {video_url}")
             cached = _apply_response_language(cached, video_url, cached.get("meta") or {})
-            _ensure_cached_recipe_nutrition(cached)
+            _ensure_cached_recipe_complete(cached)
             return jsonify({**_apply_extract_recipe_image_pref(cached), "cached": True}), 200
     # ─────────────────────────────────────────────────────────────────────────
 
@@ -9839,6 +10106,9 @@ def extract_recipe_from_video_internal(video_url: str):
                             "🎬 Vision below completeness threshold — returning best-effort recipe"
                         )
                 lang = _finalize_recipe_for_response(recipe, meta)
+                steps_generated = bool(recipe.get("instructions_generated"))
+                if steps_generated and "instructions" in missing_sections:
+                    missing_sections = [m for m in missing_sections if m != "instructions"]
                 tags = extract_recipe_tags(recipe)
                 if caption_from_partial and missing_sections:
                     extraction_method = "caption_llm_partial"
@@ -9877,6 +10147,10 @@ def extract_recipe_from_video_internal(video_url: str):
                         ]
                     else:
                         _result["warnings"] = ["Recipe extraction may be incomplete."]
+                if steps_generated and gapfill_status == "timeout":
+                    # Real steps may still come from the video; the app can refetch.
+                    # (No UI warning: recipe.instructions_generated is the only marker.)
+                    _result["retry_after_sec"] = 10
                 return _return_video_extract_result(
                     _result, url_key, video_url, meta, language=lang,
                     cache=(gapfill_status != "timeout"),

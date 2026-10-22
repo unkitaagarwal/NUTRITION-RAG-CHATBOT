@@ -49,7 +49,7 @@ def _env_int(name: str, default: int) -> int:
 
 
 CUSTOMIZE_TIMEOUT_SECONDS = float(os.getenv("CUSTOMIZE_TIMEOUT_SECONDS", "45"))
-MAX_BODY_BYTES = _env_int("CUSTOMIZE_MAX_BODY_BYTES", 64 * 1024)
+MAX_BODY_BYTES = _env_int("CUSTOMIZE_MAX_BODY_BYTES", 256 * 1024)
 MAX_PROMPT_CHARS = 500
 MAX_INGREDIENTS = 60
 MAX_STEPS = 60
@@ -71,6 +71,25 @@ USE_PRESET_MODEL = (os.getenv("CUSTOMIZE_USE_PRESET_MODEL") or "1").strip().lowe
 CLAUDE_MAX_TOKENS = _env_int("CUSTOMIZE_CLAUDE_MAX_TOKENS", 3000)  # edits only, so much smaller
 
 USERS_COLLECTION = os.getenv("CUSTOMIZE_USERS_COLLECTION", "meal_plan_chef_users")
+
+# One automatic retry for a bad / cut-off / no-op / overloaded model answer, but only if at
+# least this many seconds of the request budget are left.
+MIN_RETRY_SECONDS = float(os.getenv("CUSTOMIZE_MIN_RETRY_SECONDS", "10"))
+RETRY_MAX_TOKENS = _env_int("CUSTOMIZE_RETRY_MAX_TOKENS", 6000)
+
+# Friendly names for preset chips, used in fallback replies ("try Healthier instead?").
+PRESET_LABELS = {
+    "spicier": "Spicier", "more_protein": "More protein", "healthier": "Healthier",
+    "dairy_free": "Dairy-free", "under_20": "Under 20 min", "kid_friendly": "Kid-friendly",
+}
+PRESET_ALTERNATIVES = {
+    "spicier": ("more_protein", "healthier"),
+    "more_protein": ("healthier", "under_20"),
+    "healthier": ("more_protein", "under_20"),
+    "dairy_free": ("healthier", "kid_friendly"),
+    "under_20": ("healthier", "more_protein"),
+    "kid_friendly": ("healthier", "under_20"),
+}
 
 ALLOWED_MODES = {"preset", "chat"}
 # Spec presets (reference only): chips can change in the app, so any well-formed id is accepted.
@@ -102,6 +121,15 @@ SYSTEM_PROMPT = (
     "'add more vegetables', 'lower calorie', 'no onions') are clear enough: make sensible "
     "assumptions, apply the change, and say briefly what you assumed in assistantMessage. "
     "If the history shows you already asked a question, apply the change using the user's answer."
+    "\n\nDon't force a pointless edit. If the recipe ALREADY clearly meets the request (e.g. it is "
+    "already high in protein, already dairy-free, already ready in under 20 minutes), or the change "
+    "would turn it into a different dish, set status clarify instead. In assistantMessage, say why "
+    "using specifics from THIS recipe (e.g. 'about 38 g of protein per serving from the chicken and "
+    "Greek yogurt', 'there's no dairy in it'), then suggest one or two other changes that would "
+    "genuinely help this recipe, chosen from: spicier, more protein, healthier, dairy-free, "
+    "under 20 minutes, kid-friendly, and end with a short question. For an impossible change, offer "
+    "the closest version that keeps the dish (e.g. a mushroom version of a beef stew). "
+    "Never return status updated with edits that change nothing."
     "\n\nRespond only with JSON matching the required schema. "
     "assistantMessage is plain text (no markdown), at most about 600 characters. "
     "Return ONLY what changes, never the whole recipe. Ingredients and steps are numbered "
@@ -313,94 +341,107 @@ def _is_str(v) -> bool:
 
 
 def _validate_headers(headers) -> None:
+    """Headers are informational. Unknown X-Client / Content-Type values are logged, not rejected,
+    so a client-side slip never turns into an error screen."""
     ctype = (headers.get("Content-Type") or "").split(";")[0].strip().lower()
-    if ctype != "application/json":
-        raise ApiError(400, "invalid_request", "Content-Type must be application/json.")
-    if (headers.get("X-Client") or "").strip() not in ALLOWED_CLIENTS:
-        raise ApiError(400, "invalid_request", "X-Client must be ios-app, android-app or ios-share-extension.")
+    client = (headers.get("X-Client") or "").strip()
+    if ctype != "application/json" or client not in ALLOWED_CLIENTS:
+        print(f"[customize-recipe] lenient headers: content-type={ctype!r} x-client={client!r}")
+
+
+def _request_id_from(headers) -> str:
     rid = (headers.get("X-Request-Id") or "").strip()
-    try:
-        uuid.UUID(rid)
-    except (ValueError, AttributeError):
-        raise ApiError(400, "invalid_request", "X-Request-Id must be a UUID.")
+    if rid and len(rid) <= 100:
+        return rid
+    return str(uuid.uuid4())
+
+
+def _as_text(v) -> str:
+    if v is None:
+        return ""
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        return str(int(v)) if float(v).is_integer() else str(v)
+    return str(v) if isinstance(v, str) else ""
+
+
+def _clean_recipe_input(recipe: dict) -> dict:
+    """Drop unusable items, coerce types, trim to limits, default nutrition basis."""
+    recipe = dict(recipe)
+    ingredients = []
+    for ing in recipe.get("ingredients") if isinstance(recipe.get("ingredients"), list) else []:
+        if isinstance(ing, str) and ing.strip():
+            ing = {"name": ing.strip(), "amount": "", "unit": ""}
+        if not isinstance(ing, dict) or not _as_text(ing.get("name")).strip():
+            continue
+        ing = dict(ing)
+        ing["name"] = _as_text(ing.get("name")).strip()
+        for k in ("amount", "unit"):
+            if ing.get(k) is not None and not isinstance(ing.get(k), str):
+                ing[k] = _as_text(ing.get(k))
+        ingredients.append(ing)
+    steps = []
+    for st in recipe.get("steps") if isinstance(recipe.get("steps"), list) else []:
+        if isinstance(st, str):
+            st = {"instruction": st}
+        if not isinstance(st, dict):
+            continue
+        text = _as_text(st.get("instruction") or st.get("text")).strip()
+        if not text:
+            continue
+        steps.append({**st, "instruction": text})
+    if len(ingredients) > MAX_INGREDIENTS or len(steps) > MAX_STEPS:
+        print(f"[customize-recipe] trimming recipe: {len(ingredients)} ingredients, {len(steps)} steps")
+    recipe["ingredients"] = ingredients[:MAX_INGREDIENTS]
+    recipe["steps"] = steps[:MAX_STEPS]
+    nutrition = recipe.get("nutrition") if isinstance(recipe.get("nutrition"), dict) else {}
+    recipe["nutrition"] = {**nutrition, "basis": "per_serving"}
+    return recipe
 
 
 def _validate_body(raw: bytes) -> dict:
+    """Parse and normalize the request. Only an unreadable body or a missing recipe is a 400;
+    everything else is cleaned up so the user still gets a customization."""
     if len(raw) > MAX_BODY_BYTES:
-        raise ApiError(400, "invalid_request", "Request body exceeds 64 KB.")
+        raise ApiError(400, "invalid_request", "Request body is too large.")
     try:
         body = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError):
         raise ApiError(400, "invalid_request", "Body must be valid UTF-8 JSON.")
     if not isinstance(body, dict):
         raise ApiError(400, "invalid_request", "Body must be a JSON object.")
-
-    def bad(msg: str):
-        raise ApiError(400, "invalid_request", msg)
-
-    mode = body.get("mode")
-    if mode not in ALLOWED_MODES:
-        bad("mode must be 'preset' or 'chat'.")
-    pid = body.get("presetId")
-    if mode == "preset" and (not _is_str(pid) or not _PRESET_ID_RE.match(pid)):
-        bad("presetId is required for preset mode (letters, numbers, _ or -, max 50).")
-    if body.get("presetId") is not None and not _is_str(body.get("presetId")):
-        bad("presetId must be a string.")
-
-    prompt = body.get("prompt")
-    if not _is_str(prompt) or not prompt.strip():
-        bad("prompt is required.")
-    if len(prompt) > MAX_PROMPT_CHARS:
-        bad(f"prompt must be at most {MAX_PROMPT_CHARS} characters.")
-
-    # source is for analytics only, and new entry points (e.g. Ask RecipeVault results) appear
-    # without a server change, so accept any well-formed value.
-    src = body.get("source")
-    if not _is_str(src) or not _PRESET_ID_RE.match(src):
-        bad("source is required (letters, numbers, _ or -, max 50).")
-    if body.get("recipeId") is not None and not _is_str(body.get("recipeId")):
-        bad("recipeId must be a string or null.")
-
     recipe = body.get("recipe")
     if not isinstance(recipe, dict):
-        bad("recipe is required.")
-    ingredients = recipe.get("ingredients")
-    if not isinstance(ingredients, list):
-        bad("recipe.ingredients is required.")
-    if len(ingredients) > MAX_INGREDIENTS:
-        bad(f"recipe.ingredients must have at most {MAX_INGREDIENTS} items.")
-    for i, ing in enumerate(ingredients):
-        if not isinstance(ing, dict) or not _is_str(ing.get("name")):
-            bad(f"recipe.ingredients[{i}] must be {{name, amount, unit}}.")
-        for k in ("amount", "unit"):
-            if ing.get(k) is not None and not isinstance(ing.get(k), (str, int, float)):
-                bad(f"recipe.ingredients[{i}].{k} must be a string.")
-    steps = recipe.get("steps")
-    if not isinstance(steps, list):
-        bad("recipe.steps is required.")
-    if len(steps) > MAX_STEPS:
-        bad(f"recipe.steps must have at most {MAX_STEPS} items.")
-    for i, st in enumerate(steps):
-        if not isinstance(st, dict) or not _is_str(st.get("instruction")):
-            bad(f"recipe.steps[{i}] must be {{order, instruction}}.")
-    nutrition = recipe.get("nutrition")
-    if not isinstance(nutrition, dict) or nutrition.get("basis") != "per_serving":
-        bad("recipe.nutrition.basis must be 'per_serving'.")
+        raise ApiError(400, "invalid_request", "recipe is required.")
 
-    history = body.get("history")
-    if history is None:
-        history = []
-    if not isinstance(history, list):
-        bad("history must be an array.")
-    if len(history) > MAX_HISTORY:
-        bad(f"history must have at most {MAX_HISTORY} items.")
-    for i, turn in enumerate(history):
-        if (not isinstance(turn, dict) or turn.get("role") not in ("user", "assistant")
-                or not _is_str(turn.get("text"))):
-            bad(f"history[{i}] must be {{role: user|assistant, text}}.")
-        if len(turn["text"]) > MAX_HISTORY_TEXT_CHARS:
-            bad(f"history[{i}].text is too long.")
-    body["history"] = history
+    pid = body.get("presetId")
+    pid = pid.strip() if _is_str(pid) and _PRESET_ID_RE.match(pid.strip()) else None
+    mode = body.get("mode")
+    if mode not in ALLOWED_MODES:
+        mode = "preset" if pid else "chat"
+    if mode == "preset" and not pid:
+        mode = "chat"
+    body["mode"], body["presetId"] = mode, pid
+
+    prompt = body.get("prompt") if _is_str(body.get("prompt")) else ""
+    prompt = prompt.strip()
+    if not prompt and pid:
+        prompt = PRESET_LABELS.get(pid, pid.replace("_", " ").replace("-", " ")).capitalize()
+    body["prompt"] = prompt[:MAX_PROMPT_CHARS]   # may be "" -> handled as a friendly question
+
+    src = body.get("source")
+    body["source"] = src if _is_str(src) and _PRESET_ID_RE.match(src) else "unknown"
+    if body.get("recipeId") is not None and not _is_str(body.get("recipeId")):
+        body["recipeId"] = None
+
+    body["recipe"] = _clean_recipe_input(recipe)
+
+    history = body.get("history") if isinstance(body.get("history"), list) else []
+    clean_history = []
+    for turn in history:
+        if (isinstance(turn, dict) and turn.get("role") in ("user", "assistant")
+                and _is_str(turn.get("text")) and turn["text"].strip()):
+            clean_history.append({"role": turn["role"], "text": turn["text"][:MAX_HISTORY_TEXT_CHARS]})
+    body["history"] = clean_history[-MAX_HISTORY:]
     return body
 
 
@@ -424,12 +465,38 @@ def _numbered_recipe(recipe: dict) -> dict:
     return view
 
 
+def _has_items(items, key: str) -> bool:
+    return any(isinstance(i, dict) and str(i.get(key) or "").strip() for i in (items or []))
+
+
+def _missing_sections_note(recipe: dict) -> str:
+    """Imports can arrive without steps or ingredients; have Claude write them while customizing."""
+    missing = []
+    if not _has_items(recipe.get("ingredients"), "name"):
+        missing.append("ingredients")
+    if not _has_items(recipe.get("steps"), "instruction"):
+        missing.append("steps")
+    if not missing:
+        return ""
+    what = " and ".join(missing)
+    return (
+        f"\n(This recipe has no {what}. Write a complete, realistic list of {what} for this dish "
+        "with the requested change already applied, using {op:'add', n:0, ...} for every item "
+        "in order. Base it on the title, description and whatever the recipe does include. "
+        "Status must be updated, not clarify: if the recipe already meets the request, still write "
+        f"the {what} and say in assistantMessage that it already fits.)"
+    )
+
+
 def _build_user_content(body: dict) -> str:
     """User content: recipe as JSON, then history, then prompt (spec step 4)."""
     history_lines = [f"{t['role']}: {t['text']}" for t in body["history"]]
     history_text = "\n".join(history_lines) if history_lines else "(none)"
-    preset_note = ("\n(This is a preset chip: always apply the change, never clarify.)"
+    preset_note = ("\n(This is a preset chip: apply the change without asking what they mean. Only if "
+                   "the recipe already clearly meets it, or it would become a different dish, use "
+                   "status clarify as described; otherwise never clarify.)"
                    if body.get("mode") == "preset" else "")
+    preset_note += _missing_sections_note(body["recipe"])
     return (
         "<recipe>\n" + json.dumps(_numbered_recipe(body["recipe"]), ensure_ascii=False) + "\n</recipe>\n\n"
         "<history>\n" + history_text + "\n</history>\n\n"
@@ -500,6 +567,12 @@ def _apply_ops(items: list, ops, clean) -> tuple[list, int]:
         if kind == "remove" and 1 <= n <= total:
             removed.add(n)
             applied += 1
+        elif kind == "update" and total == 0:
+            # Nothing to update in an empty list: treat it as an add.
+            new = clean(op)
+            if new:
+                adds.setdefault(0, []).append(new)
+                applied += 1
         elif kind == "update" and 1 <= n <= total:
             new = clean(op)
             if new:
@@ -554,13 +627,22 @@ def _normalize_model_output(out: dict, original_recipe: dict) -> dict:
         recipe["dietaryTags"] = [t for t in edits["dietaryTags"] if _is_str(t) and t.strip()]
         applied += 1
 
-    ingredients, n_ing = _apply_ops(recipe.get("ingredients") or [], edits.get("ingredientOps"), _clean_ingredient)
-    steps, n_steps = _apply_ops(recipe.get("steps") or [], edits.get("stepOps"), _clean_step)
+    orig_ingredients = recipe.get("ingredients") or []
+    orig_steps = recipe.get("steps") or []
+    ingredients, n_ing = _apply_ops(orig_ingredients, edits.get("ingredientOps"), _clean_ingredient)
+    steps, n_steps = _apply_ops(orig_steps, edits.get("stepOps"), _clean_step)
+    # A recipe without ingredients or steps is still customized; an empty list is returned
+    # as-is rather than failing. If the model removed every existing item, keep the
+    # originals instead (removing everything is never the intended change).
+    if not ingredients and orig_ingredients:
+        print("[customize-recipe] model removed every ingredient; keeping the originals")
+        ingredients, n_ing = list(orig_ingredients), 0
+    if not steps and orig_steps:
+        print("[customize-recipe] model removed every step; keeping the originals")
+        steps, n_steps = list(orig_steps), 0
     applied += n_ing + n_steps
-    if not ingredients or not steps:
-        raise ApiError(502, "model_error", "The model removed every ingredient or step.")
     if applied == 0:
-        raise ApiError(502, "model_error", "The model reported an update but changed nothing.")
+        raise ApiError(502, "no_change", "The model reported an update but changed nothing.")
     recipe["ingredients"] = ingredients[:MAX_INGREDIENTS]
     recipe["steps"] = [{**st, "order": i + 1} for i, st in enumerate(steps[:MAX_STEPS])]
     # Recipes from /ask-recipes carry derived fields; keep them in sync with the edits.
@@ -620,6 +702,51 @@ def _final_nutrition(recomputed: dict | None, model_nutrition: dict | None, orig
     return out
 
 
+# ── Friendly fallbacks (never show the user an error screen) ───────────────────
+
+_TRANSIENT_MARKERS = ("overloaded", "ratelimit", "rate_limit", "internalserver", "connection",
+                      "serviceunavailable", "apistatus")
+
+
+def _failure_kind(e: Exception) -> str:
+    """Classify a failure from the model step: no_change | cut_off | bad_output | timeout | transient."""
+    if isinstance(e, ApiError):
+        return {"no_change": "no_change", "cut_off": "cut_off"}.get(e.code, "bad_output")
+    if _is_timeout_exception(e):
+        return "timeout"
+    return "transient"   # SDK overload / rate limit / 5xx / connection, or anything unexpected
+
+
+def _recipe_title(body: dict) -> str:
+    title = _as_text((body.get("recipe") or {}).get("title")).strip()
+    return title or "this recipe"
+
+
+def _label(pid: str | None) -> str:
+    return PRESET_LABELS.get(pid or "", (pid or "").replace("_", " ").replace("-", " ").strip())
+
+
+def _friendly_fallback(kind: str, body: dict) -> str:
+    """A personal reply for outcomes where we have no edited recipe to show."""
+    title = _recipe_title(body)
+    pid = body.get("presetId") if body.get("mode") == "preset" else None
+    if kind == "empty_prompt":
+        return (f"What would you like to change about {title}? I can make it healthier, quicker, "
+                "spicier or higher in protein, for example.")
+    if kind == "no_change":
+        if pid:
+            alts = [_label(a) for a in PRESET_ALTERNATIVES.get(pid, ("healthier", "under_20"))]
+            return (f"{title} already fits \u201c{_label(pid)}\u201d pretty well, so I've left it as it is. "
+                    f"Want to try {alts[0]} or {alts[1]} instead?")
+        return ("I couldn't find a meaningful change to make for that, so I've left the recipe as it is. "
+                "Could you tell me a bit more about what you'd like? For example healthier, quicker "
+                "or higher in protein.")
+    if pid:
+        return (f"Sorry, I couldn't finish the \u201c{_label(pid)}\u201d change for {title} just now. "
+                "Tap it again, or tell me what you'd like to change.")
+    return "Sorry, I couldn't finish that change just now. Could you send it again?"
+
+
 # ── Blueprint ─────────────────────────────────────────────────────────────────
 
 def create_customize_recipe_blueprint(
@@ -671,26 +798,51 @@ def create_customize_recipe_blueprint(
                 dedupe.pop(key, None)
                 fut.set_result(None)  # waiters fall through and run their own attempt
 
-    def _run_model_and_nutrition(body: dict, model: str, deadline: float) -> dict:
+    def _run_model_and_nutrition(body: dict, model: str, deadline: float, attempts: list) -> dict:
         t0 = time.monotonic()
-        remaining = max(1.0, deadline - t0)
-        resp = claude_call(
-            model=model,
-            system=SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": _build_user_content(body)}],
-            output_config={"format": {"type": "json_schema", "schema": OUTPUT_SCHEMA}},
-            max_tokens=CLAUDE_MAX_TOKENS,
-            timeout=remaining,
-        )
-        usage = getattr(resp, "usage", None)
-        tokens = {
-            "input": getattr(usage, "input_tokens", None),
-            "output": getattr(usage, "output_tokens", None),
-        }
-        if getattr(resp, "stop_reason", None) == "max_tokens":
-            raise ApiError(502, "model_error", "The model response was cut off.")
+        tokens = {"input": None, "output": None}
+        note, max_tokens = "", CLAUDE_MAX_TOKENS
+        for attempt in (1, 2):
+            try:
+                remaining = max(1.0, deadline - time.monotonic())
+                resp = claude_call(
+                    model=model,
+                    system=SYSTEM_PROMPT,
+                    messages=[{"role": "user", "content": _build_user_content(body) + note}],
+                    output_config={"format": {"type": "json_schema", "schema": OUTPUT_SCHEMA}},
+                    max_tokens=max_tokens,
+                    timeout=remaining,
+                )
+                usage = getattr(resp, "usage", None)
+                for k, attr in (("input", "input_tokens"), ("output", "output_tokens")):
+                    v = getattr(usage, attr, None)
+                    if isinstance(v, int):
+                        tokens[k] = (tokens[k] or 0) + v
+                if getattr(resp, "stop_reason", None) == "max_tokens":
+                    raise ApiError(502, "cut_off", "The model response was cut off.")
+                result = _normalize_model_output(_tool_input_from_response(resp), body["recipe"])
+                break
+            except Exception as e:
+                kind = _failure_kind(e)
+                attempts.append(kind)
+                left = deadline - time.monotonic()
+                if attempt == 2 or kind == "timeout" or left < MIN_RETRY_SECONDS:
+                    e._customize_kind = kind  # read by the handler for the friendly reply
+                    e._customize_tokens = tokens
+                    raise
+                print(f"[customize-recipe] retrying after {kind}: {type(e).__name__}: {str(e)[:200]}")
+                if kind == "no_change":
+                    note = ("\n\n(Your previous answer reported an update but changed nothing. Either "
+                            "make a real, meaningful change, or use status clarify to explain why no "
+                            "change is needed and suggest better options.)")
+                elif kind == "cut_off":
+                    max_tokens = max(max_tokens, RETRY_MAX_TOKENS)
+                    note = "\n\n(Keep the edits minimal and assistantMessage short.)"
+                elif kind == "bad_output":
+                    note = "\n\n(Return valid JSON that matches the schema exactly.)"
+                elif kind == "transient":
+                    time.sleep(min(1.0, max(0.0, left - MIN_RETRY_SECONDS)))
         claude_ms = int((time.monotonic() - t0) * 1000)
-        result = _normalize_model_output(_tool_input_from_response(resp), body["recipe"])
         nutrition_ms = 0
 
         if result["status"] == "updated":
@@ -715,7 +867,7 @@ def create_customize_recipe_blueprint(
     def customize_recipe():
         started = time.monotonic()
         deadline = started + budget
-        request_id = (request.headers.get("X-Request-Id") or "").strip() or str(uuid.uuid4())
+        request_id = _request_id_from(request.headers)
         log: dict[str, Any] = {
             "event": "customize_recipe", "requestId": request_id, "uid": None,
             "client": request.headers.get("X-Client"), "model": None,
@@ -731,6 +883,28 @@ def create_customize_recipe_blueprint(
         dedupe_key = None
         dedupe_fut = None
         final: tuple[dict, int] | None = None
+        body = None
+        used = None
+        limit = None
+        premium = None
+
+        def soft_reply(kind: str, err_code: str | None = None):
+            """200 with status clarify and a friendly message instead of an error screen.
+            Not counted against the daily limit and not replayed for duplicate retries."""
+            log["softFail"] = kind
+            if err_code:
+                log["error"] = err_code
+            payload = {
+                "requestId": request_id,
+                "status": "clarify",
+                "assistantMessage": _friendly_fallback(kind, body or {}),
+                "recipe": None,
+                "changes": None,
+                "usage": {"usedToday": used if used is not None else 0,
+                          "limitToday": limit if limit is not None else PREMIUM_DAILY_LIMIT},
+            }
+            return respond(payload, 200)
+
         try:
             # 1. Authenticate
             auth_header = request.headers.get("Authorization") or ""
@@ -763,45 +937,58 @@ def create_customize_recipe_blueprint(
                 try:
                     prior = fut.result(timeout=max(0.0, deadline - time.monotonic()))
                 except FutureTimeoutError:
-                    raise ApiError(504, "timeout", "This is taking longer than expected. Please try again.")
+                    return soft_reply("timeout", "timeout")
                 if prior is not None:
                     log["duplicate"] = True
                     return respond(*prior)
                 fut, owner = _dedupe_claim(dedupe_key)  # original failed; take over
                 if not owner:
-                    raise ApiError(504, "timeout", "This is taking longer than expected. Please try again.")
+                    return soft_reply("timeout", "timeout")
             dedupe_fut = fut
 
             # 3. Check the limit
             t_fs = time.monotonic()
-            db = get_db()
-            premium = bool(is_premium(db, uid))
-            limit = PREMIUM_DAILY_LIMIT if premium else FREE_DAILY_LIMIT
-            log["premium"] = premium
-            if limit <= 0:
-                raise ApiError(403, "premium_required", "Recipe customization is a premium feature.")
-            used = int(read_usage(db, uid))
+            db = None
+            try:
+                db = get_db()
+                premium = bool(is_premium(db, uid))
+                limit = PREMIUM_DAILY_LIMIT if premium else FREE_DAILY_LIMIT
+                log["premium"] = premium
+                if limit <= 0:
+                    raise ApiError(403, "premium_required", "Recipe customization is a premium feature.")
+                used = int(read_usage(db, uid))
+            except ApiError:
+                raise
+            except Exception as e:
+                # Firestore hiccup: let the user through rather than failing (fail open).
+                print(f"[customize-recipe] usage check failed, allowing request: {type(e).__name__}: {e}")
+                log["firestoreError"] = type(e).__name__
+                premium, limit, used = None, PREMIUM_DAILY_LIMIT, 0
             timings["firestoreReadMs"] = int((time.monotonic() - t_fs) * 1000)
             if used >= limit:
                 msg = (f"You've used today's {limit} free customizations." if not premium
                        else f"You've used today's {limit} customizations. Come back tomorrow!")
                 raise ApiError(429, "limit_reached", msg)
 
+            if not body["prompt"]:
+                return soft_reply("empty_prompt")
+
             # 4 + 5. Call Claude, then recompute nutrition (within the 45 s budget)
             model = _pick_model(body["mode"])
             log["model"] = model
-            job = executor.submit(_run_model_and_nutrition, body, model, deadline)
+            attempts: list = []
+            log["retries"] = attempts
+            job = executor.submit(_run_model_and_nutrition, body, model, deadline, attempts)
             try:
                 result = job.result(timeout=max(0.0, deadline - time.monotonic()))
             except FutureTimeoutError:
-                raise ApiError(504, "timeout", "This is taking longer than expected. Please try again.")
-            except ApiError:
-                raise
+                return soft_reply("timeout", "timeout")
             except Exception as e:
-                if _is_timeout_exception(e):
-                    raise ApiError(504, "timeout", "This is taking longer than expected. Please try again.")
-                print(f"[customize-recipe] Claude call failed: {type(e).__name__}: {e}")
-                raise ApiError(502, "model_error", "We couldn't customize this recipe. Please try again.")
+                kind = getattr(e, "_customize_kind", None) or _failure_kind(e)
+                t = getattr(e, "_customize_tokens", None) or {}
+                log["inputTokens"], log["outputTokens"] = t.get("input"), t.get("output")
+                print(f"[customize-recipe] model step failed ({kind}): {type(e).__name__}: {str(e)[:300]}")
+                return soft_reply(kind, "model_error" if kind != "timeout" else "timeout")
             tokens = result.pop("_tokens", {}) or {}
             timings.update(result.pop("_timings", {}) or {})
             if "_nutrition_source" in result:
@@ -811,7 +998,7 @@ def create_customize_recipe_blueprint(
             log["status"] = result["status"]
 
             # 6. Count the use (only when updated)
-            if result["status"] == "updated":
+            if result["status"] == "updated" and db is not None:
                 t_inc = time.monotonic()
                 try:
                     used = int(increment_usage(db, uid, request_id))
@@ -839,8 +1026,10 @@ def create_customize_recipe_blueprint(
                 log["errorMessage"] = err.message  # which field failed validation
             return respond(_error_body(request_id, err), err.http)
         except Exception as e:
-            log["error"] = "internal_error"
             print(f"[customize-recipe] unexpected error: {type(e).__name__}: {e}")
+            if body is not None and log.get("uid"):
+                return soft_reply("internal", "internal_error")
+            log["error"] = "internal_error"
             return respond(_error_body(request_id, ApiError(
                 500, "internal_error", "We ran into a problem. Please try again in a moment.")), 500)
         finally:

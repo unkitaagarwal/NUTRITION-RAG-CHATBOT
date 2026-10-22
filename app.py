@@ -10473,8 +10473,61 @@ def _customize_recompute_nutrition(recipe: dict) -> dict | None:
 
 from customize_recipe import create_customize_recipe_blueprint
 
+def _customize_nutrition_change(payload: dict) -> dict | None:
+    """Estimate how a customization's ingredient changes move per-serving nutrition.
+
+    The original per-serving numbers (what the app already shows) are taken as correct, so
+    only the effect of the changes is estimated: final = original + change. Untouched values
+    can't drift. Returns {calories, protein, carbs, fat, <micronutrient keys>} as per-serving
+    deltas, or None on failure (the caller falls back to Claude's anchored estimate).
+    """
+    original = payload.get("original") or {}
+    keys = ["calories", "protein", "carbs", "fat"] + [k for k in _RECIPE_MICRONUTRIENT_KEYS if k in original]
+    system = (
+        "You estimate how ingredient changes affect a recipe's PER-SERVING nutrition. "
+        "The original per-serving nutrition is correct; do not re-estimate it. Estimate only the "
+        "change caused by the listed ingredient edits, per serving: added items add their "
+        "nutrition, removed items subtract theirs, changed items add the difference between the "
+        "new and old amount. If servings changed and amounts were scaled to match, per-serving "
+        "values barely change. A value no edit affects must be exactly 0. Positive = increase, "
+        "negative = decrease. Units: calories kcal, protein/carbs/fat grams, other keys by suffix. "
+        "Return ONLY JSON with numeric values for exactly these keys: " + ", ".join(keys) + "."
+    )
+    user = json.dumps({
+        "recipe": payload.get("title") or "",
+        "servingsBefore": payload.get("servingsBefore"),
+        "servingsAfter": payload.get("servingsAfter"),
+        "originalPerServing": original,
+        "originalIngredients": payload.get("originalIngredients") or [],
+        "ingredientChanges": payload.get("diff") or {},
+    }, ensure_ascii=False)
+    try:
+        completion = client.chat.completions.create(
+            model=RECIPE_LLM_MODEL,
+            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+            temperature=0,
+            max_tokens=300,
+            response_format={"type": "json_object"},
+            timeout=EXTRACT_RECIPE_STEPS_TIMEOUT,
+        )
+        data = json.loads(completion.choices[0].message.content.strip()) or {}
+        out = {}
+        for k in keys:
+            try:
+                out[k] = float(data.get(k) or 0)
+            except (TypeError, ValueError):
+                out[k] = 0.0
+        return out
+    except Exception as e:
+        print(f"⚠️ Customize nutrition change estimate failed: {type(e).__name__}: {e}")
+        return None
+
+
 app.register_blueprint(
-    create_customize_recipe_blueprint(recompute_nutrition=_customize_recompute_nutrition)
+    create_customize_recipe_blueprint(
+        recompute_nutrition=_customize_recompute_nutrition,
+        estimate_nutrition_change=_customize_nutrition_change,
+    )
 )
 
 

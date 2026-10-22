@@ -130,6 +130,11 @@ SYSTEM_PROMPT = (
     "under 20 minutes, kid-friendly, and end with a short question. For an impossible change, offer "
     "the closest version that keeps the dish (e.g. a mushroom version of a beef stew). "
     "Never return status updated with edits that change nothing."
+    "\n\nNutrition: start edits.nutrition from the recipe's current per-serving nutrition and "
+    "adjust only for what your edits change; values your edits don't affect must stay exactly the "
+    "same. When you mention nutrition in changes or assistantMessage, use per-serving numbers that "
+    "match edits.nutrition (e.g. 'Protein up from 20g to 28g') and the recipe's current values for "
+    "anything kept."
     "\n\nRespond only with JSON matching the required schema. "
     "assistantMessage is plain text (no markdown), at most about 600 characters. "
     "Return ONLY what changes, never the whole recipe. Ingredients and steps are numbered "
@@ -702,6 +707,177 @@ def _final_nutrition(recomputed: dict | None, model_nutrition: dict | None, orig
     return out
 
 
+# ── Consistent nutrition (one source of truth for every number the user sees) ──
+
+MACRO_KEYS = ("calories", "protein", "carbs", "fat")
+
+
+def _usable_nutrition(n) -> dict | None:
+    """Numeric per-serving values from the client's recipe, or None if it has no real numbers."""
+    if not isinstance(n, dict):
+        return None
+    out = {}
+    for k in MACRO_KEYS + MICRONUTRIENT_KEYS:
+        try:
+            if n.get(k) is not None and n.get(k) != "":
+                out[k] = float(n[k])
+        except (TypeError, ValueError):
+            continue
+    if any(k not in out for k in MACRO_KEYS) or out["calories"] <= 0:
+        return None
+    return out
+
+
+def _ingredient_line(ing: dict) -> str:
+    return " ".join(str(ing.get(k) or "").strip() for k in ("amount", "unit", "name")
+                    if str(ing.get(k) or "").strip())
+
+
+def _ingredient_diff(before: list, after: list) -> dict:
+    """What changed in the ingredient list: removed / added / changed (same name, new amount)."""
+    def by_name(items):
+        out = {}
+        for i in items or []:
+            if isinstance(i, dict) and str(i.get("name") or "").strip():
+                out.setdefault(str(i["name"]).strip().lower(), []).append(_ingredient_line(i))
+        return out
+    b, a = by_name(before), by_name(after)
+    diff = {"removed": [], "added": [], "changed": []}
+    for name in b.keys() | a.keys():
+        old, new = sorted(b.get(name, [])), sorted(a.get(name, []))
+        if old == new:
+            continue
+        if old and new:
+            diff["changed"].append({"before": "; ".join(old), "after": "; ".join(new)})
+        elif old:
+            diff["removed"].extend(old)
+        else:
+            diff["added"].extend(new)
+    return diff
+
+
+def _anchored_nutrition(original: dict, values: dict) -> dict:
+    """Original nutrition dict with the given numeric values written over it (keeps extra keys)."""
+    out = dict(original or {})
+    for k, v in values.items():
+        n = _num(v, integer=(k == "calories"))
+        if n is not None:
+            out[k] = n
+    out["basis"] = "per_serving"
+    return out
+
+
+_GOALS = {
+    # preset id -> (description for the retry note, check(before, after))
+    "more_protein": ("raise protein", lambda b, a: a["protein"] > b["protein"]),
+    "healthier": ("make it lighter (fewer calories or less fat)",
+                  lambda b, a: (a["calories"] < b["calories"] or a["fat"] < b["fat"])
+                  and a["calories"] <= b["calories"] * 1.05),
+}
+
+
+def _goal_check(pid: str | None, before: dict | None, after: dict) -> str | None:
+    """None if the preset's goal is met (or has no nutrition goal); else a short explanation."""
+    goal = _GOALS.get(pid or "")
+    if not goal or not before:
+        return None
+    try:
+        a = {k: float(after[k]) for k in MACRO_KEYS}
+    except (KeyError, TypeError, ValueError):
+        return None
+    if goal[1](before, a):
+        return None
+    return (f"Your edits didn't actually {goal[0]}: per serving it went from {_fmt(before['calories'])} "
+            f"to {_fmt(a['calories'])} kcal, protein {_fmt(before['protein'])}g to {_fmt(a['protein'])}g, "
+            f"fat {_fmt(before['fat'])}g to {_fmt(a['fat'])}g.")
+
+
+def _fmt(v) -> str:
+    n = _num(v)
+    return "" if n is None else str(n)
+
+
+_NUM_UNIT_RE = _re.compile(r"(\d+(?:\.\d+)?)\s*(kcal|calories|cal|grams|gram|g)\b", _re.I)
+_MACRO_WORDS = (
+    ("saturated_fat_g", ("saturated fat", "sat fat")),
+    ("fiber_g", ("fiber", "fibre")),
+    ("sugar_g", ("sugar",)),
+    ("protein", ("protein",)),
+    ("carbs", ("carb",)),
+    ("fat", ("fat",)),
+    ("calories", ("calorie", "kcal", "cal")),
+)
+
+
+def _macro_near(sentence: str, start: int, end: int, unit: str) -> str | None:
+    if unit.lower() in ("kcal", "calories", "cal"):
+        return "calories"
+    window = sentence.lower()
+    best, best_dist = None, 10 ** 6
+    for key, words in _MACRO_WORDS:
+        if key == "calories":
+            continue
+        for w in words:
+            for m in _re.finditer(_re.escape(w), window):
+                if key == "fat" and window[max(0, m.start() - 10):m.start()].strip().endswith("saturated"):
+                    continue
+                dist = min(abs(m.start() - end), abs(start - m.end()))
+                if dist < best_dist:
+                    best, best_dist = key, dist
+    return best if best_dist <= 40 else None
+
+
+_NUTRITION_PHRASE_BEFORE = _re.compile(
+    r"(?:\bfrom|\bto|\bup|\bdown|\bnow|\bat|\bnearly|\babout|\baround|~)\s*$", _re.I)
+_NUTRITION_PHRASE_AFTER = _re.compile(r"^\s*(?:per serving|a serving|each)", _re.I)
+
+
+def _macro_in(text: str) -> str | None:
+    """The first nutrition value a short text talks about ('Protein increased...' -> protein)."""
+    low = (text or "").lower()
+    best = None
+    for key, words in _MACRO_WORDS:
+        for w in words:
+            i = low.find(w)
+            if i >= 0 and (best is None or i < best[0]):
+                best = (i, key)
+    return best[1] if best else None
+
+
+def _sync_numbers_in_text(text: str, before: dict | None, after: dict,
+                          default_key: str | None = None) -> str:
+    """Rewrite nutrition numbers in user-facing text so they match the numbers on screen.
+    In a sentence with two numbers for the same value ('from 20g to 30g'), the first is the
+    original and the last is the updated value; a single number is the updated value."""
+    if not text or not _NUM_UNIT_RE.search(text):
+        return text
+    out = []
+    for sentence in _re.split(r"(?<=[.!?])\s+", text):
+        hits = []
+        for m in _NUM_UNIT_RE.finditer(sentence):
+            key = _macro_near(sentence, m.start(), m.end(), m.group(2))
+            if key is None and default_key and (
+                    _NUTRITION_PHRASE_BEFORE.search(sentence[:m.start()])
+                    or _NUTRITION_PHRASE_AFTER.search(sentence[m.end():])):
+                key = default_key  # e.g. detail "Up from 20g to 30g" under a "Protein ..." title
+            if key and after.get(key) is not None:
+                hits.append((m, key))
+        per_key = {}
+        for m, key in hits:
+            per_key.setdefault(key, []).append(m)
+        repl = {}
+        for key, ms in per_key.items():
+            for i, m in enumerate(ms):
+                use_before = len(ms) > 1 and i < len(ms) - 1 and before and before.get(key) is not None
+                val = (before or {}).get(key) if use_before else after.get(key)
+                repl[m.start()] = (m.end(1), _fmt(round(float(val)) if key == "calories" else val))
+        for start in sorted(repl, reverse=True):
+            end1, val = repl[start]
+            sentence = sentence[:start] + val + sentence[end1:]
+        out.append(sentence)
+    return " ".join(out)
+
+
 # ── Friendly fallbacks (never show the user an error screen) ───────────────────
 
 _TRANSIENT_MARKERS = ("overloaded", "ratelimit", "rate_limit", "internalserver", "connection",
@@ -711,7 +887,8 @@ _TRANSIENT_MARKERS = ("overloaded", "ratelimit", "rate_limit", "internalserver",
 def _failure_kind(e: Exception) -> str:
     """Classify a failure from the model step: no_change | cut_off | bad_output | timeout | transient."""
     if isinstance(e, ApiError):
-        return {"no_change": "no_change", "cut_off": "cut_off"}.get(e.code, "bad_output")
+        return {"no_change": "no_change", "cut_off": "cut_off",
+                "goal_not_met": "goal_not_met"}.get(e.code, "bad_output")
     if _is_timeout_exception(e):
         return "timeout"
     return "transient"   # SDK overload / rate limit / 5xx / connection, or anything unexpected
@@ -741,6 +918,10 @@ def _friendly_fallback(kind: str, body: dict) -> str:
         return ("I couldn't find a meaningful change to make for that, so I've left the recipe as it is. "
                 "Could you tell me a bit more about what you'd like? For example healthier, quicker "
                 "or higher in protein.")
+    if kind == "goal_not_met" and pid:
+        alts = [_label(a) for a in PRESET_ALTERNATIVES.get(pid, ("healthier", "under_20"))]
+        return (f"I couldn't find a good way to make {title} \u201c{_label(pid)}\u201d without changing "
+                f"the dish too much, so I've left it as it is. Want to try {alts[0]} or {alts[1]} instead?")
     if pid:
         return (f"Sorry, I couldn't finish the \u201c{_label(pid)}\u201d change for {title} just now. "
                 "Tap it again, or tell me what you'd like to change.")
@@ -752,6 +933,7 @@ def _friendly_fallback(kind: str, body: dict) -> str:
 def create_customize_recipe_blueprint(
     *,
     recompute_nutrition: Callable[[dict], dict | None] | None = None,
+    estimate_nutrition_change: Callable[[dict], dict | None] | None = None,
     verify_token: Callable[[str], str] = _default_verify_token,
     get_db: Callable[[], Any] = _default_firestore,
     claude_call: Callable[..., Any] = _default_claude_call,
@@ -798,10 +980,91 @@ def create_customize_recipe_blueprint(
                 dedupe.pop(key, None)
                 fut.set_result(None)  # waiters fall through and run their own attempt
 
+    def _finalize_nutrition(body: dict, result: dict) -> None:
+        """Set result["recipe"]["nutrition"] so every number on screen agrees.
+
+        Anchored path (the recipe already has nutrition): the original numbers are the
+        baseline the app shows as "Original". Only the effect of the ingredient changes is
+        estimated (original + change), so untouched values cannot drift. No ingredient
+        changes -> the numbers stay exactly the same, with no estimate at all.
+        Then the preset goal is checked and any numbers in the text are aligned.
+        """
+        original_raw = body["recipe"].get("nutrition") or {}
+        before = _usable_nutrition(original_raw)
+        updated = result["recipe"]
+        model_n = result.get("_model_nutrition")
+        diff = _ingredient_diff(body["recipe"].get("ingredients"), updated.get("ingredients"))
+        servings_changed = updated.get("servings") != body["recipe"].get("servings")
+        source = "original"
+
+        if before:
+            if not any(diff.values()):
+                final = _anchored_nutrition(original_raw, {})
+                source = "unchanged"
+            else:
+                final, delta = None, None
+                if estimate_nutrition_change is not None:
+                    try:
+                        delta = estimate_nutrition_change({
+                            "title": updated.get("title") or body["recipe"].get("title") or "",
+                            "servingsBefore": body["recipe"].get("servings"),
+                            "servingsAfter": updated.get("servings"),
+                            "servingsChanged": servings_changed,
+                            "original": {k: v for k, v in before.items()},
+                            "originalIngredients": [_ingredient_line(i) for i in body["recipe"].get("ingredients") or []],
+                            "diff": diff,
+                        })
+                    except Exception as e:
+                        print(f"[customize-recipe] nutrition change estimate failed: {type(e).__name__}: {e}")
+                if isinstance(delta, dict):
+                    vals = {}
+                    for k, base in before.items():
+                        try:
+                            vals[k] = max(0.0, base + float(delta.get(k) or 0))
+                        except (TypeError, ValueError):
+                            vals[k] = base
+                    if vals["calories"] > 0:
+                        final, source = _anchored_nutrition(original_raw, vals), "anchored_delta"
+                if final is None:
+                    final = _final_nutrition(None, model_n, original_raw)
+                    final = _anchored_nutrition(original_raw, {k: final.get(k) for k in MACRO_KEYS})
+                    source = "model_anchored"
+            # Goal check: a preview must not contradict the chip that was tapped.
+            pid = body.get("presetId") if body.get("mode") == "preset" else None
+            problem = _goal_check(pid, before, final)
+            if problem and source == "anchored_delta" and isinstance(model_n, dict):
+                alt = _final_nutrition(None, model_n, original_raw)
+                if not _goal_check(pid, before, alt):
+                    final = _anchored_nutrition(final, {k: alt.get(k) for k in MACRO_KEYS})
+                    source, problem = "model_anchored", None
+            if problem:
+                raise ApiError(502, "goal_not_met", problem)
+        else:
+            # The recipe arrived without nutrition: nothing to anchor to, estimate it whole.
+            recomputed = None
+            if recompute_nutrition is not None:
+                try:
+                    recomputed = recompute_nutrition(updated)
+                except Exception as e:  # best-effort; fall back below
+                    print(f"[customize-recipe] nutrition recompute failed: {e}")
+            final = _final_nutrition(recomputed, model_n, original_raw)
+            source = "recomputed" if recomputed else "model_or_original"
+
+        updated["nutrition"] = final
+        result["_nutrition_source"] = source
+        # Words must match the numbers on screen.
+        result["assistantMessage"] = _sync_numbers_in_text(result["assistantMessage"], before, final)
+        kind_macro = {"more_protein": "protein"}
+        for ch in result.get("changes") or []:
+            hint = _macro_in(ch["title"]) or kind_macro.get(ch.get("kind"))
+            ch["title"] = _sync_numbers_in_text(ch["title"], before, final, hint)
+            ch["detail"] = _sync_numbers_in_text(ch["detail"], before, final, hint)
+
     def _run_model_and_nutrition(body: dict, model: str, deadline: float, attempts: list) -> dict:
         t0 = time.monotonic()
         tokens = {"input": None, "output": None}
         note, max_tokens = "", CLAUDE_MAX_TOKENS
+        nutrition_ms = 0
         for attempt in (1, 2):
             try:
                 remaining = max(1.0, deadline - time.monotonic())
@@ -821,6 +1084,10 @@ def create_customize_recipe_blueprint(
                 if getattr(resp, "stop_reason", None) == "max_tokens":
                     raise ApiError(502, "cut_off", "The model response was cut off.")
                 result = _normalize_model_output(_tool_input_from_response(resp), body["recipe"])
+                if result["status"] == "updated":
+                    t1 = time.monotonic()
+                    _finalize_nutrition(body, result)
+                    nutrition_ms += int((time.monotonic() - t1) * 1000)
                 break
             except Exception as e:
                 kind = _failure_kind(e)
@@ -840,24 +1107,12 @@ def create_customize_recipe_blueprint(
                     note = "\n\n(Keep the edits minimal and assistantMessage short.)"
                 elif kind == "bad_output":
                     note = "\n\n(Return valid JSON that matches the schema exactly.)"
+                elif kind == "goal_not_met":
+                    note = (f"\n\n({e.message} Make edits that clearly achieve the request with "
+                            "realistic amounts, or use status clarify if it can't be done well.)")
                 elif kind == "transient":
                     time.sleep(min(1.0, max(0.0, left - MIN_RETRY_SECONDS)))
-        claude_ms = int((time.monotonic() - t0) * 1000)
-        nutrition_ms = 0
-
-        if result["status"] == "updated":
-            recomputed = None
-            t1 = time.monotonic()
-            if recompute_nutrition is not None:
-                try:
-                    recomputed = recompute_nutrition(result["recipe"])
-                except Exception as e:  # nutrition is best-effort; fall back below
-                    print(f"[customize-recipe] nutrition recompute failed: {e}")
-            result["recipe"]["nutrition"] = _final_nutrition(
-                recomputed, result["_model_nutrition"], body["recipe"].get("nutrition"),
-            )
-            nutrition_ms = int((time.monotonic() - t1) * 1000)
-            result["_nutrition_source"] = "recomputed" if recomputed else "model_or_original"
+        claude_ms = int((time.monotonic() - t0) * 1000) - nutrition_ms
         result.pop("_model_nutrition", None)
         result["_tokens"] = tokens
         result["_timings"] = {"claudeMs": claude_ms, "nutritionMs": nutrition_ms}

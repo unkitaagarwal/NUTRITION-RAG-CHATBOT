@@ -86,6 +86,7 @@ PREFETCH_COLLECTION = os.getenv("ASK_RECIPES_PREFETCH_COLLECTION", "ask_recipes_
 PREFETCH_MINUTES = _env_int("ASK_RECIPES_PREFETCH_MINUTES", 30)
 PREFETCH_TIMEOUT_SECONDS = _env_int("ASK_RECIPES_PREFETCH_TIMEOUT_SECONDS", 60)
 MORE_PROMPT = "Show more like these"
+DESCRIPTION_MAX_CHARS = int(os.getenv("ASK_RECIPES_DESCRIPTION_MAX_CHARS", "100"))
 
 CACHE_COLLECTION = os.getenv("ASK_RECIPES_CACHE_COLLECTION", "ask_recipes_cache")
 CACHE_TTL_DAYS = _env_int("ASK_RECIPES_CACHE_TTL_DAYS", 30)
@@ -133,7 +134,12 @@ SYSTEM_PROMPT = (
     "(string, may be empty), unit (may be empty) and note (preparation, may be empty). "
     "Steps are in order; give durationMinutes only when a step has a clear duration. tags are "
     "up to 3 short display labels (e.g. 'High protein', 'Quick'); dietaryTags are lowercase "
-    "machine values such as vegetarian, vegan, gluten_free, dairy_free. nutrition is your "
+    "machine values such as vegetarian, vegan, gluten_free, dairy_free. description is ONE "
+    "short sentence of at most 90 characters that tells the user why this recipe is worth "
+    "cooking: what it tastes like or its standout ingredient, plus why it fits their request or "
+    "preferences (e.g. 'Smoky chickpeas and crispy kale make this a filling, meat-free weeknight "
+    "bowl.'). Don't repeat the title, don't start with 'A' or 'This recipe', and don't state "
+    "numbers (time, calories, grams); the app already shows those. nutrition is your "
     "per-serving estimate (the server recomputes it). followUps: type 'more' for 'Show more "
     "like these', 'refine' for anything that narrows or changes the results. When status is "
     "not results, return recipes as [] and followUps as []."
@@ -158,7 +164,9 @@ _RECIPE_SCHEMA = {
     "type": "object",
     "properties": {
         "title": {"type": "string"},
-        "description": {"type": "string"},
+        "description": {"type": "string",
+                        "description": "One sentence, max 90 characters: why it's worth cooking "
+                                       "and why it fits the request. No numbers, no title."},
         "prepMinutes": {"type": "integer"},
         "cookMinutes": {"type": "integer"},
         "servings": {"type": "integer"},
@@ -429,6 +437,40 @@ def _allergy_terms(allergies: list[str]) -> list[str]:
     return sorted(terms)
 
 
+def _fit_description(text: str, limit: int = DESCRIPTION_MAX_CHARS) -> str:
+    """Trim to `limit` characters at a clean boundary (sentence end, then word), never mid-word."""
+    text = _re.sub(r"\s+", " ", (text or "")).strip().strip('"\u201c\u201d').strip()
+    if len(text) <= limit:
+        return text
+    cut = text[:limit]
+    end = max(cut.rfind(". "), cut.rfind("! "), cut.rfind("? "))
+    if end >= 40:
+        return cut[:end + 1]
+    cut = cut[:limit - 1].rsplit(" ", 1)[0].rstrip(" ,;:-\u2013\u2014")
+    for word in (" and", " with", " or", " for", " of", " the", " a", " to", " in"):
+        if cut.lower().endswith(word):
+            cut = cut[: -len(word)].rstrip(" ,;:")
+    return cut + "\u2026"
+
+
+def _fallback_description(title: str, raw: dict, ingredients: list) -> str:
+    """Built from the recipe's own data when the model left the description empty."""
+    skip = {"salt", "pepper", "black pepper", "water", "oil", "olive oil", "cooking spray"}
+    title_low = title.lower()
+    stars = [i["name"] for i in ingredients
+             if i["name"].lower() not in skip and i["name"].lower() not in title_low][:2]
+    cuisine = str(raw.get("cuisine") or "").strip()
+    meal = str(raw.get("mealType") or "").strip().lower() or "meal"
+    lead = f"{cuisine} {meal}" if cuisine else f"Easy {meal}"
+    if len(stars) == 2:
+        text = f"{lead} with {stars[0]} and {stars[1]}."
+    elif stars:
+        text = f"{lead} built around {stars[0]}."
+    else:
+        text = f"{lead} you can make at home."
+    return _fit_description(text[0].upper() + text[1:])
+
+
 def _normalize_recipe(raw: dict, servings_default: int) -> dict | None:
     if not isinstance(raw, dict) or not _is_str(raw.get("title")) or not raw["title"].strip():
         return None
@@ -453,7 +495,8 @@ def _normalize_recipe(raw: dict, servings_default: int) -> dict | None:
     cook = _int(raw.get("cookMinutes"))
     return {
         "title": raw["title"].strip(),
-        "description": str(raw.get("description") or "").strip(),
+        "description": (_fit_description(str(raw.get("description") or ""))
+                        or _fallback_description(raw["title"].strip(), raw, ingredients)),
         "prepMinutes": prep,
         "cookMinutes": cook,
         "totalMinutes": prep + cook,

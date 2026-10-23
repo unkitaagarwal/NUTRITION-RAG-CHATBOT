@@ -4897,10 +4897,10 @@ def extract_recipe_diet_flags(recipe: dict) -> list[str]:
     return list(dict.fromkeys(f for f in flags if f in DIET_FLAGS))
 
 
-def _short_recipe_description(recipe: dict, *, language: str | None = None) -> str:
+def _legacy_short_description(recipe: dict, *, language: str | None = None) -> str:
     """
-    Build a short, one-line summary of the recipe (max 100 chars) for /extract-recipe response.
-    Uses recipe name + diet/style flags. Ends with a full stop; no ellipsis.
+    OLD description builder (diet flags + name, cut at 99 chars). Kept only so cache hits can
+    recognise descriptions produced by it and replace them with a written one.
     """
     if not recipe:
         return ""
@@ -5553,7 +5553,149 @@ def _ensure_cached_recipe_complete(payload: dict) -> None:
                 payload["warnings"] = warnings
             else:
                 payload.pop("warnings", None)
+        desc = str(recipe.get("description") or "").strip()
+        if not desc or desc == _legacy_short_description(recipe, language=lang):
+            fut = _start_recipe_description(recipe, language=lang)
+            recipe["description"] = _finish_recipe_description(recipe, fut, language=lang)
     _ensure_cached_recipe_nutrition(payload)
+
+
+EXTRACT_RECIPE_DESCRIPTION_MAX_CHARS = int(os.getenv("EXTRACT_RECIPE_DESCRIPTION_MAX_CHARS", "100"))
+EXTRACT_RECIPE_DESCRIPTION_TIMEOUT = float(os.getenv("EXTRACT_RECIPE_DESCRIPTION_TIMEOUT", "8"))
+_description_executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="recipe-desc")
+
+_DESCRIPTION_SKIP_INGREDIENTS = {
+    "salt", "pepper", "black pepper", "salt and pepper", "water", "oil", "olive oil",
+    "vegetable oil", "cooking spray", "ice",
+}
+
+
+def _fit_recipe_description(text: str, limit: int = EXTRACT_RECIPE_DESCRIPTION_MAX_CHARS) -> str:
+    """Clean up and trim to `limit` chars at a clean boundary (sentence end, then word)."""
+    text = re.sub(r"#\w+", "", text or "")                      # hashtags
+    text = re.sub(r"[\U0001F000-\U0001FAFF\u2600-\u27BF\uFE0F]", "", text)  # emoji
+    text = re.sub(r"\s+", " ", text).strip().strip('"\u201c\u201d\'').strip()
+    if not text:
+        return ""
+    if len(text) > limit:
+        cut = text[:limit]
+        end = max(cut.rfind(". "), cut.rfind("! "), cut.rfind("? "))
+        if end >= 40:
+            text = cut[:end + 1]
+        else:
+            cut = cut[:limit - 1].rsplit(" ", 1)[0].rstrip(" ,;:-\u2013\u2014")
+            for word in (" and", " with", " or", " for", " of", " the", " a", " to", " in"):
+                if cut.lower().endswith(word):
+                    cut = cut[: -len(word)].rstrip(" ,;:")
+            return cut + "\u2026"
+    text = text[0].upper() + text[1:]
+    return text if text[-1] in ".!?\u2026" else text + "."
+
+
+def _fallback_recipe_description(recipe: dict, *, language: str | None = None) -> str:
+    """Written from the recipe's own data when the LLM is unavailable."""
+    name = (recipe.get("name") or "").strip()
+    if language and language != "en":
+        return _fit_recipe_description(name)
+    title_low = name.lower()
+    stars = []
+    for ing in recipe.get("ingredients") or []:
+        n = (ing.get("name") if isinstance(ing, dict) else str(ing or "")).strip()
+        n = re.sub(r"\s*\(.*?\)", "", n).split(",")[0].strip()
+        if n and n.lower() not in _DESCRIPTION_SKIP_INGREDIENTS and n.lower() not in title_low:
+            stars.append(n.lower())
+        if len(stars) == 2:
+            break
+    cuisine = (recipe.get("cuisine") or "").strip()
+    meal = (recipe.get("meal_type") or "").strip().lower() or "dish"
+    lead = f"{cuisine} {meal}" if cuisine and cuisine.lower() != "other" else f"Homemade {meal}"
+    if len(stars) == 2:
+        text = f"{lead} with {stars[0]} and {stars[1]}."
+    elif stars:
+        text = f"{lead} built around {stars[0]}."
+    else:
+        text = f"{lead} you can make at home." if not name else f"{lead}: {name}."
+    return _fit_recipe_description(text)
+
+
+def _write_recipe_description_llm(snapshot: dict, *, language: str | None = None) -> str:
+    """One short, useful sentence about the recipe ('' on failure)."""
+    if language and language != "en":
+        lang_rule = f" Write it in {_LANGUAGE_NAMES.get(language, language)}."
+    else:
+        lang_rule = " Write it in the same language as the recipe name."
+    system = (
+        "Write a one-sentence description for a recipe card in a cooking app. At most 90 "
+        "characters. It must help someone decide whether to cook it: say what it tastes or "
+        "feels like and its standout ingredients, and what kind of meal it is good for "
+        "(e.g. 'Smoky lentils in a tangy tomato sauce, piled into roasted sweet potatoes for "
+        "a cosy dinner.'). Use plain, everyday words. Don't repeat the full recipe name, don't "
+        "start with 'A', 'An' or 'This recipe', and don't include numbers (time, calories, "
+        "grams), hashtags, emoji or the creator's name. Only describe what the ingredients and "
+        "steps support; don't call it healthy, keto, low-carb or similar unless that is "
+        "obviously true from the ingredients." + lang_rule +
+        ' Return ONLY JSON: {"description": ""}'
+    )
+    try:
+        completion = client.chat.completions.create(
+            model=RECIPE_LLM_MODEL,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": json.dumps(snapshot, ensure_ascii=False)},
+            ],
+            temperature=0.4,
+            max_tokens=120,
+            response_format={"type": "json_object"},
+            timeout=EXTRACT_RECIPE_DESCRIPTION_TIMEOUT,
+        )
+        data = json.loads(completion.choices[0].message.content.strip()) or {}
+        return _fit_recipe_description(str(data.get("description") or ""))
+    except Exception as e:
+        print(f"⚠️ Recipe description failed: {type(e).__name__}: {e}")
+        return ""
+
+
+def _description_snapshot(recipe: dict, source_description: str = "") -> dict:
+    ings = []
+    for ing in (recipe.get("ingredients") or [])[:15]:
+        n = ing.get("name") if isinstance(ing, dict) else str(ing or "")
+        if str(n or "").strip():
+            ings.append(str(n).strip())
+    steps = [str(st).strip()[:160] for st in (recipe.get("instructions") or []) if str(st).strip()][:4]
+    snap = {
+        "name": (recipe.get("name") or "").strip(),
+        "cuisine": (recipe.get("cuisine") or "").strip(),
+        "mealType": (recipe.get("meal_type") or "").strip(),
+        "ingredients": ings,
+        "firstSteps": steps,
+    }
+    if source_description and source_description.strip():
+        snap["sourceBlurb"] = source_description.strip()[:300]
+    return snap
+
+
+def _start_recipe_description(recipe: dict, *, language: str | None = None, source_description: str = ""):
+    """Start writing the description in the background (overlaps the metadata/nutrition calls)."""
+    if not ((recipe.get("name") or "").strip() or recipe.get("ingredients")):
+        return None
+    try:
+        return _description_executor.submit(
+            _write_recipe_description_llm, _description_snapshot(recipe, source_description),
+            language=language,
+        )
+    except Exception as e:
+        print(f"⚠️ Could not start description: {e}")
+        return None
+
+
+def _finish_recipe_description(recipe: dict, future, *, language: str | None = None) -> str:
+    text = ""
+    if future is not None:
+        try:
+            text = future.result(timeout=EXTRACT_RECIPE_DESCRIPTION_TIMEOUT)
+        except Exception as e:
+            print(f"⚠️ Recipe description not ready: {type(e).__name__}")
+    return text or _fallback_recipe_description(recipe, language=language)
 
 
 def _enrich_recipe_response(recipe: dict, *, language: str | None = None) -> None:
@@ -5575,9 +5717,13 @@ def _enrich_recipe_response(recipe: dict, *, language: str | None = None) -> Non
         if not (recipe.get("cuisine") or "").strip():
             recipe["cuisine"] = ""
         recipe["diet_flags"] = []
+    # Written in parallel with the metadata / nutrition estimates below.
+    desc_future = _start_recipe_description(
+        recipe, language=language, source_description=str(recipe.get("description") or ""),
+    )
     _fill_missing_recipe_metadata(recipe, language=language)
     _ensure_recipe_nutrition_macros(recipe, language=language)
-    recipe["description"] = _short_recipe_description(recipe, language=language)
+    recipe["description"] = _finish_recipe_description(recipe, desc_future, language=language)
 
 
 def _guess_difficulty_from_tags(tags: list[str]) -> str:

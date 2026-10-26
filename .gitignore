@@ -82,3 +82,7 @@ batch_tests/recent_imports.csv
 batch_tests/ab_results.csv
 batch_tests/*.jsonl
 batch_tests/*.jsonl.bak
+batch_tests/wide_set.csv
+batch_tests/web_subset.csv
+batch_tests/regression_net.csv
+batch_tests/*_ab.csv

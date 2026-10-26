@@ -92,6 +92,8 @@ VIDEO_CLIP_OVER_CAP = (os.getenv("VIDEO_CLIP_OVER_CAP") or "1").strip().lower() 
 # reach the end of the container for some formats, and /tmp on the host is
 # capped at 2GB. A 2-hour ceiling keeps livestreams and full episodes out.
 MAX_VIDEO_SECONDS_HARD = int(os.getenv("MAX_VIDEO_SECONDS_HARD", "7200"))
+# Only clip when the video exceeds the window by this factor (1.2 = 20%).
+VIDEO_CLIP_MARGIN = float(os.getenv("VIDEO_CLIP_MARGIN", "1.2"))
 
 
 def _video_reject_seconds() -> int:
@@ -141,7 +143,11 @@ def _make_download_ranges(sections: list[str] | None = None, max_seconds=None):
             window = float(max_seconds)
         elif VIDEO_CLIP_OVER_CAP:
             window = float(MAX_VIDEO_SECONDS)
-        if window and duration and duration > window:
+        # Clipping re-cuts at keyframes, which costs time and can produce a
+        # LARGER file than the original for a video only slightly over the cap
+        # (measured: 322s source -> 2.2MB/2s whole vs 3.9MB/5s clipped). Only
+        # clip when there is enough to save to be worth the re-encode.
+        if window and duration and duration > window * VIDEO_CLIP_MARGIN:
             return [{"start_time": 0.0, "end_time": window}]
         return [{}]  # whole video — identical to yt-dlp's default
 

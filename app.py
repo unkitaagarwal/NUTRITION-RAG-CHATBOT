@@ -344,7 +344,10 @@ _SHARE_LINK_HOSTS = {
 _FACEBOOK_HOSTS = {
     "facebook.com", "www.facebook.com", "m.facebook.com", "web.facebook.com",
 }
-_SHARE_PATH_RE = re.compile(r"^/share/[a-z]+/", re.I)
+_SHARE_PATH_RE = re.compile(r"^/share(?:/|$)", re.I)
+# Both real forms: /share/r/<id>/ (kind segment) AND /share/<id>/ (bare).
+# The bare form is 7 of 135 observed share links; an earlier [a-z]+ kind
+# segment requirement silently skipped it.
 
 # A resolved URL landing on one of these paths is a login / consent / checkpoint
 # wall, not the post. Facebook answers share links with these constantly, and the
@@ -449,6 +452,13 @@ def _resolve_share_url(url: str) -> str:
         # another path instead of extracting the wall.
         if _is_dead_end_url(p):
             print(f"[resolve] share link resolved to a wall ({p.path}) for {url[:120]}")
+            return url
+
+        # Landed on a bare homepage (expired/invalid short link bounces to "/").
+        # Returning that is strictly worse than the original: the extractor would
+        # happily scrape pinterest.com instead of failing honestly.
+        if (p.path or "/").strip("/") == "":
+            print(f"[resolve] share link resolved to a bare homepage ({fhost}) for {url[:120]}")
             return url
 
         if not was_facebook:
@@ -597,7 +607,7 @@ print(
     f"SOCIAL_PROXY={'set' if SOCIAL_PROXY else 'none'} "
     f"({'PROXY-FIRST via SOCIAL_USE_PROXY=1' if SOCIAL_USE_PROXY else 'direct-first'}), "
     f"clients={','.join(YT_PLAYER_CLIENTS)}, "
-    f"proxy_blackout={_PROXY_DISABLE_SECONDS}s"
+    f"proxy_blackout={os.getenv('PROXY_DISABLE_SECONDS', '600')}s"
 )
 PROFILE_VIDEO_DOWNLOADS_DIR = os.getenv("PROFILE_VIDEO_DOWNLOADS_DIR", "./downloads/profile_videos")
 PROFILE_VIDEO_PARALLEL_DOWNLOADS = max(1, min(int(os.getenv("PROFILE_VIDEO_PARALLEL_DOWNLOADS", "4")), 10))
@@ -4144,16 +4154,6 @@ SCRAPER_API_TIMEOUT = int(os.getenv("SCRAPER_API_TIMEOUT", "70"))
 # to save free-tier credits if you only hit lighter protections.
 SCRAPER_API_ULTRA = os.getenv("SCRAPER_API_ULTRA", "true").strip().lower() == "true"
 
-# Say at boot which anti-bot tiers are actually armed. 131 webpage 403s in 30
-# days could be a code problem OR two unset env vars, and there was no way to
-# tell them apart from the logs without reproducing a block.
-print(
-    "[startup] fetch_html tiers: "
-    f"direct=on  proxy={'ON' if (FETCH_HTML_USE_PROXY and SOCIAL_PROXY) else 'OFF'}"
-    f"{'' if SOCIAL_PROXY else ' (SOCIAL_PROXY unset)'}  "
-    f"scraperapi={'ON' if SCRAPER_API_KEY else 'OFF (SCRAPER_API_KEY unset)'}"
-)
-
 _BROWSER_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -4232,6 +4232,16 @@ def _fetch_via_scraperapi(url: str) -> str:
 # FETCH_HTML_USE_PROXY=0.
 FETCH_HTML_USE_PROXY = (
     (os.getenv("FETCH_HTML_USE_PROXY") or "1").strip().lower() not in ("0", "false", "no")
+)
+
+# Say at boot which anti-bot tiers are actually armed. 131 webpage 403s in 30
+# days could be a code problem OR two unset env vars, and there was no way to
+# tell them apart from the logs without reproducing a block.
+print(
+    "[startup] fetch_html tiers: "
+    f"direct=on  proxy={'ON' if (FETCH_HTML_USE_PROXY and SOCIAL_PROXY) else 'OFF'}"
+    f"{'' if SOCIAL_PROXY else ' (SOCIAL_PROXY unset)'}  "
+    f"scraperapi={'ON' if SCRAPER_API_KEY else 'OFF (SCRAPER_API_KEY unset)'}"
 )
 
 

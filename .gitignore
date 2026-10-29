@@ -86,3 +86,6 @@ batch_tests/wide_set.csv
 batch_tests/web_subset.csv
 batch_tests/regression_net.csv
 batch_tests/*_ab.csv
+batch_tests/cohort.json
+batch_tests/freemium_funnel.json
+batch_tests/v69.json

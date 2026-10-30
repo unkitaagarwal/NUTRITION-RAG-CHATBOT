@@ -27,7 +27,7 @@ import tempfile
 from datetime import datetime, timedelta
 import uuid
 from openai import OpenAI
-from threading import Thread, Lock
+from threading import Thread, Lock, BoundedSemaphore
 from collections import defaultdict
 import yt_dlp
 import instaloader
@@ -758,7 +758,27 @@ _PROXY_DISABLED_UNTIL = 0.0
 # (_PROXY_DISABLE_SECONDS is defined above the [startup] proxies banner)
 
 
+# Concurrent yt-dlp DOWNLOADS per gunicorn worker (each one can spawn ffmpeg).
+# Metadata-only calls are not limited. 2 workers x 3 = at most 6 at once.
+_MEDIA_DOWNLOAD_SLOTS = BoundedSemaphore(
+    max(1, int(os.getenv("MEDIA_DOWNLOAD_CONCURRENCY", "3")))
+)
+
+
 def _ydl_extract(ydl_opts: dict, video_url: str, *, download: bool):
+    """Same as _ydl_extract_impl, but downloads wait for a free media slot so a
+    burst of imports can't run the instance out of memory / CPU."""
+    if not download:
+        return _ydl_extract_impl(ydl_opts, video_url, download=False)
+    t_wait = time.time()
+    with _MEDIA_DOWNLOAD_SLOTS:
+        waited = time.time() - t_wait
+        if waited > 1:
+            print(f"⏳ waited {waited:.1f}s for a media download slot")
+        return _ydl_extract_impl(ydl_opts, video_url, download=True)
+
+
+def _ydl_extract_impl(ydl_opts: dict, video_url: str, *, download: bool):
     """Run yt-dlp extract_info with direct-first / cookie-less / proxy fallback.
 
     1. Direct connection with the given options (cookies if configured).
@@ -3352,8 +3372,11 @@ def ytdlp_base_opts(temp_dir: str, video_url: str = None):
         # Clip ONLY when the video is over the cap (decided after metadata, in
         # the callable). A short video keeps exactly the old download path.
         "download_ranges": _make_download_ranges(),
-        # Section downloads need ffmpeg to cut on keyframes.
-        "force_keyframes_at_cuts": True,
+        # NO force_keyframes_at_cuts: it makes ffmpeg RE-ENCODE every clipped
+        # section. On Render (1 CPU / 2 GB) concurrent re-encodes pinned the CPU
+        # and ran the instance out of memory (OOM restarts -> 502s, 2026-10-30).
+        # Stream-copy cuts land on the nearest keyframe (a second or two off),
+        # which is irrelevant for recipe extraction.
         # Helps for YouTube signature issues & format availability
         "extractor_args": {
             "youtube": _yt_extractor_args()
@@ -7934,7 +7957,7 @@ def _download_video_to_file(
         ydl_opts["download_ranges"] = _make_download_ranges(
             sections=download_sections, max_seconds=max_seconds,
         )
-        ydl_opts["force_keyframes_at_cuts"] = True
+        # (no force_keyframes_at_cuts — see ytdlp_base_opts: re-encoding OOM'd Render)
 
         # Single call: fetches metadata AND downloads in one network session
         info = _ydl_extract(ydl_opts, video_url, download=True)
@@ -10150,8 +10173,18 @@ def _post_image_data_urls(image_urls: list[str]) -> list[str]:
     def _one(u):
         r = requests.get(u, headers=headers, timeout=EXTRACT_RECIPE_TIMEOUT)
         r.raise_for_status()
-        ctype = (r.headers.get("Content-Type") or "image/jpeg").split(";")[0]
-        return f"data:{ctype};base64,{base64.b64encode(r.content).decode('utf-8')}"
+        try:  # cap at 1280px: still readable for printed recipe text, far less memory/tokens
+            from PIL import Image
+            import io as _io
+            img = Image.open(_io.BytesIO(r.content)).convert("RGB")
+            img.thumbnail((1280, 1280))
+            buf = _io.BytesIO()
+            img.save(buf, format="JPEG", quality=85)
+            data, ctype = buf.getvalue(), "image/jpeg"
+        except Exception:
+            data = r.content
+            ctype = (r.headers.get("Content-Type") or "image/jpeg").split(";")[0]
+        return f"data:{ctype};base64,{base64.b64encode(data).decode('utf-8')}"
 
     out = [None] * len(urls)
     with ThreadPoolExecutor(max_workers=min(6, max(1, len(urls)))) as ex:

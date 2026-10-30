@@ -8993,11 +8993,53 @@ def _instagram_post_shortcode(url: str) -> str | None:
     return match.group(1) if match else None
 
 
+class _NoWaitRateController(instaloader.RateController):
+    """Never sleep inside a request thread; a rate limit becomes a fast failure."""
+
+    def sleep(self, secs: float):
+        if secs > 0.5:
+            raise instaloader.exceptions.TooManyRequestsException(
+                f"instaloader rate limit (would wait {secs:.0f}s) — skipped")
+
+
+# Per-process circuit breaker + login cache for instaloader. After Instagram
+# rate-limits or rejects the session, stop calling it for a while instead of
+# paying a doomed request on every import.
+_IG_LOADER_BLOCKED_UNTIL = 0.0
+_IG_LOADER_BACKOFF_SECONDS = int(os.getenv("INSTALOADER_BACKOFF_SECONDS", "900"))
+_IG_LOGIN_CACHE: dict = {"username": None, "until": 0.0}
+_IG_LOGIN_CACHE_SECONDS = int(os.getenv("INSTALOADER_LOGIN_CACHE_SECONDS", "1800"))
+
+
+def _ig_loader_blocked() -> bool:
+    return time.time() < _IG_LOADER_BLOCKED_UNTIL
+
+
+def _ig_loader_trip(reason) -> None:
+    """Back off from instaloader after a rate limit / auth rejection."""
+    global _IG_LOADER_BLOCKED_UNTIL
+    text = str(reason)
+    low = text.lower()
+    if any(m in low for m in ("401", "429", "please wait", "too many", "rate limit",
+                              "checkpoint", "login", "not accepted", "timed out", "timeout")):
+        _IG_LOADER_BLOCKED_UNTIL = time.time() + _IG_LOADER_BACKOFF_SECONDS
+        _IG_LOGIN_CACHE["username"] = None
+        print(f"⏸️ instaloader paused for {_IG_LOADER_BACKOFF_SECONDS}s: {text[:120]}")
+
+
 def _make_instaloader() -> instaloader.Instaloader:
     ig_username = os.getenv("INSTAGRAM_USERNAME", "")
     session_file = os.getenv("INSTALOADER_SESSION_FILE", "")
     L = instaloader.Instaloader(
         quiet=True,
+        # Defaults are built for a CLI, not a web server: 300s timeout, 3
+        # retries, random pauses, and minutes-long sleeps on 429 / "Please wait
+        # a few minutes". On Render that held gunicorn threads until every
+        # worker was saturated and ALL imports returned 502. Fail fast instead.
+        sleep=False,
+        max_connection_attempts=1,
+        request_timeout=float(os.getenv("INSTALOADER_TIMEOUT_SECONDS", "10")),
+        rate_controller=lambda ctx: _NoWaitRateController(ctx),
         download_videos=False,
         download_video_thumbnails=False,
         download_geotags=False,
@@ -9610,6 +9652,8 @@ def _logged_in_instaloader(url: str | None = None):
     was configured. We now verify the cookie session with test_login() and set
     the username it returns.
     """
+    if _ig_loader_blocked():
+        return None
     L = _make_instaloader()
     if getattr(L.context, "is_logged_in", False):
         return L
@@ -9623,14 +9667,20 @@ def _logged_in_instaloader(url: str | None = None):
             next((c.value for c in L.context._session.cookies if c.name == "csrftoken"), None)
         if csrf:
             L.context._session.headers.update({"X-CSRFToken": csrf})
+        if _IG_LOGIN_CACHE["username"] and time.time() < _IG_LOGIN_CACHE["until"]:
+            L.context.username = _IG_LOGIN_CACHE["username"]  # verified recently; skip the extra request
+            return L
         try:
             username = L.test_login()
         except Exception as e:
             print(f"⚠️ instaloader: cookie session check failed: {str(e)[:120]}")
-            username = None
+            _ig_loader_trip(e)
+            return None
         if not username:
             print("🍪 instaloader: Instagram cookie session not accepted (stale/flagged) — refresh cookies")
+            _ig_loader_trip("session not accepted")
             return None
+        _IG_LOGIN_CACHE.update(username=username, until=time.time() + _IG_LOGIN_CACHE_SECONDS)
         L.context.username = username
         return L
     except Exception as e:
@@ -9671,6 +9721,7 @@ def _fetch_instagram_page_caption(url: str) -> str | None:
         return caption or None
     except Exception as e:
         print(f"⚠️ Instagram page caption fetch failed: {e}")
+        _ig_loader_trip(e)
         return None
 
 
@@ -9955,11 +10006,14 @@ def _fetch_instagram_carousel_slideshow(url: str) -> tuple[list[str], dict] | No
     shortcode = _instagram_post_shortcode(url)
     if not shortcode:
         return None
+    if _ig_loader_blocked():
+        return None
     L = _logged_in_instaloader(url) or _make_instaloader()
     try:
         post = instaloader.Post.from_shortcode(L.context, shortcode)
     except instaloader.exceptions.InstaloaderException as e:
         print(f"⚠️ instaloader carousel lookup failed for {url}: {e}")
+        _ig_loader_trip(e)
         return None
 
     if post.typename != "GraphSidecar":
@@ -10199,6 +10253,7 @@ def _try_instagram_photo_post_fast_path(url: str, url_key: str):
         post = instaloader.Post.from_shortcode(L.context, shortcode)
     except Exception as e:
         print(f"⚠️ IG photo fast-path: post lookup failed: {str(e)[:150]}")
+        _ig_loader_trip(e)
         return None
     if post.typename == "GraphSidecar":
         image_urls = [n.display_url for n in post.get_sidecar_nodes() if not n.is_video and n.display_url]

@@ -77,3 +77,8 @@ cookies*.txt
 
 # TikTok page dumps (EXTRACT_RECIPE_TIKTOK_DEBUG=1)
 debug_dumps/
+# batch_tests generated data (real user URLs / run artifacts)
+batch_tests/recent_imports.csv
+batch_tests/ab_results.csv
+batch_tests/*.jsonl
+batch_tests/*.jsonl.bak

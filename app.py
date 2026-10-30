@@ -35,7 +35,7 @@ import shutil
 import time
 import socket
 import ipaddress
-from urllib.parse import urlparse, parse_qs, urlunparse
+from urllib.parse import urlparse, parse_qs, parse_qsl, urlencode, urlunparse
 import http.cookiejar
 import requests
 from bs4 import BeautifulSoup
@@ -77,7 +77,75 @@ _img_persist_futures: dict = {}
 
 # Initialize once
 # ---------- Config ----------
-MAX_VIDEO_SECONDS = int(os.getenv("MAX_VIDEO_SECONDS", "900"))  # 15 min default
+# How much of a video we actually read. Over-cap videos are CLIPPED to this
+# length and extracted from the first MAX_VIDEO_SECONDS rather than refused —
+# a recipe is almost always stated in the opening minutes, and refusing outright
+# turned 85 imports in 30 days into a dead end.
+MAX_VIDEO_SECONDS = int(os.getenv("MAX_VIDEO_SECONDS", "300"))  # 5 min default
+
+# Clip instead of reject. Set VIDEO_CLIP_OVER_CAP=0 to restore hard rejection.
+VIDEO_CLIP_OVER_CAP = (os.getenv("VIDEO_CLIP_OVER_CAP") or "1").strip().lower() not in (
+    "0", "false", "no",
+)
+
+# Even when clipping, refuse absurdly long media outright: yt-dlp still has to
+# reach the end of the container for some formats, and /tmp on the host is
+# capped at 2GB. A 2-hour ceiling keeps livestreams and full episodes out.
+MAX_VIDEO_SECONDS_HARD = int(os.getenv("MAX_VIDEO_SECONDS_HARD", "7200"))
+
+
+def _video_reject_seconds() -> int:
+    """Duration above which we refuse rather than clip."""
+    return MAX_VIDEO_SECONDS_HARD if VIDEO_CLIP_OVER_CAP else MAX_VIDEO_SECONDS
+
+
+def _clip_sections() -> list[str] | None:
+    """Legacy spec form, kept for callers that still pass string sections."""
+    return [f"*0-{MAX_VIDEO_SECONDS}"] if VIDEO_CLIP_OVER_CAP else None
+
+
+def _parse_section_spec(spec: str) -> dict | None:
+    """'*0-300' -> {'start_time': 0.0, 'end_time': 300.0}. None if unparseable."""
+    try:
+        body = spec[1:] if spec.startswith("*") else spec
+        start_s, _, end_s = body.partition("-")
+        return {"start_time": float(start_s or 0), "end_time": float(end_s)}
+    except Exception:
+        return None
+
+
+def _make_download_ranges(sections: list[str] | None = None, max_seconds=None):
+    """Build a yt-dlp `download_ranges` CALLABLE.
+
+    IMPORTANT: `download_sections` is a CLI flag name, NOT a YoutubeDL python-API
+    parameter — YoutubeDL never reads it, so every `ydl_opts["download_sections"]`
+    in this file was silently ignored and videos were always fetched in full.
+    The API parameter is `download_ranges`, a callable run after metadata.
+
+    Returning `[{}]` is yt-dlp's own default and means "the whole video", so a
+    video under the cap takes exactly the path it took before. Returning an
+    empty list would SKIP the download entirely — never do that.
+    """
+    explicit = []
+    for spec in (sections or []):
+        parsed = _parse_section_spec(spec)
+        if parsed:
+            explicit.append(parsed)
+
+    def _ranges(info_dict, ydl=None):
+        if explicit:
+            return explicit
+        duration = (info_dict or {}).get("duration") or 0
+        window = None
+        if max_seconds and max_seconds > 0:
+            window = float(max_seconds)
+        elif VIDEO_CLIP_OVER_CAP:
+            window = float(MAX_VIDEO_SECONDS)
+        if window and duration and duration > window:
+            return [{"start_time": 0.0, "end_time": window}]
+        return [{}]  # whole video — identical to yt-dlp's default
+
+    return _ranges
 
 # ---------- Temp download dirs (/tmp hygiene) ----------
 # All yt-dlp/ffmpeg work happens in per-request temp dirs. Cleanup normally runs
@@ -154,8 +222,9 @@ def _reject_too_long_filter(info_dict, *, incomplete=False):
     MAX_VIDEO_SECONDS — BEFORE any bytes hit /tmp (previously the full file was
     downloaded and only then rejected). Returning a string skips the video."""
     dur = info_dict.get("duration")
-    if dur and dur > MAX_VIDEO_SECONDS:
-        return f"Video too long ({dur}s). Max allowed is {MAX_VIDEO_SECONDS}s"
+    limit = _video_reject_seconds()
+    if dur and dur > limit:
+        return f"Video too long ({dur}s). Max allowed is {limit}s"
     return None
 
 # Cookies can be provided as: 1) file path, or 2) base64-encoded content in YTDLP_COOKIES_B64 env var
@@ -180,6 +249,36 @@ try:
     print(f"[startup] YouTube cookies: {'FILE' if YT_COOKIES_FILE and os.path.exists(YT_COOKIES_FILE) else 'B64' if YT_COOKIES_B64 else 'NONE'}")
 except Exception as _e:
     print(f"[startup] cookie check failed: {_e}")
+
+
+def _too_long_response(err: Exception):
+    """413 for an over-cap video, WITH a user_message.
+
+    Every other error path carries user_message; these three did not, so the app
+    fell back to its generic "something went wrong" and the person never learned
+    the video was simply too long to read. 85 failures in 30 days, 67 of them
+    TikTok.
+    """
+    text = str(err)
+    m = re.search(r"\((\d+)s\)", text)
+    mins = None
+    if m:
+        try:
+            mins = max(1, round(int(m.group(1)) / 60))
+        except ValueError:
+            mins = None
+    cap_mins = max(1, round(_video_reject_seconds() / 60))
+    if mins:
+        msg = (
+            f"This video is about {mins} minutes long. We can read videos up to "
+            f"{cap_mins} minutes — try a shorter one, or add the recipe manually."
+        )
+    else:
+        msg = (
+            f"This video is too long to read. We can handle up to {cap_mins} minutes "
+            "— try a shorter one, or add the recipe manually."
+        )
+    return jsonify({"error": text, "user_message": msg, "reason": "video_too_long"}), 413
 
 
 def _prepare_cookiefile(temp_dir: str | None = None, video_url: str | None = None) -> str | None:
@@ -228,18 +327,95 @@ def _prepare_cookiefile(temp_dir: str | None = None, video_url: str | None = Non
 # Hosts whose share/short links must be resolved to a canonical URL before yt-dlp.
 # yt-dlp's generic extractor loops on fb.watch redirects ("302 redirect loop"),
 # but the canonical facebook.com/watch?v=... / /reel/<id>/ URL extracts fine.
-_SHARE_LINK_HOSTS = {"fb.watch", "www.fb.watch", "fb.com", "www.fb.com"}
+# pin.it / share.google / apple.news are plain wrappers around a real page: left
+# unresolved they reach the extractor as a redirect stub with no recipe on it.
+_SHARE_LINK_HOSTS = {
+    "fb.watch", "www.fb.watch", "fb.com", "www.fb.com",
+    "l.facebook.com", "lm.facebook.com",
+    "pin.it", "www.pin.it",
+    "share.google", "www.share.google",
+    "apple.news", "www.apple.news",
+}
+
+# Facebook hosts where the SHARE WRAPPER IS A PATH, not a host:
+# facebook.com/share/r/<id>/, /share/p/<id>/, /share/v/<id>/. These never match a
+# host-only check, which is why they reached yt-dlp unresolved and came back
+# "Unsupported URL".
+_FACEBOOK_HOSTS = {
+    "facebook.com", "www.facebook.com", "m.facebook.com", "web.facebook.com",
+}
+_SHARE_PATH_RE = re.compile(r"^/share/[a-z]+/", re.I)
+
+# A resolved URL landing on one of these paths is a login / consent / checkpoint
+# wall, not the post. Facebook answers share links with these constantly, and the
+# old host-only guard accepted them because "facebook.com" is still in the host —
+# so yt-dlp was handed https://www.facebook.com/login/ and said "Unsupported URL".
+_DEAD_END_PATH_PREFIXES = (
+    "/login", "/checkpoint", "/consent", "/privacy", "/recover", "/help",
+    "/policies", "/terms", "/unsupportedbrowser", "/device-based",
+)
+
+# Params that identify a share event rather than the content.
+_TRACKING_PARAMS = {
+    "mibextid", "fbclid", "igsh", "igshid", "si", "is", "rdid", "share_url",
+    "mibextid0", "_rdr", "stkn", "obrf", "xtok",
+    "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
+}
+
+
+def _is_facebook_host(host: str) -> bool:
+    host = (host or "").lower()
+    return host in _FACEBOOK_HOSTS or host.endswith(".facebook.com")
+
+
+def _is_dead_end_url(parsed) -> bool:
+    """True when a resolved URL is a login/consent wall rather than the post."""
+    path = (getattr(parsed, "path", "") or "").lower()
+    return any(path == pre or path.startswith(pre + "/") or path == pre + "/"
+               for pre in _DEAD_END_PATH_PREFIXES)
+
+
+def _strip_tracking_params(url: str) -> str:
+    """Drop share-event params, keep everything a page might actually need."""
+    try:
+        p = urlparse(url)
+        if not p.query:
+            return url
+        kept = [(k, v) for k, v in parse_qsl(p.query, keep_blank_values=True)
+                if k.lower() not in _TRACKING_PARAMS]
+        return p._replace(query=urlencode(kept)).geturl()
+    except Exception:
+        return url
+
+
+def _needs_share_resolution(url: str) -> bool:
+    """Host-based wrappers (fb.watch, pin.it) OR facebook.com/share/<kind>/ paths."""
+    try:
+        p = urlparse(url)
+    except Exception:
+        return False
+    host = (p.hostname or "").lower()
+    if host in _SHARE_LINK_HOSTS:
+        return True
+    return _is_facebook_host(host) and bool(_SHARE_PATH_RE.match(p.path or ""))
 
 
 def _resolve_share_url(url: str) -> str:
-    """Resolve a short/share link (e.g. fb.watch) to its canonical URL.
+    """Resolve a short/share link (fb.watch, facebook.com/share/..., pin.it,
+    share.google, apple.news) to the canonical URL of the thing it points at.
 
-    Returns the original URL unchanged on any failure or for non-share hosts.
+    Returns the original URL unchanged on any failure, for non-share hosts, or
+    when the redirect lands on a login/consent wall (which must NOT be passed on
+    to the extractor as if it were the post).
     """
     try:
-        host = (urlparse(url).hostname or "").lower()
-        if host not in _SHARE_LINK_HOSTS:
+        if not _needs_share_resolution(url):
             return url
+        was_facebook = _is_facebook_host((urlparse(url).hostname or "")) or \
+            (urlparse(url).hostname or "").lower() in {
+                "fb.watch", "www.fb.watch", "fb.com", "www.fb.com",
+                "l.facebook.com", "lm.facebook.com",
+            }
 
         sess = requests.Session()
         # Attach cookies so Facebook resolves the video instead of bouncing to
@@ -260,15 +436,46 @@ def _resolve_share_url(url: str) -> str:
             ),
             "Accept-Language": "en-US,en;q=0.9",
         }
-        proxies = None
-        if SOCIAL_PROXY:
-            proxies = {"http": SOCIAL_PROXY, "https": SOCIAL_PROXY}
-        resp = sess.get(url, headers=headers, allow_redirects=True, timeout=15, proxies=proxies)
+        # Same policy as every other social request: direct first, proxy only
+        # as a fallback (or first, with SOCIAL_USE_PROXY=1). This used to be
+        # proxy-ONLY, so a dead proxy (407) meant no share link resolved at all.
+        proxy_cfg = {"http": SOCIAL_PROXY, "https": SOCIAL_PROXY} if SOCIAL_PROXY else None
+        attempts = [None]
+        if proxy_cfg:
+            attempts = [proxy_cfg, None] if SOCIAL_USE_PROXY else [None, proxy_cfg]
+        resp, last_err = None, None
+        for proxies in attempts:
+            try:
+                resp = sess.get(url, headers=headers, allow_redirects=True,
+                                timeout=15, proxies=proxies)
+                if proxies is None and resp.status_code in (403, 429) and len(attempts) > 1:
+                    continue  # blocked direct; let the proxy try
+                break
+            except requests.exceptions.RequestException as e:
+                last_err = e
+                print(f"[resolve] {'proxy' if proxies else 'direct'} attempt failed for "
+                      f"{url[:100]}: {str(e)[:140]}")
+        if resp is None:
+            raise last_err or RuntimeError("share-url resolution: no response")
         final = resp.url or url
         p = urlparse(final)
         fhost = (p.hostname or "").lower()
-        if "facebook.com" not in fhost:
-            # Landed somewhere unexpected (e.g. login). Keep original for yt-dlp.
+
+        # Login / consent / checkpoint wall — the resolution failed even though
+        # the host still looks right. Keep the original so the caller can try
+        # another path instead of extracting the wall.
+        if _is_dead_end_url(p):
+            print(f"[resolve] share link resolved to a wall ({p.path}) for {url[:120]}")
+            return url
+
+        if not was_facebook:
+            # pin.it / share.google / apple.news → wherever they actually point.
+            if fhost and fhost not in _SHARE_LINK_HOSTS:
+                return _strip_tracking_params(final)
+            return url
+
+        if not _is_facebook_host(fhost):
+            # Landed somewhere unexpected. Keep original for yt-dlp.
             return url
 
         # Build a clean canonical URL, dropping tracking params (mibextid, etc.)
@@ -276,6 +483,11 @@ def _resolve_share_url(url: str) -> str:
         vid = (qs.get("v") or [None])[0]
         if vid:
             return f"https://www.facebook.com/watch/?v={vid}"
+        if _SHARE_PATH_RE.match(p.path or ""):
+            # Still a share wrapper after redirects — nothing gained, and passing
+            # it on is what produced "Unsupported URL".
+            print(f"[resolve] facebook share link did not resolve past /share/ for {url[:120]}")
+            return url
         return f"https://www.facebook.com{p.path}"
     except Exception as e:
         print(f"[resolve] share-url resolution failed for {url}: {e}")
@@ -375,7 +587,14 @@ SOCIAL_USE_PROXY = os.getenv("SOCIAL_USE_PROXY", "0") == "1"  # same opt-in for 
 # Player clients to impersonate for YouTube, in priority order.
 # android_vr: PO-token-free, full format access (primary).
 # web_safari / web: fallbacks if android_vr is missing a format.
-YT_PLAYER_CLIENTS = ["default", "web_safari"]
+# Order matters: yt-dlp tries each until one yields formats. "ios" needs no PO
+# token and is the client that most often walks past "Sign in to confirm you're
+# not a bot" from a datacenter IP; "tv" is the usual second chance. Dropping
+# android_vr on 20 Oct left only two clients and YouTube success fell from 30%
+# to 13% — these restore the fallbacks without bringing android_vr back.
+YT_PLAYER_CLIENTS = [c.strip() for c in os.getenv(
+    "YT_PLAYER_CLIENTS", "default,ios,tv,web_safari"
+).split(",") if c.strip()]
 
 
 def _yt_extractor_args() -> dict:
@@ -389,10 +608,15 @@ def _yt_extractor_args() -> dict:
 SOCIAL_PROXY = os.getenv("SOCIAL_PROXY") or os.getenv("YTDLP_PROXY") or YT_PROXY
 print(f"[startup] yt-dlp version: {getattr(yt_dlp.version, '__version__', 'unknown')}")
 print(f"[startup] deno: {shutil.which('deno') or 'NOT FOUND'}")
+# Defined here, not further down, because the banner below reads it at import.
+_PROXY_DISABLE_SECONDS = int(os.getenv("PROXY_DISABLE_SECONDS", "600"))
 print(
     f"[startup] proxies: YT_PROXY={'set' if YT_PROXY else 'none'} "
-    f"({'ENABLED via YT_USE_PROXY' if YT_USE_PROXY else 'NOT USED — YouTube goes direct via android_vr client'}), "
-    f"SOCIAL_PROXY={'set' if SOCIAL_PROXY else 'none'}"
+    f"({'PROXY-FIRST via YT_USE_PROXY=1' if YT_USE_PROXY else 'direct-first; proxy only as blocked-retry fallback'}), "
+    f"SOCIAL_PROXY={'set' if SOCIAL_PROXY else 'none'} "
+    f"({'PROXY-FIRST via SOCIAL_USE_PROXY=1' if SOCIAL_USE_PROXY else 'direct-first'}), "
+    f"clients={','.join(YT_PLAYER_CLIENTS)}, "
+    f"proxy_blackout={_PROXY_DISABLE_SECONDS}s"
 )
 PROFILE_VIDEO_DOWNLOADS_DIR = os.getenv("PROFILE_VIDEO_DOWNLOADS_DIR", "./downloads/profile_videos")
 PROFILE_VIDEO_PARALLEL_DOWNLOADS = max(1, min(int(os.getenv("PROFILE_VIDEO_PARALLEL_DOWNLOADS", "4")), 10))
@@ -531,7 +755,7 @@ def _proxy_config_error(exc: Exception) -> bool:
 # When the proxy returns 407 etc., stop trying it for a while instead of
 # paying a doomed retry on every metadata + download call.
 _PROXY_DISABLED_UNTIL = 0.0
-_PROXY_DISABLE_SECONDS = int(os.getenv("PROXY_DISABLE_SECONDS", "600"))
+# (_PROXY_DISABLE_SECONDS is defined above the [startup] proxies banner)
 
 
 def _ydl_extract(ydl_opts: dict, video_url: str, *, download: bool):
@@ -3107,7 +3331,14 @@ def ytdlp_base_opts(temp_dir: str, video_url: str = None):
     opts = {
         # IMPORTANT: robust selector with fallbacks (handles many edge cases)
         # Prefer low-bitrate audio — Whisper doesn't need high quality, so this reduces download size/time
-        "format": "bestaudio[abr<=64]/bestaudio/best",
+        # Ladder, not a single selector. "bestaudio[abr<=64]" is absent for some
+        # player clients (and since android_vr was dropped, for YouTube in
+        # particular) — yt-dlp then raises "Requested format is not available"
+        # instead of falling back, which was a live failure on YouTube.
+        "format": (
+            "bestaudio[abr<=64]/bestaudio/worstaudio/"
+            "best[height<=480]/worst/best"
+        ),
         "outtmpl": os.path.join(temp_dir, "%(id)s.%(ext)s"),
         "restrictfilenames": True,
         "noplaylist": True,
@@ -3118,6 +3349,11 @@ def ytdlp_base_opts(temp_dir: str, video_url: str = None):
         "fragment_retries": 2,
         # Safety net against filling /tmp: skip absurdly large files outright
         "max_filesize": YTDLP_MAX_FILESIZE_BYTES,
+        # Clip ONLY when the video is over the cap (decided after metadata, in
+        # the callable). A short video keeps exactly the old download path.
+        "download_ranges": _make_download_ranges(),
+        # Section downloads need ffmpeg to cut on keyframes.
+        "force_keyframes_at_cuts": True,
         # Helps for YouTube signature issues & format availability
         "extractor_args": {
             "youtube": _yt_extractor_args()
@@ -3178,14 +3414,14 @@ def download_audio_mp3(video_url: str):
         info_dict = _ydl_extract(opts, video_url, download=True)
         if info_dict is None:
             # match_filter skipped it → over the duration cap
-            raise ValueError(f"Video too long. Max allowed is {MAX_VIDEO_SECONDS}s")
+            raise ValueError(f"Video too long. Max allowed is {_video_reject_seconds()}s")
 
         duration = info_dict.get("duration")
         title = info_dict.get("title") or ""
         extractor = info_dict.get("extractor_key") or info_dict.get("extractor") or ""
 
-        if duration and duration > MAX_VIDEO_SECONDS:
-            raise ValueError(f"Video too long ({duration}s). Max allowed is {MAX_VIDEO_SECONDS}s")
+        if duration and duration > _video_reject_seconds():
+            raise ValueError(f"Video too long ({duration}s). Max allowed is {_video_reject_seconds()}s")
 
         mp3s = [f for f in os.listdir(temp_dir) if f.endswith(".mp3")]
         if not mp3s:
@@ -3376,7 +3612,7 @@ def extract_recipe_from_video():
         try:
             audio_bytes, meta = download_audio_mp3(video_url)
         except ValueError as ve:
-            return jsonify({"error": str(ve)}), 413
+            return _too_long_response(ve)
         except yt_dlp.utils.DownloadError as de:
             # very common for IG/TikTok without cookies
             return jsonify({
@@ -3721,10 +3957,21 @@ class YouTubeVideoTooLongError(Exception):
 
 
 def _youtube_shorts_max_seconds() -> int:
+    """Duration above which a YouTube video is refused outright.
+
+    Was a hard 180s Shorts-only rule, which refused anything longer even though
+    every other source is now CLIPPED at MAX_VIDEO_SECONDS. A 277s YouTube video
+    was being rejected while a 1200s TikTok was accepted and clipped — the cap
+    now follows the same policy, so YouTube is read for its first
+    MAX_VIDEO_SECONDS like everything else.
+    """
     try:
-        return max(1, int(os.getenv("YOUTUBE_SHORTS_MAX_SECONDS", "180")))
+        explicit = os.getenv("YOUTUBE_SHORTS_MAX_SECONDS")
+        if explicit:
+            return max(1, int(explicit))
     except ValueError:
-        return 180
+        pass
+    return max(1, _video_reject_seconds())
 
 
 def _youtube_max_duration_label(seconds: int) -> str:
@@ -3916,6 +4163,20 @@ SCRAPER_API_TIMEOUT = int(os.getenv("SCRAPER_API_TIMEOUT", "70"))
 # to save free-tier credits if you only hit lighter protections.
 SCRAPER_API_ULTRA = os.getenv("SCRAPER_API_ULTRA", "true").strip().lower() == "true"
 
+# Say at boot which anti-bot tiers are actually armed. 131 webpage 403s in 30
+# days could be a code problem OR two unset env vars, and there was no way to
+# tell them apart from the logs without reproducing a block.
+# Defined before the banner below, which reads it at import.
+FETCH_HTML_USE_PROXY = (
+    (os.getenv("FETCH_HTML_USE_PROXY") or "1").strip().lower() not in ("0", "false", "no")
+)
+print(
+    "[startup] fetch_html tiers: "
+    f"direct=on  proxy={'ON' if (FETCH_HTML_USE_PROXY and SOCIAL_PROXY) else 'OFF'}"
+    f"{'' if SOCIAL_PROXY else ' (SOCIAL_PROXY unset)'}  "
+    f"scraperapi={'ON' if SCRAPER_API_KEY else 'OFF (SCRAPER_API_KEY unset)'}"
+)
+
 _BROWSER_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -3926,11 +4187,22 @@ _BROWSER_HEADERS = {
         "image/avif,image/webp,*/*;q=0.8"
     ),
     "Accept-Language": "en-US,en;q=0.9",
+    # Recipe blogs live on Google traffic and routinely wave through a visitor
+    # that looks like a search click while challenging a bare request.
+    "Referer": "https://www.google.com/",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "cross-site",
+    "Sec-Fetch-User": "?1",
+    "Upgrade-Insecure-Requests": "1",
 }
 
 # HTTP statuses that typically indicate an anti-bot block rather than a real
 # "page missing" error — worth retrying through the scraping fallback.
-_BLOCK_STATUSES = {401, 402, 403, 429, 503}
+# 451 = legal block, 520-526 = Cloudflare origin/handshake errors. None were
+# listed, so a Cloudflare-fronted blog returning 521 fell straight through
+# to raise_for_status() and never reached the proxy or ScraperAPI tiers.
+_BLOCK_STATUSES = {401, 402, 403, 429, 451, 503, 520, 521, 522, 523, 525, 526}
 
 
 def _looks_like_challenge(html: str) -> bool:
@@ -3965,7 +4237,7 @@ def _fetch_via_scraperapi(url: str) -> str:
             return r.text
         print("[fetch_html] ScraperAPI no-render returned challenge HTML; escalating to render")
     except requests.exceptions.RequestException as e:
-        print(f"[fetch_html] ScraperAPI no-render failed ({str(e)[:120]}); escalating to render")
+        print(f"[fetch_html] ScraperAPI no-render failed ({_redact_api_key(str(e))[:120]}); escalating to render")
 
     # Stage 2: full render (+ultra when configured)
     params = dict(base)
@@ -3981,9 +4253,7 @@ def _fetch_via_scraperapi(url: str) -> str:
 # (SOCIAL_PROXY / Decodo) before spending ScraperAPI credits. Webpage-only —
 # the video pipelines (TikTok/IG/FB/YT) never call fetch_html. Disable with
 # FETCH_HTML_USE_PROXY=0.
-FETCH_HTML_USE_PROXY = (
-    (os.getenv("FETCH_HTML_USE_PROXY") or "1").strip().lower() not in ("0", "false", "no")
-)
+# (FETCH_HTML_USE_PROXY is defined above the [startup] fetch_html tiers banner)
 
 
 def _mask_proxy_url(proxy: str) -> str:
@@ -3998,6 +4268,15 @@ def _mask_proxy_url(proxy: str) -> str:
     except Exception:
         pass
     return proxy
+
+
+_API_KEY_RE = re.compile(r"(api_key=)[^&\s'\"]+", re.I)
+
+
+def _redact_api_key(text: str) -> str:
+    """requests puts the full request URL in HTTPError text, and ScraperAPI's
+    key is a query param — so every ScraperAPI error used to print the key."""
+    return _API_KEY_RE.sub(r"\1***", text or "")
 
 
 def _impersonated_get(url: str, timeout: int, proxy: str | None = None):
@@ -4074,7 +4353,7 @@ def fetch_html(url: str, timeout: int | None = None) -> str:
             print(f"[fetch_html] retrying via ScraperAPI (ultra={SCRAPER_API_ULTRA}) for {url[:120]}")
             return _fetch_via_scraperapi(url)
         except requests.exceptions.RequestException as e:
-            print(f"[fetch_html] ScraperAPI fetch failed for {url[:120]}: {str(e)[:200]}")
+            print(f"[fetch_html] ScraperAPI fetch failed for {url[:120]}: {_redact_api_key(str(e))[:200]}")
     else:
         print("[fetch_html] blocked and no SCRAPER_API_KEY set — cannot fall back")
 
@@ -5994,6 +6273,24 @@ def extract_recipe():
         print(f"[extract-recipe] 400: invalid url: {err}")
         return jsonify({"error": err, "user_message": "That link doesn't look valid. Please check the URL."}), 400
 
+    # Resolve share wrappers BEFORE deciding video vs webpage. pin.it /
+    # share.google / apple.news are webpage-bound, so the video path's own
+    # _resolve_share_url never saw them and the extractor was handed a redirect
+    # stub with no recipe on it. Resolving here also means a wrapper around a
+    # TikTok/Reel is routed as video, and the webpage cache is keyed by the
+    # canonical URL instead of a per-share link that can never hit twice.
+    if _needs_share_resolution(url):
+        resolved_share = _resolve_share_url(url)
+        if resolved_share and resolved_share != url:
+            print(f"[extract-recipe] share link resolved: {url[:90]} -> {resolved_share[:90]}")
+            url = resolved_share
+            ok, err = validate_video_url(url)
+            if not ok:
+                return jsonify({
+                    "error": err,
+                    "user_message": "That link doesn't look valid. Please check the URL.",
+                }), 400
+
     # Decide type
     url_is_video = is_video_url(url)
     if mode == "video":
@@ -6313,8 +6610,8 @@ def _download_audio_mp3(video_url: str):
         webpage_url = info.get("webpage_url") or video_url
         thumbnail = info.get("thumbnail")  # often present for YouTube/IG/TikTok
 
-        if duration and duration > MAX_VIDEO_SECONDS:
-            raise ValueError(f"Video too long ({duration}s). Max allowed is {MAX_VIDEO_SECONDS}s")
+        if duration and duration > _video_reject_seconds():
+            raise ValueError(f"Video too long ({duration}s). Max allowed is {_video_reject_seconds()}s")
 
         ydl_opts = {
             # IMPORTANT: robust selector with fallbacks (handles many edge cases)
@@ -6366,7 +6663,7 @@ def _download_audio_mp3(video_url: str):
 
         if _ydl_extract(ydl_opts, video_url, download=True) is None:
             # match_filter skipped it → over the duration cap
-            raise ValueError(f"Video too long. Max allowed is {MAX_VIDEO_SECONDS}s")
+            raise ValueError(f"Video too long. Max allowed is {_video_reject_seconds()}s")
 
         mp3s = [f for f in os.listdir(temp_dir) if f.endswith(".mp3")]
         if not mp3s:
@@ -6695,11 +6992,26 @@ def _return_video_extract_result(
     return jsonify(_apply_extract_recipe_image_pref(result)), 200
 
 
+def _is_short_form_video_url(url: str, duration_sec: float | None = None) -> bool:
+    """YouTube Shorts and Facebook Reels behave like TikTok/IG reels: often no
+    speech, recipe shown as on-screen text. Used ONLY for frame sampling —
+    _is_social_video_url() drives other policy and is deliberately unchanged.
+    (Before this, a 34s silent Short got 2 frames vs 6 for the same TikTok.)
+    """
+    lowered = (url or "").lower()
+    if "youtube.com/shorts/" in lowered:
+        return True
+    if is_youtube_url(url) and duration_sec and 0 < float(duration_sec) <= 180:
+        return True  # Shorts are <=3 min; a short watch?v= link is the same content
+    return "facebook.com/reel" in lowered or "facebook.com/share/r/" in lowered
+
+
 def _social_video_frames_for_duration(
     url: str, duration_sec: float | None, *, meta: dict | None = None
 ) -> int:
-    """TikTok/IG: sample multiple frames when vision fallback is needed."""
-    if not _is_social_video_url(url):
+    """TikTok/IG (and YouTube Shorts / Facebook Reels): sample multiple frames
+    when vision fallback is needed."""
+    if not (_is_social_video_url(url) or _is_short_form_video_url(url, duration_sec)):
         return _video_frames_for_duration(duration_sec)
     caption = _video_caption_text(meta or {})
     # Short hashtag captions → recipe is usually on-screen text; sample denser.
@@ -6887,6 +7199,62 @@ def _caption_has_instructions(caption: str) -> bool:
         caption,
     )
     return len(cap_verbs) >= 3
+
+
+def _ingredient_grounded_in_caption(name: str, caption_lower: str) -> bool:
+    """True when some word of the ingredient name appears in the caption
+    (prefix match, so 'tomatoes' matches 'tomato'). Filters out ingredients the
+    LLM guessed from the dish name rather than read from the caption."""
+    for tok in re.findall(r"[a-zA-Z\u00C0-\u024F]{3,}", (name or "").lower()):
+        stem = tok[:max(4, len(tok) - 2)]
+        if tok in caption_lower or stem in caption_lower:
+            return True
+    return False
+
+
+def _merge_caption_ingredients(vision_recipe: dict | None, caption_recipe: dict | None,
+                               caption: str) -> dict | None:
+    """Caption had real ingredients but no method, so the caption result was
+    rejected for its invented steps — and its ingredients were thrown away too.
+
+    Keep only the ingredients actually present in the caption, keep any steps
+    vision read off the frames, and leave instructions empty otherwise so
+    _ensure_recipe_instructions generates them WITH instructions_generated=True
+    (the same rule every other source follows). Returns None if the caption
+    contributes nothing.
+    """
+    if not caption_recipe or not (caption or "").strip():
+        return None
+    cap_lower = caption.lower()
+    grounded = [
+        ing for ing in (caption_recipe.get("ingredients") or [])
+        if isinstance(ing, dict) and (ing.get("name") or "").strip()
+        and _ingredient_grounded_in_caption(ing.get("name"), cap_lower)
+    ]
+    if len(grounded) < 2:
+        return None
+    vision_recipe = vision_recipe or {}
+    vision_ings = [
+        ing for ing in (vision_recipe.get("ingredients") or [])
+        if isinstance(ing, dict) and (ing.get("name") or "").strip()
+    ]
+    if len(vision_ings) >= len(grounded):
+        return None  # vision already found as much; nothing to add
+    vision_steps = [str(x).strip() for x in (vision_recipe.get("instructions") or []) if str(x).strip()]
+
+    base = dict(vision_recipe) if (vision_recipe.get("name") or "").strip() else dict(caption_recipe)
+    base["ingredients"] = grounded
+    base["instructions"] = vision_steps  # real steps from frames, or [] -> generated + flagged
+    base.pop("instructions_generated", None)
+    if not (base.get("name") or "").strip():
+        base["name"] = caption_recipe.get("name") or ""
+    dropped = len(caption_recipe.get("ingredients") or []) - len(grounded)
+    print(
+        f"📝 Kept {len(grounded)} caption ingredient(s) (dropped {dropped} not in caption); "
+        f"steps: {len(vision_steps)} from frames"
+        + ("" if vision_steps else ", rest will be generated and flagged")
+    )
+    return base
 
 
 def _social_caption_recipe_acceptable(recipe: dict | None, caption: str) -> bool:
@@ -7560,16 +7928,19 @@ def _download_video_to_file(
         _proxy = _ytdlp_proxy(video_url)
         if _proxy:
             ydl_opts["proxy"] = _proxy
-        if download_sections:
-            ydl_opts["download_sections"] = download_sections
-        elif max_seconds and max_seconds > 0:
-            ydl_opts["download_sections"] = [f"*0-{int(max_seconds)}"]
+        # download_ranges is the real API parameter (download_sections is the CLI
+        # spelling and was being ignored). Explicit caller sections win; else the
+        # callable clips only when the video exceeds the window.
+        ydl_opts["download_ranges"] = _make_download_ranges(
+            sections=download_sections, max_seconds=max_seconds,
+        )
+        ydl_opts["force_keyframes_at_cuts"] = True
 
         # Single call: fetches metadata AND downloads in one network session
         info = _ydl_extract(ydl_opts, video_url, download=True)
         if info is None:
             # match_filter skipped it → over the duration cap
-            raise ValueError(f"Video too long. Max allowed is {MAX_VIDEO_SECONDS}s")
+            raise ValueError(f"Video too long. Max allowed is {_video_reject_seconds()}s")
 
         duration = info.get("duration")
         title = info.get("title") or ""
@@ -7577,8 +7948,8 @@ def _download_video_to_file(
         webpage_url = info.get("webpage_url") or video_url
         thumbnail = info.get("thumbnail")
 
-        if duration and duration > MAX_VIDEO_SECONDS:
-            raise ValueError(f"Video too long ({duration}s). Max allowed is {MAX_VIDEO_SECONDS}s")
+        if duration and duration > _video_reject_seconds():
+            raise ValueError(f"Video too long ({duration}s). Max allowed is {_video_reject_seconds()}s")
 
         candidates = [f for f in os.listdir(temp_dir) if f.endswith((".mp4", ".webm", ".mkv", ".mov"))]
         if not candidates:
@@ -7602,6 +7973,14 @@ def _download_video_to_file(
         elif max_seconds and duration and duration > max_seconds:
             meta["vision_duration"] = float(max_seconds)
             print(f"⚡ Partial video download: first {max_seconds}s of {duration}s")
+        if duration and duration > MAX_VIDEO_SECONDS and VIDEO_CLIP_OVER_CAP:
+            # Over the cap: we read the opening window only. Recorded so the
+            # response can tell the user the recipe came from a clip.
+            meta["clipped_to_seconds"] = MAX_VIDEO_SECONDS
+            meta["source_duration"] = float(duration)
+            print(
+                f"✂️ Clipped: read the first {MAX_VIDEO_SECONDS}s of a {int(duration)}s video"
+            )
         return temp_dir, video_path, meta
     except Exception:
         shutil.rmtree(temp_dir, ignore_errors=True)
@@ -8405,6 +8784,11 @@ def _run_frame_vision_fallback(video_url: str, meta: dict) -> tuple[dict | None,
             if _social_caption_recipe_acceptable(caption_recipe, caption_text):
                 recipe = caption_recipe
                 method = "caption_llm"
+            else:
+                merged = _merge_caption_ingredients(recipe, caption_recipe, caption_text)
+                if merged is not None:
+                    recipe = merged
+                    method = "caption_ingredients_vision"
         if not _recipe_has_usable_content(recipe):
             return None, None, None
         source = _build_video_recipe_source(video_url, video_meta, recipe)
@@ -8455,6 +8839,11 @@ def _run_frame_vision_fallback_from_path(
             if _social_caption_recipe_acceptable(caption_recipe, caption_text):
                 recipe = caption_recipe
                 method = "caption_llm"
+            else:
+                merged = _merge_caption_ingredients(recipe, caption_recipe, caption_text)
+                if merged is not None:
+                    recipe = merged
+                    method = "caption_ingredients_vision"
         if not _recipe_has_usable_content(recipe):
             return None, None, None
         source = _build_video_recipe_source(video_url, meta, recipe)
@@ -9211,6 +9600,47 @@ def _instaloader_import_cookies(L, cookiefile: str) -> bool:
     return found_sessionid
 
 
+def _logged_in_instaloader(url: str | None = None):
+    """instaloader authenticated with INSTALOADER_SESSION_FILE or, failing that,
+    the yt-dlp Instagram cookies. Returns None when no working session exists.
+
+    Importing cookies alone never logged instaloader in: `is_logged_in` is
+    `bool(context.username)`, and nothing set a username — so the Instagram
+    caption fetch silently returned None for every post unless a session file
+    was configured. We now verify the cookie session with test_login() and set
+    the username it returns.
+    """
+    L = _make_instaloader()
+    if getattr(L.context, "is_logged_in", False):
+        return L
+    cookie_tmp = None
+    try:
+        cookie_tmp = _mkdtemp()
+        cf = _prepare_cookiefile(cookie_tmp, url or "https://www.instagram.com/")
+        if not (cf and _instaloader_import_cookies(L, cf)):
+            return None
+        csrf = L.context._session.cookies.get("csrftoken", domain=".instagram.com") or \
+            next((c.value for c in L.context._session.cookies if c.name == "csrftoken"), None)
+        if csrf:
+            L.context._session.headers.update({"X-CSRFToken": csrf})
+        try:
+            username = L.test_login()
+        except Exception as e:
+            print(f"⚠️ instaloader: cookie session check failed: {str(e)[:120]}")
+            username = None
+        if not username:
+            print("🍪 instaloader: Instagram cookie session not accepted (stale/flagged) — refresh cookies")
+            return None
+        L.context.username = username
+        return L
+    except Exception as e:
+        print(f"⚠️ instaloader: cookie import failed: {e}")
+        return None
+    finally:
+        if cookie_tmp:
+            shutil.rmtree(cookie_tmp, ignore_errors=True)
+
+
 def _fetch_instagram_page_caption(url: str) -> str | None:
     """Fetch full Instagram post/reel caption via instaloader.
 
@@ -9228,23 +9658,8 @@ def _fetch_instagram_page_caption(url: str) -> str | None:
     if not shortcode:
         return None
 
-    L = _make_instaloader()  # loads INSTALOADER_SESSION_FILE if configured
-
-    # If the session file didn't log us in, try the yt-dlp Instagram cookies.
-    if not getattr(L.context, "is_logged_in", False):
-        cookie_tmp = None
-        try:
-            cookie_tmp = _mkdtemp()
-            cf = _prepare_cookiefile(cookie_tmp, url)
-            if cf:
-                _instaloader_import_cookies(L, cf)
-        except Exception as e:
-            print(f"⚠️ instaloader: cookie import failed: {e}")
-        finally:
-            if cookie_tmp:
-                shutil.rmtree(cookie_tmp, ignore_errors=True)
-
-    if not getattr(L.context, "is_logged_in", False):
+    L = _logged_in_instaloader(url)
+    if L is None:
         # Anonymous access is reliably blocked by Instagram — skip without noise.
         return None
 
@@ -9540,7 +9955,7 @@ def _fetch_instagram_carousel_slideshow(url: str) -> tuple[list[str], dict] | No
     shortcode = _instagram_post_shortcode(url)
     if not shortcode:
         return None
-    L = _make_instaloader()
+    L = _logged_in_instaloader(url) or _make_instaloader()
     try:
         post = instaloader.Post.from_shortcode(L.context, shortcode)
     except instaloader.exceptions.InstaloaderException as e:
@@ -9661,6 +10076,213 @@ def _extract_recipe_from_slideshow(url: str, url_key: str, slideshow: tuple[list
             "user_message": "We couldn't read this photo slideshow. Please try another link or add the recipe manually.",
             "details": str(e),
         }), 500
+
+
+_IG_PHOTO_MAX_IMAGES = 6
+_RECIPE_HEADING_RE = re.compile(r"^[^\w\n]*ingredients?\b[^\w\n]*$", re.I | re.M)
+
+
+def _caption_recipe_count(caption: str) -> int:
+    """How many separate recipes a caption holds: one 'Ingredients' heading each."""
+    return len(_RECIPE_HEADING_RE.findall(caption or ""))
+
+
+def _post_image_data_urls(image_urls: list[str]) -> list[str]:
+    """Full-resolution images for vision: recipe cards carry small printed text
+    that the 512px slideshow downscale makes unreadable."""
+    urls = image_urls[:_IG_PHOTO_MAX_IMAGES]
+    headers = _slideshow_request_headers()
+
+    def _one(u):
+        r = requests.get(u, headers=headers, timeout=EXTRACT_RECIPE_TIMEOUT)
+        r.raise_for_status()
+        ctype = (r.headers.get("Content-Type") or "image/jpeg").split(";")[0]
+        return f"data:{ctype};base64,{base64.b64encode(r.content).decode('utf-8')}"
+
+    out = [None] * len(urls)
+    with ThreadPoolExecutor(max_workers=min(6, max(1, len(urls)))) as ex:
+        futs = {ex.submit(_one, u): i for i, u in enumerate(urls)}
+        for f in as_completed(futs):
+            try:
+                out[futs[f]] = f.result()
+            except Exception as e:
+                print(f"⚠️ photo-post image download failed: {str(e)[:120]}")
+    return [u for u in out if u]
+
+
+def extract_recipes_from_post_llm(image_data_urls: list[str], caption: str) -> list[dict]:
+    """Vision + caption, ONE call, returning EVERY recipe in the post separately.
+
+    Handles: one photo + full recipe in caption, recipe-card images, and roundup
+    posts (several recipes in one image, details split between image and caption).
+    """
+    lang_rule = _source_language_prompt_rule()
+    one = (
+        '{"language":"","name":"","ingredients":[{"name":"","quantity":""}],'
+        '"instructions":["..."],"servings":"","prep_time":"","cook_time":"","total_time":"",'
+        '"notes":[],"meal_type":"","cuisine":"","nutrition":{"calories":"","protein_g":"","carbs_g":"",'
+        '"fat_g":"","fiber_g":"","sugar_g":"","sodium_mg":"","cholesterol_mg":"","saturated_fat_g":"",'
+        '"potassium_mg":"","calcium_mg":"","iron_mg":"","vitamin_a_mcg":"","vitamin_c_mg":"","vitamin_d_mcg":""}}'
+    )
+    system = (
+        "You extract recipes from an Instagram photo post: its image(s) and its caption. "
+        "A post may contain ONE recipe or SEVERAL distinct recipes (e.g. '6 breakfast casseroles'). "
+        f'Return ONLY JSON: {{"recipes":[{one}, ...]}} with one entry per distinct dish, in the order they appear. '
+        "Rules: (1) Match each recipe across sources by its name; the caption usually has the fuller text, "
+        "the image may add or confirm ingredients/times — merge them, do not duplicate. "
+        "(2) Take ingredients and instructions ONLY from text visible in the images or written in the caption. "
+        "Never invent steps or ingredients; if a recipe has no instructions anywhere, return []. "
+        "(3) Ignore hashtags, calls to action ('save this', 'follow'), and shared notes go in every recipe they apply to "
+        "(e.g. 'all use a 9x13 dish, serve 12' -> servings and notes). "
+        "(4) Do not return a recipe that has neither ingredients nor instructions. "
+        f"meal_type: Breakfast|Lunch|Dinner|Snack. {_RECIPE_NUTRITION_PROMPT_RULE}{lang_rule} JSON only."
+    )
+    content = [{"type": "text", "text": (
+        f"Instagram post with {len(image_data_urls)} image(s).\n\nCAPTION:\n{(caption or '').strip()[:12000]}"
+    )}]
+    for u in image_data_urls:
+        content.append({"type": "image_url", "image_url": {"url": u, "detail": "high"}})
+    model = os.getenv("RECIPE_LLM_MODEL", "gpt-4o-mini")
+
+    def _call(cap):
+        return client.chat.completions.create(
+            model=model,
+            messages=[{"role": "system", "content": system}, {"role": "user", "content": content}],
+            temperature=0.1,
+            response_format={"type": "json_object"},
+            timeout=max(EXTRACT_RECIPE_TIMEOUT, 90),
+            **_chat_completion_limit_kw(model, cap),
+        )
+
+    cap = int(os.getenv("IG_POST_LLM_MAX_TOKENS", "8000"))
+    completion = _call(cap)
+    if completion.choices[0].finish_reason == "length":
+        print(f"⚠️ Photo-post LLM hit the {cap}-token cap; retrying with {cap * 2}")
+        completion = _call(cap * 2)
+    data = json.loads(completion.choices[0].message.content or "{}")
+    recipes = data.get("recipes") if isinstance(data, dict) else None
+    if not isinstance(recipes, list):
+        recipes = [data] if isinstance(data, dict) and data.get("name") else []
+    return [r for r in recipes if isinstance(r, dict)]
+
+
+def _recipe_has_ingredients_and_steps(recipe: dict | None) -> bool:
+    if not recipe:
+        return False
+    has_ing = any(isinstance(i, dict) and (i.get("name") or "").strip() for i in recipe.get("ingredients") or [])
+    has_steps = any(str(x).strip() for x in recipe.get("instructions") or [])
+    return has_ing and has_steps
+
+
+def _try_instagram_photo_post_fast_path(url: str, url_key: str):
+    """Instagram /p/ PHOTO posts (single image or carousel) never go through the
+    video download, which always fails for them. Recipe comes from the caption
+    and/or the images; posts with several recipes return all of them.
+
+    Returns None (caller continues the normal pipeline) for videos, non-/p/ URLs,
+    or when no logged-in Instagram session is available.
+
+    Response is backward compatible: `recipe` is the first recipe; `recipes`
+    and `recipe_count` are added only when the post has more than one.
+    """
+    if not _is_instagram_post_url(url):
+        return None
+    shortcode = _instagram_post_shortcode(url)
+    if not shortcode:
+        return None
+    t0 = time.time()
+    L = _logged_in_instaloader(url)
+    if L is None:
+        print("📷 IG photo fast-path skipped: no logged-in Instagram session")
+        return None
+    try:
+        post = instaloader.Post.from_shortcode(L.context, shortcode)
+    except Exception as e:
+        print(f"⚠️ IG photo fast-path: post lookup failed: {str(e)[:150]}")
+        return None
+    if post.typename == "GraphSidecar":
+        image_urls = [n.display_url for n in post.get_sidecar_nodes() if not n.is_video and n.display_url]
+    elif not post.is_video:
+        image_urls = [post.url] if post.url else []
+    else:
+        return None  # a video post — the normal video pipeline handles it
+    if not image_urls:
+        return None
+
+    caption = (post.caption or "").strip()
+    n_in_caption = _caption_recipe_count(caption)
+    meta = {
+        "title": (caption.splitlines() or [""])[0][:150],
+        "description": caption,
+        "provider": "instagram.com",
+        "extractor": "instagram_photo_post",
+        "webpage_url": url,
+        "thumbnail": image_urls[0],
+        "image_count": len(image_urls),
+    }
+    print(f"📷 IG photo post: {len(image_urls)} image(s), caption {len(caption)} chars, "
+          f"{n_in_caption} 'Ingredients' heading(s)")
+
+    recipes: list[dict] = []
+    method = ""
+    # Cheapest path: one complete recipe written out in the caption → text only.
+    if n_in_caption <= 1 and _caption_has_full_recipe_text(caption):
+        r = _extract_recipe_from_video_caption(meta)
+        if _recipe_has_ingredients_and_steps(r):
+            recipes, method = [r], "caption_llm"
+            print("📝 IG photo post: full recipe read from caption")
+    if not recipes:
+        data_urls = _post_image_data_urls(image_urls)
+        if not data_urls and not caption:
+            return None
+        t_llm = time.time()
+        try:
+            raw = extract_recipes_from_post_llm(data_urls, caption)
+        except Exception as e:
+            print(f"⚠️ IG photo-post extraction failed: {type(e).__name__}: {str(e)[:200]}")
+            return None
+        recipes = [_normalize_extracted_recipe(r) for r in raw]
+        recipes = [r for r in recipes if _recipe_has_usable_content(r) and (
+            r.get("ingredients") or r.get("instructions"))]
+        method = "photo_post_vision" if len(recipes) <= 1 else "photo_post_multi_recipe"
+        print(f"🧠 IG photo-post LLM: {len(recipes)} recipe(s) in {time.time() - t_llm:.2f}s")
+    if not recipes:
+        return None
+
+    # Enrich every recipe (steps if missing → flagged, description, metadata).
+    def _fin(r):
+        return _finalize_recipe_for_response(r, meta)
+    if len(recipes) == 1:
+        langs = [_fin(recipes[0])]
+    else:
+        with ThreadPoolExecutor(max_workers=min(6, len(recipes))) as ex:
+            langs = list(ex.map(_fin, recipes))
+
+    first = recipes[0]
+    source = {
+        "type": "instagram_post",
+        "url": url,
+        "provider": "instagram.com",
+        "title": meta["title"] or first.get("name", ""),
+        "image": image_urls[0],
+        "source_type": determine_source_type(url),
+    }
+    result = {
+        "source": source,
+        "recipe": first,
+        "tags": extract_recipe_tags(first),
+        "transcript": None,
+        "extraction": {"method": method, "confidence": 0.7},
+        "meta": meta,
+        "language": langs[0],
+    }
+    if len(recipes) > 1:
+        result["recipes"] = recipes
+        result["recipe_count"] = len(recipes)
+    result = _apply_response_language(result, url, meta)
+    _recipe_cache.set(url_key, result)
+    print(f"✅ IG photo post: {len(recipes)} recipe(s) via {method} in {time.time() - t0:.2f}s")
+    return jsonify(_apply_extract_recipe_image_pref(result)), 200
 
 
 def _try_slideshow_fallback_on_download_error(
@@ -10009,6 +10631,10 @@ def extract_recipe_from_video_internal(video_url: str):
     if tiktok_photo_resp is not None:
         return tiktok_photo_resp
 
+    ig_photo_resp = _try_instagram_photo_post_fast_path(video_url, url_key)
+    if ig_photo_resp is not None:
+        return ig_photo_resp
+
     resolved_tt = _resolve_tiktok_short_url(video_url)
     if _is_tiktok_photo_url(video_url) or _is_tiktok_photo_url(resolved_tt):
         return _tiktok_photo_slideshow_error_response()
@@ -10198,7 +10824,7 @@ def extract_recipe_from_video_internal(video_url: str):
                     )
                     meta = _merge_meta_keep_longer_description(meta, dl_meta)
                 except ValueError as ve:
-                    return jsonify({"error": str(ve)}), 413
+                    return _too_long_response(ve)
                 except yt_dlp.utils.DownloadError as de:
                     slideshow_resp = _try_slideshow_fallback_on_download_error(
                         video_url, url_key, download_error=str(de)
@@ -10321,7 +10947,7 @@ def extract_recipe_from_video_internal(video_url: str):
             except YouTubeVideoTooLongError as e:
                 return _youtube_too_long_response(e)
             except ValueError as ve:
-                return jsonify({"error": str(ve)}), 413
+                return _too_long_response(ve)
             except Exception as e:
                 return jsonify({
                     "error": "YouTube transcript failed",
@@ -10406,7 +11032,7 @@ def extract_recipe_from_video_internal(video_url: str):
                         "cookies_configured": cookies_configured,
                     }), 400
                 if isinstance(de, ValueError):
-                    return jsonify({"error": str(de)}), 413
+                    return _too_long_response(de)
                 return jsonify({
                     "error": "Video download failed",
                     "user_message": "We couldn't download this video. Please try another link or add the recipe manually.",

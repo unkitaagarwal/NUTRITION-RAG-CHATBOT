@@ -436,10 +436,27 @@ def _resolve_share_url(url: str) -> str:
             ),
             "Accept-Language": "en-US,en;q=0.9",
         }
-        proxies = None
-        if SOCIAL_PROXY:
-            proxies = {"http": SOCIAL_PROXY, "https": SOCIAL_PROXY}
-        resp = sess.get(url, headers=headers, allow_redirects=True, timeout=15, proxies=proxies)
+        # Same policy as every other social request: direct first, proxy only
+        # as a fallback (or first, with SOCIAL_USE_PROXY=1). This used to be
+        # proxy-ONLY, so a dead proxy (407) meant no share link resolved at all.
+        proxy_cfg = {"http": SOCIAL_PROXY, "https": SOCIAL_PROXY} if SOCIAL_PROXY else None
+        attempts = [None]
+        if proxy_cfg:
+            attempts = [proxy_cfg, None] if SOCIAL_USE_PROXY else [None, proxy_cfg]
+        resp, last_err = None, None
+        for proxies in attempts:
+            try:
+                resp = sess.get(url, headers=headers, allow_redirects=True,
+                                timeout=15, proxies=proxies)
+                if proxies is None and resp.status_code in (403, 429) and len(attempts) > 1:
+                    continue  # blocked direct; let the proxy try
+                break
+            except requests.exceptions.RequestException as e:
+                last_err = e
+                print(f"[resolve] {'proxy' if proxies else 'direct'} attempt failed for "
+                      f"{url[:100]}: {str(e)[:140]}")
+        if resp is None:
+            raise last_err or RuntimeError("share-url resolution: no response")
         final = resp.url or url
         p = urlparse(final)
         fhost = (p.hostname or "").lower()
@@ -591,6 +608,8 @@ def _yt_extractor_args() -> dict:
 SOCIAL_PROXY = os.getenv("SOCIAL_PROXY") or os.getenv("YTDLP_PROXY") or YT_PROXY
 print(f"[startup] yt-dlp version: {getattr(yt_dlp.version, '__version__', 'unknown')}")
 print(f"[startup] deno: {shutil.which('deno') or 'NOT FOUND'}")
+# Defined here, not further down, because the banner below reads it at import.
+_PROXY_DISABLE_SECONDS = int(os.getenv("PROXY_DISABLE_SECONDS", "600"))
 print(
     f"[startup] proxies: YT_PROXY={'set' if YT_PROXY else 'none'} "
     f"({'PROXY-FIRST via YT_USE_PROXY=1' if YT_USE_PROXY else 'direct-first; proxy only as blocked-retry fallback'}), "
@@ -736,7 +755,7 @@ def _proxy_config_error(exc: Exception) -> bool:
 # When the proxy returns 407 etc., stop trying it for a while instead of
 # paying a doomed retry on every metadata + download call.
 _PROXY_DISABLED_UNTIL = 0.0
-_PROXY_DISABLE_SECONDS = int(os.getenv("PROXY_DISABLE_SECONDS", "600"))
+# (_PROXY_DISABLE_SECONDS is defined above the [startup] proxies banner)
 
 
 def _ydl_extract(ydl_opts: dict, video_url: str, *, download: bool):
@@ -4147,6 +4166,10 @@ SCRAPER_API_ULTRA = os.getenv("SCRAPER_API_ULTRA", "true").strip().lower() == "t
 # Say at boot which anti-bot tiers are actually armed. 131 webpage 403s in 30
 # days could be a code problem OR two unset env vars, and there was no way to
 # tell them apart from the logs without reproducing a block.
+# Defined before the banner below, which reads it at import.
+FETCH_HTML_USE_PROXY = (
+    (os.getenv("FETCH_HTML_USE_PROXY") or "1").strip().lower() not in ("0", "false", "no")
+)
 print(
     "[startup] fetch_html tiers: "
     f"direct=on  proxy={'ON' if (FETCH_HTML_USE_PROXY and SOCIAL_PROXY) else 'OFF'}"
@@ -4214,7 +4237,7 @@ def _fetch_via_scraperapi(url: str) -> str:
             return r.text
         print("[fetch_html] ScraperAPI no-render returned challenge HTML; escalating to render")
     except requests.exceptions.RequestException as e:
-        print(f"[fetch_html] ScraperAPI no-render failed ({str(e)[:120]}); escalating to render")
+        print(f"[fetch_html] ScraperAPI no-render failed ({_redact_api_key(str(e))[:120]}); escalating to render")
 
     # Stage 2: full render (+ultra when configured)
     params = dict(base)
@@ -4230,9 +4253,7 @@ def _fetch_via_scraperapi(url: str) -> str:
 # (SOCIAL_PROXY / Decodo) before spending ScraperAPI credits. Webpage-only —
 # the video pipelines (TikTok/IG/FB/YT) never call fetch_html. Disable with
 # FETCH_HTML_USE_PROXY=0.
-FETCH_HTML_USE_PROXY = (
-    (os.getenv("FETCH_HTML_USE_PROXY") or "1").strip().lower() not in ("0", "false", "no")
-)
+# (FETCH_HTML_USE_PROXY is defined above the [startup] fetch_html tiers banner)
 
 
 def _mask_proxy_url(proxy: str) -> str:
@@ -4247,6 +4268,15 @@ def _mask_proxy_url(proxy: str) -> str:
     except Exception:
         pass
     return proxy
+
+
+_API_KEY_RE = re.compile(r"(api_key=)[^&\s'\"]+", re.I)
+
+
+def _redact_api_key(text: str) -> str:
+    """requests puts the full request URL in HTTPError text, and ScraperAPI's
+    key is a query param — so every ScraperAPI error used to print the key."""
+    return _API_KEY_RE.sub(r"\1***", text or "")
 
 
 def _impersonated_get(url: str, timeout: int, proxy: str | None = None):
@@ -4323,7 +4353,7 @@ def fetch_html(url: str, timeout: int | None = None) -> str:
             print(f"[fetch_html] retrying via ScraperAPI (ultra={SCRAPER_API_ULTRA}) for {url[:120]}")
             return _fetch_via_scraperapi(url)
         except requests.exceptions.RequestException as e:
-            print(f"[fetch_html] ScraperAPI fetch failed for {url[:120]}: {str(e)[:200]}")
+            print(f"[fetch_html] ScraperAPI fetch failed for {url[:120]}: {_redact_api_key(str(e))[:200]}")
     else:
         print("[fetch_html] blocked and no SCRAPER_API_KEY set — cannot fall back")
 
@@ -6962,11 +6992,26 @@ def _return_video_extract_result(
     return jsonify(_apply_extract_recipe_image_pref(result)), 200
 
 
+def _is_short_form_video_url(url: str, duration_sec: float | None = None) -> bool:
+    """YouTube Shorts and Facebook Reels behave like TikTok/IG reels: often no
+    speech, recipe shown as on-screen text. Used ONLY for frame sampling —
+    _is_social_video_url() drives other policy and is deliberately unchanged.
+    (Before this, a 34s silent Short got 2 frames vs 6 for the same TikTok.)
+    """
+    lowered = (url or "").lower()
+    if "youtube.com/shorts/" in lowered:
+        return True
+    if is_youtube_url(url) and duration_sec and 0 < float(duration_sec) <= 180:
+        return True  # Shorts are <=3 min; a short watch?v= link is the same content
+    return "facebook.com/reel" in lowered or "facebook.com/share/r/" in lowered
+
+
 def _social_video_frames_for_duration(
     url: str, duration_sec: float | None, *, meta: dict | None = None
 ) -> int:
-    """TikTok/IG: sample multiple frames when vision fallback is needed."""
-    if not _is_social_video_url(url):
+    """TikTok/IG (and YouTube Shorts / Facebook Reels): sample multiple frames
+    when vision fallback is needed."""
+    if not (_is_social_video_url(url) or _is_short_form_video_url(url, duration_sec)):
         return _video_frames_for_duration(duration_sec)
     caption = _video_caption_text(meta or {})
     # Short hashtag captions → recipe is usually on-screen text; sample denser.
@@ -7154,6 +7199,62 @@ def _caption_has_instructions(caption: str) -> bool:
         caption,
     )
     return len(cap_verbs) >= 3
+
+
+def _ingredient_grounded_in_caption(name: str, caption_lower: str) -> bool:
+    """True when some word of the ingredient name appears in the caption
+    (prefix match, so 'tomatoes' matches 'tomato'). Filters out ingredients the
+    LLM guessed from the dish name rather than read from the caption."""
+    for tok in re.findall(r"[a-zA-Z\u00C0-\u024F]{3,}", (name or "").lower()):
+        stem = tok[:max(4, len(tok) - 2)]
+        if tok in caption_lower or stem in caption_lower:
+            return True
+    return False
+
+
+def _merge_caption_ingredients(vision_recipe: dict | None, caption_recipe: dict | None,
+                               caption: str) -> dict | None:
+    """Caption had real ingredients but no method, so the caption result was
+    rejected for its invented steps — and its ingredients were thrown away too.
+
+    Keep only the ingredients actually present in the caption, keep any steps
+    vision read off the frames, and leave instructions empty otherwise so
+    _ensure_recipe_instructions generates them WITH instructions_generated=True
+    (the same rule every other source follows). Returns None if the caption
+    contributes nothing.
+    """
+    if not caption_recipe or not (caption or "").strip():
+        return None
+    cap_lower = caption.lower()
+    grounded = [
+        ing for ing in (caption_recipe.get("ingredients") or [])
+        if isinstance(ing, dict) and (ing.get("name") or "").strip()
+        and _ingredient_grounded_in_caption(ing.get("name"), cap_lower)
+    ]
+    if len(grounded) < 2:
+        return None
+    vision_recipe = vision_recipe or {}
+    vision_ings = [
+        ing for ing in (vision_recipe.get("ingredients") or [])
+        if isinstance(ing, dict) and (ing.get("name") or "").strip()
+    ]
+    if len(vision_ings) >= len(grounded):
+        return None  # vision already found as much; nothing to add
+    vision_steps = [str(x).strip() for x in (vision_recipe.get("instructions") or []) if str(x).strip()]
+
+    base = dict(vision_recipe) if (vision_recipe.get("name") or "").strip() else dict(caption_recipe)
+    base["ingredients"] = grounded
+    base["instructions"] = vision_steps  # real steps from frames, or [] -> generated + flagged
+    base.pop("instructions_generated", None)
+    if not (base.get("name") or "").strip():
+        base["name"] = caption_recipe.get("name") or ""
+    dropped = len(caption_recipe.get("ingredients") or []) - len(grounded)
+    print(
+        f"📝 Kept {len(grounded)} caption ingredient(s) (dropped {dropped} not in caption); "
+        f"steps: {len(vision_steps)} from frames"
+        + ("" if vision_steps else ", rest will be generated and flagged")
+    )
+    return base
 
 
 def _social_caption_recipe_acceptable(recipe: dict | None, caption: str) -> bool:
@@ -8683,6 +8784,11 @@ def _run_frame_vision_fallback(video_url: str, meta: dict) -> tuple[dict | None,
             if _social_caption_recipe_acceptable(caption_recipe, caption_text):
                 recipe = caption_recipe
                 method = "caption_llm"
+            else:
+                merged = _merge_caption_ingredients(recipe, caption_recipe, caption_text)
+                if merged is not None:
+                    recipe = merged
+                    method = "caption_ingredients_vision"
         if not _recipe_has_usable_content(recipe):
             return None, None, None
         source = _build_video_recipe_source(video_url, video_meta, recipe)
@@ -8733,6 +8839,11 @@ def _run_frame_vision_fallback_from_path(
             if _social_caption_recipe_acceptable(caption_recipe, caption_text):
                 recipe = caption_recipe
                 method = "caption_llm"
+            else:
+                merged = _merge_caption_ingredients(recipe, caption_recipe, caption_text)
+                if merged is not None:
+                    recipe = merged
+                    method = "caption_ingredients_vision"
         if not _recipe_has_usable_content(recipe):
             return None, None, None
         source = _build_video_recipe_source(video_url, meta, recipe)
@@ -9489,6 +9600,47 @@ def _instaloader_import_cookies(L, cookiefile: str) -> bool:
     return found_sessionid
 
 
+def _logged_in_instaloader(url: str | None = None):
+    """instaloader authenticated with INSTALOADER_SESSION_FILE or, failing that,
+    the yt-dlp Instagram cookies. Returns None when no working session exists.
+
+    Importing cookies alone never logged instaloader in: `is_logged_in` is
+    `bool(context.username)`, and nothing set a username — so the Instagram
+    caption fetch silently returned None for every post unless a session file
+    was configured. We now verify the cookie session with test_login() and set
+    the username it returns.
+    """
+    L = _make_instaloader()
+    if getattr(L.context, "is_logged_in", False):
+        return L
+    cookie_tmp = None
+    try:
+        cookie_tmp = _mkdtemp()
+        cf = _prepare_cookiefile(cookie_tmp, url or "https://www.instagram.com/")
+        if not (cf and _instaloader_import_cookies(L, cf)):
+            return None
+        csrf = L.context._session.cookies.get("csrftoken", domain=".instagram.com") or \
+            next((c.value for c in L.context._session.cookies if c.name == "csrftoken"), None)
+        if csrf:
+            L.context._session.headers.update({"X-CSRFToken": csrf})
+        try:
+            username = L.test_login()
+        except Exception as e:
+            print(f"⚠️ instaloader: cookie session check failed: {str(e)[:120]}")
+            username = None
+        if not username:
+            print("🍪 instaloader: Instagram cookie session not accepted (stale/flagged) — refresh cookies")
+            return None
+        L.context.username = username
+        return L
+    except Exception as e:
+        print(f"⚠️ instaloader: cookie import failed: {e}")
+        return None
+    finally:
+        if cookie_tmp:
+            shutil.rmtree(cookie_tmp, ignore_errors=True)
+
+
 def _fetch_instagram_page_caption(url: str) -> str | None:
     """Fetch full Instagram post/reel caption via instaloader.
 
@@ -9506,23 +9658,8 @@ def _fetch_instagram_page_caption(url: str) -> str | None:
     if not shortcode:
         return None
 
-    L = _make_instaloader()  # loads INSTALOADER_SESSION_FILE if configured
-
-    # If the session file didn't log us in, try the yt-dlp Instagram cookies.
-    if not getattr(L.context, "is_logged_in", False):
-        cookie_tmp = None
-        try:
-            cookie_tmp = _mkdtemp()
-            cf = _prepare_cookiefile(cookie_tmp, url)
-            if cf:
-                _instaloader_import_cookies(L, cf)
-        except Exception as e:
-            print(f"⚠️ instaloader: cookie import failed: {e}")
-        finally:
-            if cookie_tmp:
-                shutil.rmtree(cookie_tmp, ignore_errors=True)
-
-    if not getattr(L.context, "is_logged_in", False):
+    L = _logged_in_instaloader(url)
+    if L is None:
         # Anonymous access is reliably blocked by Instagram — skip without noise.
         return None
 
@@ -9818,7 +9955,7 @@ def _fetch_instagram_carousel_slideshow(url: str) -> tuple[list[str], dict] | No
     shortcode = _instagram_post_shortcode(url)
     if not shortcode:
         return None
-    L = _make_instaloader()
+    L = _logged_in_instaloader(url) or _make_instaloader()
     try:
         post = instaloader.Post.from_shortcode(L.context, shortcode)
     except instaloader.exceptions.InstaloaderException as e:
@@ -9939,6 +10076,213 @@ def _extract_recipe_from_slideshow(url: str, url_key: str, slideshow: tuple[list
             "user_message": "We couldn't read this photo slideshow. Please try another link or add the recipe manually.",
             "details": str(e),
         }), 500
+
+
+_IG_PHOTO_MAX_IMAGES = 6
+_RECIPE_HEADING_RE = re.compile(r"^[^\w\n]*ingredients?\b[^\w\n]*$", re.I | re.M)
+
+
+def _caption_recipe_count(caption: str) -> int:
+    """How many separate recipes a caption holds: one 'Ingredients' heading each."""
+    return len(_RECIPE_HEADING_RE.findall(caption or ""))
+
+
+def _post_image_data_urls(image_urls: list[str]) -> list[str]:
+    """Full-resolution images for vision: recipe cards carry small printed text
+    that the 512px slideshow downscale makes unreadable."""
+    urls = image_urls[:_IG_PHOTO_MAX_IMAGES]
+    headers = _slideshow_request_headers()
+
+    def _one(u):
+        r = requests.get(u, headers=headers, timeout=EXTRACT_RECIPE_TIMEOUT)
+        r.raise_for_status()
+        ctype = (r.headers.get("Content-Type") or "image/jpeg").split(";")[0]
+        return f"data:{ctype};base64,{base64.b64encode(r.content).decode('utf-8')}"
+
+    out = [None] * len(urls)
+    with ThreadPoolExecutor(max_workers=min(6, max(1, len(urls)))) as ex:
+        futs = {ex.submit(_one, u): i for i, u in enumerate(urls)}
+        for f in as_completed(futs):
+            try:
+                out[futs[f]] = f.result()
+            except Exception as e:
+                print(f"⚠️ photo-post image download failed: {str(e)[:120]}")
+    return [u for u in out if u]
+
+
+def extract_recipes_from_post_llm(image_data_urls: list[str], caption: str) -> list[dict]:
+    """Vision + caption, ONE call, returning EVERY recipe in the post separately.
+
+    Handles: one photo + full recipe in caption, recipe-card images, and roundup
+    posts (several recipes in one image, details split between image and caption).
+    """
+    lang_rule = _source_language_prompt_rule()
+    one = (
+        '{"language":"","name":"","ingredients":[{"name":"","quantity":""}],'
+        '"instructions":["..."],"servings":"","prep_time":"","cook_time":"","total_time":"",'
+        '"notes":[],"meal_type":"","cuisine":"","nutrition":{"calories":"","protein_g":"","carbs_g":"",'
+        '"fat_g":"","fiber_g":"","sugar_g":"","sodium_mg":"","cholesterol_mg":"","saturated_fat_g":"",'
+        '"potassium_mg":"","calcium_mg":"","iron_mg":"","vitamin_a_mcg":"","vitamin_c_mg":"","vitamin_d_mcg":""}}'
+    )
+    system = (
+        "You extract recipes from an Instagram photo post: its image(s) and its caption. "
+        "A post may contain ONE recipe or SEVERAL distinct recipes (e.g. '6 breakfast casseroles'). "
+        f'Return ONLY JSON: {{"recipes":[{one}, ...]}} with one entry per distinct dish, in the order they appear. '
+        "Rules: (1) Match each recipe across sources by its name; the caption usually has the fuller text, "
+        "the image may add or confirm ingredients/times — merge them, do not duplicate. "
+        "(2) Take ingredients and instructions ONLY from text visible in the images or written in the caption. "
+        "Never invent steps or ingredients; if a recipe has no instructions anywhere, return []. "
+        "(3) Ignore hashtags, calls to action ('save this', 'follow'), and shared notes go in every recipe they apply to "
+        "(e.g. 'all use a 9x13 dish, serve 12' -> servings and notes). "
+        "(4) Do not return a recipe that has neither ingredients nor instructions. "
+        f"meal_type: Breakfast|Lunch|Dinner|Snack. {_RECIPE_NUTRITION_PROMPT_RULE}{lang_rule} JSON only."
+    )
+    content = [{"type": "text", "text": (
+        f"Instagram post with {len(image_data_urls)} image(s).\n\nCAPTION:\n{(caption or '').strip()[:12000]}"
+    )}]
+    for u in image_data_urls:
+        content.append({"type": "image_url", "image_url": {"url": u, "detail": "high"}})
+    model = os.getenv("RECIPE_LLM_MODEL", "gpt-4o-mini")
+
+    def _call(cap):
+        return client.chat.completions.create(
+            model=model,
+            messages=[{"role": "system", "content": system}, {"role": "user", "content": content}],
+            temperature=0.1,
+            response_format={"type": "json_object"},
+            timeout=max(EXTRACT_RECIPE_TIMEOUT, 90),
+            **_chat_completion_limit_kw(model, cap),
+        )
+
+    cap = int(os.getenv("IG_POST_LLM_MAX_TOKENS", "8000"))
+    completion = _call(cap)
+    if completion.choices[0].finish_reason == "length":
+        print(f"⚠️ Photo-post LLM hit the {cap}-token cap; retrying with {cap * 2}")
+        completion = _call(cap * 2)
+    data = json.loads(completion.choices[0].message.content or "{}")
+    recipes = data.get("recipes") if isinstance(data, dict) else None
+    if not isinstance(recipes, list):
+        recipes = [data] if isinstance(data, dict) and data.get("name") else []
+    return [r for r in recipes if isinstance(r, dict)]
+
+
+def _recipe_has_ingredients_and_steps(recipe: dict | None) -> bool:
+    if not recipe:
+        return False
+    has_ing = any(isinstance(i, dict) and (i.get("name") or "").strip() for i in recipe.get("ingredients") or [])
+    has_steps = any(str(x).strip() for x in recipe.get("instructions") or [])
+    return has_ing and has_steps
+
+
+def _try_instagram_photo_post_fast_path(url: str, url_key: str):
+    """Instagram /p/ PHOTO posts (single image or carousel) never go through the
+    video download, which always fails for them. Recipe comes from the caption
+    and/or the images; posts with several recipes return all of them.
+
+    Returns None (caller continues the normal pipeline) for videos, non-/p/ URLs,
+    or when no logged-in Instagram session is available.
+
+    Response is backward compatible: `recipe` is the first recipe; `recipes`
+    and `recipe_count` are added only when the post has more than one.
+    """
+    if not _is_instagram_post_url(url):
+        return None
+    shortcode = _instagram_post_shortcode(url)
+    if not shortcode:
+        return None
+    t0 = time.time()
+    L = _logged_in_instaloader(url)
+    if L is None:
+        print("📷 IG photo fast-path skipped: no logged-in Instagram session")
+        return None
+    try:
+        post = instaloader.Post.from_shortcode(L.context, shortcode)
+    except Exception as e:
+        print(f"⚠️ IG photo fast-path: post lookup failed: {str(e)[:150]}")
+        return None
+    if post.typename == "GraphSidecar":
+        image_urls = [n.display_url for n in post.get_sidecar_nodes() if not n.is_video and n.display_url]
+    elif not post.is_video:
+        image_urls = [post.url] if post.url else []
+    else:
+        return None  # a video post — the normal video pipeline handles it
+    if not image_urls:
+        return None
+
+    caption = (post.caption or "").strip()
+    n_in_caption = _caption_recipe_count(caption)
+    meta = {
+        "title": (caption.splitlines() or [""])[0][:150],
+        "description": caption,
+        "provider": "instagram.com",
+        "extractor": "instagram_photo_post",
+        "webpage_url": url,
+        "thumbnail": image_urls[0],
+        "image_count": len(image_urls),
+    }
+    print(f"📷 IG photo post: {len(image_urls)} image(s), caption {len(caption)} chars, "
+          f"{n_in_caption} 'Ingredients' heading(s)")
+
+    recipes: list[dict] = []
+    method = ""
+    # Cheapest path: one complete recipe written out in the caption → text only.
+    if n_in_caption <= 1 and _caption_has_full_recipe_text(caption):
+        r = _extract_recipe_from_video_caption(meta)
+        if _recipe_has_ingredients_and_steps(r):
+            recipes, method = [r], "caption_llm"
+            print("📝 IG photo post: full recipe read from caption")
+    if not recipes:
+        data_urls = _post_image_data_urls(image_urls)
+        if not data_urls and not caption:
+            return None
+        t_llm = time.time()
+        try:
+            raw = extract_recipes_from_post_llm(data_urls, caption)
+        except Exception as e:
+            print(f"⚠️ IG photo-post extraction failed: {type(e).__name__}: {str(e)[:200]}")
+            return None
+        recipes = [_normalize_extracted_recipe(r) for r in raw]
+        recipes = [r for r in recipes if _recipe_has_usable_content(r) and (
+            r.get("ingredients") or r.get("instructions"))]
+        method = "photo_post_vision" if len(recipes) <= 1 else "photo_post_multi_recipe"
+        print(f"🧠 IG photo-post LLM: {len(recipes)} recipe(s) in {time.time() - t_llm:.2f}s")
+    if not recipes:
+        return None
+
+    # Enrich every recipe (steps if missing → flagged, description, metadata).
+    def _fin(r):
+        return _finalize_recipe_for_response(r, meta)
+    if len(recipes) == 1:
+        langs = [_fin(recipes[0])]
+    else:
+        with ThreadPoolExecutor(max_workers=min(6, len(recipes))) as ex:
+            langs = list(ex.map(_fin, recipes))
+
+    first = recipes[0]
+    source = {
+        "type": "instagram_post",
+        "url": url,
+        "provider": "instagram.com",
+        "title": meta["title"] or first.get("name", ""),
+        "image": image_urls[0],
+        "source_type": determine_source_type(url),
+    }
+    result = {
+        "source": source,
+        "recipe": first,
+        "tags": extract_recipe_tags(first),
+        "transcript": None,
+        "extraction": {"method": method, "confidence": 0.7},
+        "meta": meta,
+        "language": langs[0],
+    }
+    if len(recipes) > 1:
+        result["recipes"] = recipes
+        result["recipe_count"] = len(recipes)
+    result = _apply_response_language(result, url, meta)
+    _recipe_cache.set(url_key, result)
+    print(f"✅ IG photo post: {len(recipes)} recipe(s) via {method} in {time.time() - t0:.2f}s")
+    return jsonify(_apply_extract_recipe_image_pref(result)), 200
 
 
 def _try_slideshow_fallback_on_download_error(
@@ -10286,6 +10630,10 @@ def extract_recipe_from_video_internal(video_url: str):
     tiktok_photo_resp = _try_tiktok_photo_slideshow_fast_path(video_url, url_key)
     if tiktok_photo_resp is not None:
         return tiktok_photo_resp
+
+    ig_photo_resp = _try_instagram_photo_post_fast_path(video_url, url_key)
+    if ig_photo_resp is not None:
+        return ig_photo_resp
 
     resolved_tt = _resolve_tiktok_short_url(video_url)
     if _is_tiktok_photo_url(video_url) or _is_tiktok_photo_url(resolved_tt):

@@ -70,6 +70,11 @@ CLAUDE_PRESET_MODEL = os.getenv("CUSTOMIZE_CLAUDE_PRESET_MODEL", "claude-haiku-4
 USE_PRESET_MODEL = (os.getenv("CUSTOMIZE_USE_PRESET_MODEL") or "1").strip().lower() in ("1", "true", "yes")
 CLAUDE_MAX_TOKENS = _env_int("CUSTOMIZE_CLAUDE_MAX_TOKENS", 3000)  # edits only, so much smaller
 
+# Seconds of clock difference allowed when checking Firebase ID tokens. With 0, a freshly
+# issued token is rejected as "used too early" if this server's clock is slightly behind
+# Google's. Firebase allows 0-60.
+TOKEN_CLOCK_SKEW_SECONDS = max(0, min(60, _env_int("CUSTOMIZE_TOKEN_CLOCK_SKEW_SECONDS", 10)))
+
 USERS_COLLECTION = os.getenv("CUSTOMIZE_USERS_COLLECTION", "meal_plan_chef_users")
 
 # One automatic retry for a bad / cut-off / no-op / overloaded model answer, but only if at
@@ -110,13 +115,18 @@ SYSTEM_PROMPT = (
     "Keep existing dietary tags unless the user explicitly asks to change them. "
     "Use realistic amounts for the given servings. "
     "Never claim a recipe is safe for an allergy. "
-    "If the request is unclear, set status to clarify and ask one short question. "
-    "If it is not about cooking this recipe, set status to declined. "
+    "Every reply must give the user something useful: either the change applied, or concrete "
+    "recommendations they can act on. Never reply with only a question. "
+    "If it is not about cooking at all (weather, news, coding...), set status to declined. "
     "Write assistantMessage in a friendly tone: say what changed in 1-2 sentences, "
     "then ask whether they'd like to see a preview."
     # Output-format guidance (not part of the product prompt above):
-    "\n\nPrefer applying the change. Use status clarify ONLY when the request cannot be acted "
-    "on at all (e.g. 'change it', 'make it better', 'hmm'). Requests that name a goal, diet, "
+    "\n\nPrefer applying the change. Vague requests (e.g. 'change it', 'make it better', "
+    "'make it nicer') still get a real answer: apply the single most useful improvement for THIS "
+    "recipe, say in assistantMessage what you chose and why, and you may then ask whether they had "
+    "something else in mind. Use status clarify only when no sensible edit exists (the recipe "
+    "already meets the request, the change would make it a different dish, or the message is not "
+    "a change request at all, e.g. 'hmm', 'ok'). Requests that name a goal, diet, "
     "ingredient, audience, flavour, time or amount (e.g. 'make it toddler-friendly', 'less salty', "
     "'add more vegetables', 'lower calorie', 'no onions') are clear enough: make sensible "
     "assumptions, apply the change, and say briefly what you assumed in assistantMessage. "
@@ -130,6 +140,19 @@ SYSTEM_PROMPT = (
     "under 20 minutes, kid-friendly, and end with a short question. For an impossible change, offer "
     "the closest version that keeps the dish (e.g. a mushroom version of a beef stew). "
     "Never return status updated with edits that change nothing."
+    "\n\nIf the request would turn the recipe into a different dish (e.g. 'turn it into a "
+    "chocolate cake'), set status clarify and describe the closest version that keeps this dish, "
+    "concretely: e.g. for a savoury bowl asked to be a cake, a sweet twist such as 'drizzle 1 tbsp "
+    "honey over the yogurt and add a pinch of cinnamon', or a recipe-specific swap."
+    "\n\nWhen status is clarify or declined, assistantMessage MUST lead with value: one to three "
+    "concrete, recipe-specific recommendations naming ingredients and amounts from THIS recipe "
+    "(e.g. 'stir 1 tsp chili crisp into the potatoes just before serving', 'swap the cream for "
+    "120 ml coconut milk'). Only after that may you add ONE short follow-up question. A reply that "
+    "is only a question (e.g. 'Which part would you like to change?') is never acceptable, and "
+    "neither is a list of options phrased as a question (e.g. 'Would you like it spicier or "
+    "higher in protein?'). Even a declined reply says it can't help with that topic in one short "
+    "sentence, then gives at least one specific suggestion for this recipe with an ingredient "
+    "and amount."
     "\n\nNutrition: start edits.nutrition from the recipe's current per-serving nutrition and "
     "adjust only for what your edits change; values your edits don't affect must stay exactly the "
     "same. When you mention nutrition in changes or assistantMessage, use per-serving numbers that "
@@ -253,7 +276,8 @@ def _default_verify_token(id_token: str) -> str:
 
     init_mealmap_firestore()  # ensures the named 'mealmap' app exists
     app_name = os.getenv("CUSTOMIZE_FIREBASE_APP", "mealmap")
-    decoded = fb_auth.verify_id_token(id_token, app=firebase_admin.get_app(app_name))
+    decoded = fb_auth.verify_id_token(id_token, app=firebase_admin.get_app(app_name),
+                                      clock_skew_seconds=TOKEN_CLOCK_SKEW_SECONDS)
     return decoded["uid"]
 
 
@@ -894,6 +918,107 @@ def _failure_kind(e: Exception) -> str:
     return "transient"   # SDK overload / rate limit / 5xx / connection, or anything unexpected
 
 
+# Quick, do-it-yourself tips so a reply without an edited recipe still carries value.
+PRESET_TIPS = {
+    "spicier": "For more heat, stir in 1/2 tsp chili flakes or a spoonful of chili crisp at the end, "
+               "or cook a sliced green chili with the aromatics.",
+    "more_protein": "For more protein, add a cup of chickpeas, lentils or cubed tofu, serve it with a "
+                    "dollop of Greek yogurt, or top each portion with an egg.",
+    "healthier": "To lighten it, cut the oil or butter by about a third, add an extra cup of vegetables, "
+                 "and go easy on added salt and sugar.",
+    "dairy_free": "To make it dairy-free, use olive oil instead of butter, coconut milk or cashew cream "
+                  "instead of cream, and nutritional yeast instead of cheese.",
+    "under_20": "To save time, cut everything smaller, use a hotter pan, and swap in ready-cooked staples "
+                "like canned beans or microwave rice.",
+    "kid_friendly": "For kids, dial back the chili, cut everything bite-size, and serve sauces and "
+                    "toppings on the side so they can choose.",
+}
+GENERAL_TIP = ("A few ideas that suit most recipes: finish with a squeeze of lemon or a handful of fresh "
+               "herbs for brightness, add an extra vegetable for fibre, or swap in a leaner protein to "
+               "lighten it.")
+_TIP_KEYWORDS = (
+    ("spicier", ("spic", "hot", "heat", "chili", "chilli")),
+    ("more_protein", ("protein",)),
+    ("dairy_free", ("dairy", "vegan", "lactose", "milk", "cheese")),
+    ("kid_friendly", ("kid", "child", "toddler", "baby", "picky")),
+    ("under_20", ("quick", "fast", "faster", "time", "minute", "easier")),
+    ("healthier", ("health", "light", "calorie", "low fat", "low-fat", "salt", "sugar", "diet")),
+)
+
+
+def _tip_for(body: dict, pid: str | None = None) -> str:
+    """The most relevant quick tip: the preset if known, else keywords in the prompt, else general."""
+    pid = pid or (body.get("presetId") if body.get("mode") == "preset" else None)
+    if pid in PRESET_TIPS:
+        return PRESET_TIPS[pid]
+    prompt = _as_text(body.get("prompt")).lower()
+    for key, words in _TIP_KEYWORDS:
+        if any(w in prompt for w in words):
+            return PRESET_TIPS[key]
+    return GENERAL_TIP
+
+
+_SENTENCE_RE = _re.compile(r"(?<=[.!?])\s+")
+
+
+def _is_question_only(message: str) -> bool:
+    """True when a reply is just a question (no recommendation or answer around it)."""
+    sentences = [x.strip() for x in _SENTENCE_RE.split(message or "") if x.strip()]
+    statements = " ".join(x for x in sentences if not x.endswith("?"))
+    return len(statements) < 40
+
+
+_CONCRETE_RE = _re.compile(
+    r"\d|\b(tsp|tbsp|teaspoons?|tablespoons?|cups?|grams?|g|ml|kg|oz|pinch|handful|squeeze|"
+    r"splash|dash|drizzle|sprinkle|spoonful|dollop|knob)\b", _re.IGNORECASE)
+_INGREDIENT_STOPWORDS = {
+    "fresh", "ground", "cooked", "large", "small", "medium", "chopped", "sliced", "diced",
+    "minced", "whole", "dried", "frozen", "canned", "boneless", "skinless", "extra", "virgin",
+    "baby", "optional", "taste", "plus", "more", "with", "into", "about",
+}
+
+
+def _ingredient_words(recipe: dict | None) -> set[str]:
+    words = set()
+    for ing in (recipe or {}).get("ingredients") or []:
+        name = _as_text(ing.get("name") if isinstance(ing, dict) else ing).lower()
+        for w in _re.findall(r"[a-z]+", name):
+            if len(w) >= 4 and w not in _INGREDIENT_STOPWORDS:
+                words.add(w)
+                if w.endswith("es") and len(w) > 5:
+                    words.add(w[:-2])
+                if w.endswith("s"):
+                    words.add(w[:-1])
+                else:
+                    words.add(w + "s")
+    return words
+
+
+def _lacks_recommendation(message: str, recipe: dict | None = None) -> bool:
+    """True when a reply gives the user nothing to act on.
+
+    Questions don't count (so "Would you like it spicier?" is not a recommendation), and
+    neither does the recipe's title. What remains must name an amount / measure (1 tsp,
+    a handful, 100 g) or an ingredient from this recipe.
+    """
+    if _is_question_only(message):
+        return True
+    sentences = [x.strip() for x in _SENTENCE_RE.split(message or "") if x.strip()]
+    statements = " ".join(x for x in sentences if not x.endswith("?"))
+    title = _as_text((recipe or {}).get("title")).strip()
+    if title:
+        statements = _re.sub(_re.escape(title), " ", statements, flags=_re.IGNORECASE)
+    if _CONCRETE_RE.search(statements):
+        return False
+    lowered = statements.lower()
+    return not any(_re.search(rf"\b{_re.escape(w)}\b", lowered) for w in _ingredient_words(recipe))
+
+
+def _with_recommendation(message: str, body: dict) -> str:
+    """Put a concrete tip in front of a question-only reply."""
+    return f"{_tip_for(body)} {message.strip()}"[:MAX_ASSISTANT_MESSAGE_CHARS]
+
+
 def _recipe_title(body: dict) -> str:
     title = _as_text((body.get("recipe") or {}).get("title")).strip()
     return title or "this recipe"
@@ -908,24 +1033,27 @@ def _friendly_fallback(kind: str, body: dict) -> str:
     title = _recipe_title(body)
     pid = body.get("presetId") if body.get("mode") == "preset" else None
     if kind == "empty_prompt":
-        return (f"What would you like to change about {title}? I can make it healthier, quicker, "
-                "spicier or higher in protein, for example.")
+        return (f"{GENERAL_TIP} What would you like to change about {title}? I can also make it "
+                "healthier, quicker, spicier or higher in protein.")
     if kind == "no_change":
         if pid:
-            alts = [_label(a) for a in PRESET_ALTERNATIVES.get(pid, ("healthier", "under_20"))]
+            alt_ids = PRESET_ALTERNATIVES.get(pid, ("healthier", "under_20"))
+            alts = [_label(a) for a in alt_ids]
             return (f"{title} already fits \u201c{_label(pid)}\u201d pretty well, so I've left it as it is. "
-                    f"Want to try {alts[0]} or {alts[1]} instead?")
+                    f"{_tip_for(body, alt_ids[0])} Want to try {alts[0]} or {alts[1]} instead?")
         return ("I couldn't find a meaningful change to make for that, so I've left the recipe as it is. "
-                "Could you tell me a bit more about what you'd like? For example healthier, quicker "
-                "or higher in protein.")
+                f"{_tip_for(body)} Want me to apply one of these, or tell me a bit more about what you'd like?")
     if kind == "goal_not_met" and pid:
-        alts = [_label(a) for a in PRESET_ALTERNATIVES.get(pid, ("healthier", "under_20"))]
+        alt_ids = PRESET_ALTERNATIVES.get(pid, ("healthier", "under_20"))
+        alts = [_label(a) for a in alt_ids]
         return (f"I couldn't find a good way to make {title} \u201c{_label(pid)}\u201d without changing "
-                f"the dish too much, so I've left it as it is. Want to try {alts[0]} or {alts[1]} instead?")
+                f"the dish too much, so I've left it as it is. {_tip_for(body, alt_ids[0])} "
+                f"Want to try {alts[0]} or {alts[1]} instead?")
     if pid:
         return (f"Sorry, I couldn't finish the \u201c{_label(pid)}\u201d change for {title} just now. "
-                "Tap it again, or tell me what you'd like to change.")
-    return "Sorry, I couldn't finish that change just now. Could you send it again?"
+                f"A quick way to do it yourself: {_tip_for(body)} Tap it again for the full updated recipe.")
+    return (f"Sorry, I couldn't finish that change just now. {_tip_for(body)} "
+            "Send it again and I'll update the full recipe.")
 
 
 # ── Blueprint ─────────────────────────────────────────────────────────────────
@@ -1084,6 +1212,19 @@ def create_customize_recipe_blueprint(
                 if getattr(resp, "stop_reason", None) == "max_tokens":
                     raise ApiError(502, "cut_off", "The model response was cut off.")
                 result = _normalize_model_output(_tool_input_from_response(resp), body["recipe"])
+                if (result["status"] != "updated"
+                        and _lacks_recommendation(result["assistantMessage"], body["recipe"])):
+                    if attempt == 1 and deadline - time.monotonic() >= MIN_RETRY_SECONDS:
+                        attempts.append("no_recommendation")
+                        print("[customize-recipe] retrying after a reply with no concrete recommendation")
+                        note = ("\n\n(Your previous answer gave no concrete recommendation: only a "
+                                "question or a list of options. Give the user real value: apply a "
+                                "sensible change, or give at least one specific suggestion for this "
+                                "recipe with an ingredient and amount, then at most one short "
+                                "question. For a different dish, describe the closest version that "
+                                "keeps this dish.)")
+                        continue
+                    result["assistantMessage"] = _with_recommendation(result["assistantMessage"], body)
                 if result["status"] == "updated":
                     t1 = time.monotonic()
                     _finalize_nutrition(body, result)

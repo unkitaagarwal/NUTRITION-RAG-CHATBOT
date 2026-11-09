@@ -1291,6 +1291,108 @@ def create_customize_recipe_blueprint(
             if dedupe_key is not None and dedupe_fut is not None:
                 _dedupe_release(dedupe_key, dedupe_fut, final)
 
+    # ── /web/customize-recipe: recipe-vault.io free importer (no sign-in) ─────────
+    # Preset chips only (cheap preset model), a small daily limit per visitor and a
+    # global daily cap so the public page can never run up the Claude bill. Counters
+    # are per gunicorn worker (in memory), so the real ceilings are workers x these.
+    web_presets = set(PRESET_LABELS)
+    web_per_ip = _env_int("WEB_CUSTOMIZE_PER_IP_DAILY", 3)          # 0 => web customization off
+    web_daily_cap = _env_int("WEB_CUSTOMIZE_DAILY_CAP", 300)
+    web_origins = tuple(o.strip().rstrip("/") for o in (os.getenv("WEB_CUSTOMIZE_ORIGINS")
+                        or "https://recipe-vault.io,https://www.recipe-vault.io").split(",") if o.strip())
+    web_lock = threading.Lock()
+    web_state: dict[str, Any] = {"day": "", "total": 0, "ip": {}}
+
+    def _web_visitor() -> str:
+        h = request.headers
+        ip = (h.get("X-Nf-Client-Connection-Ip") or (h.get("X-Forwarded-For") or "").split(",")[0]
+              or request.remote_addr or "").strip()
+        return str(abs(hash(ip)))[:16]
+
+    def _web_reserve(key: str) -> tuple[str, int]:
+        today = datetime.now(ZoneInfo("UTC")).strftime("%Y-%m-%d")
+        with web_lock:
+            if web_state["day"] != today:
+                web_state.update(day=today, total=0, ip={})
+            used = web_state["ip"].get(key, 0)
+            if web_state["total"] >= web_daily_cap:
+                return "busy", used
+            if used >= web_per_ip:
+                return "limit", used
+            web_state["ip"][key] = used + 1
+            web_state["total"] += 1
+            return "ok", used + 1
+
+    def _web_refund(key: str) -> None:
+        with web_lock:
+            if web_state["ip"].get(key, 0) > 0:
+                web_state["ip"][key] -= 1
+                web_state["total"] = max(0, web_state["total"] - 1)
+
+    @bp.route("/web/customize-recipe", methods=["POST"])
+    def web_customize_recipe():
+        started = time.monotonic()
+        deadline = started + budget
+        request_id = _request_id_from(request.headers)
+        log: dict[str, Any] = {"event": "web_customize_recipe", "requestId": request_id}
+
+        def respond(payload: dict, http: int):
+            log["http"] = http
+            log["latencyMs"] = int((time.monotonic() - started) * 1000)
+            print("[web-customize] " + json.dumps(log, ensure_ascii=False))
+            return jsonify(payload), http
+
+        key, reserved = _web_visitor(), False
+        try:
+            origin = (request.headers.get("Origin") or "").rstrip("/")
+            if origin and origin not in web_origins and not origin.startswith(("http://localhost", "http://127.0.0.1")):
+                raise ApiError(403, "forbidden_origin", "Not allowed from this site.")
+            if web_per_ip <= 0:
+                raise ApiError(403, "web_disabled", "Customization is available in the RecipeVault app.")
+            body = _validate_body(request.get_data(cache=False) or b"")
+            if body["mode"] != "preset" or body.get("presetId") not in web_presets:
+                raise ApiError(400, "preset_only", "On the website you can use the one-tap presets. Ask for anything in the app.")
+            log["presetId"] = body["presetId"]
+            state, used = _web_reserve(key)
+            if state != "ok":
+                log["limit"] = state
+                raise ApiError(429, "limit_reached" if state == "limit" else "busy",
+                               "You've used today's free web customizations. Keep customizing free in the RecipeVault app."
+                               if state == "limit" else "Customization is busy right now. Try it in the RecipeVault app.")
+            reserved = True
+            model = _pick_model("preset")
+            log["model"] = model
+            job = executor.submit(_run_model_and_nutrition, body, model, deadline, [])
+            try:
+                result = job.result(timeout=max(0.0, deadline - time.monotonic()))
+            except FutureTimeoutError:
+                raise ApiError(504, "timeout", "That took too long. Please try again.")
+            for k in ("_tokens", "_timings", "_nutrition_source"):
+                v = result.pop(k, None)
+                if k == "_tokens" and isinstance(v, dict):
+                    log["inputTokens"], log["outputTokens"] = v.get("input"), v.get("output")
+            log["status"] = result["status"]
+            if result["status"] != "updated":
+                _web_refund(key)
+                used -= 1
+            reserved = False
+            return respond({"requestId": request_id, "status": result["status"],
+                            "assistantMessage": result["assistantMessage"], "recipe": result["recipe"],
+                            "changes": result["changes"],
+                            "usage": {"usedToday": used, "limitToday": web_per_ip}}, 200)
+        except ApiError as err:
+            if reserved:
+                _web_refund(key)
+            log["error"] = err.code
+            return respond(_error_body(request_id, err), err.http)
+        except Exception as e:
+            if reserved:
+                _web_refund(key)
+            print(f"[web-customize] error: {type(e).__name__}: {str(e)[:300]}")
+            log["error"] = "internal_error"
+            return respond(_error_body(request_id, ApiError(
+                502, "model_error", "We couldn't customize this recipe. Please try again.")), 502)
+
     return bp
 
 

@@ -6952,10 +6952,68 @@ def _pop_recipe_language(recipe: dict | None) -> str | None:
     return _normalize_language_code(raw)
 
 
+def _meta_is_youtube(meta: dict | None) -> bool:
+    """True only for YouTube video metadata (never TikTok/Instagram/Facebook/webpages)."""
+    meta = meta or {}
+    provider = str(meta.get("provider") or "").strip().lower()
+    if provider in ("youtube.com", "youtu.be") or provider.endswith(".youtube.com"):
+        return True
+    return is_youtube_url(str(meta.get("webpage_url") or ""))
+
+
+# Scripts the keyword detector identifies reliably (by character range, not word lists).
+_SCRIPT_DETECTED_LANGUAGE_CODES = {"zh", "ja", "ko", "ar", "hi", "ru", "th"}
+
+
+def _resolve_youtube_response_language(meta: dict | None, recipe: dict | None) -> str:
+    """YouTube only: English by default; another language only when the content is.
+
+    The keyword heuristic (_detect_text_language) misreads English cooking text as
+    French ("Au Gratin" + "pour mixture over" = 2 French hits), which then made the
+    generated steps/description French for an English Short. So for YouTube the
+    Latin-script word lists are never used: LLM detection decides, and when it is
+    unavailable we fall back to English (non-Latin scripts are still recognised).
+    """
+    meta = meta or {}
+    parts: list[str] = []
+    steps: list[str] = []
+    if recipe:
+        parts.append(str(recipe.get("name") or ""))
+        steps = [str(s).strip() for s in (recipe.get("instructions") or []) if str(s).strip()]
+        parts.extend(steps[:3])
+    text = " ".join(p for p in parts if p).strip()
+    if not steps:
+        # A dish name alone ("Crème Brûlée", "Au Gratin Potatoes") says little about
+        # the video's language; add the title/description for context.
+        text = (text + "\n" + _video_caption_text(meta)).strip()
+    if not text:
+        return "en"
+    detected = _detect_language_llm(text)
+    if detected:
+        return detected
+    script = _detect_text_language(text)
+    return script if script in _SCRIPT_DETECTED_LANGUAGE_CODES else "en"
+
+
+def _youtube_title_as_recipe_name(meta: dict | None) -> str:
+    """Video title cleaned up for use as a recipe name (hashtags removed)."""
+    title = str((meta or {}).get("title") or "")
+    title = re.sub(r"#\w+", " ", title)
+    return re.sub(r"\s+", " ", title).strip(" -|·•")
+
+
 def _finalize_recipe_for_response(recipe: dict, meta: dict) -> str:
     """Resolve language, enrich recipe, return ISO code for API response."""
     lang = _pop_recipe_language(recipe)
-    if not lang:
+    if _meta_is_youtube(meta):
+        # YouTube only — TikTok/Instagram/other sources keep the logic below unchanged.
+        if not lang:
+            lang = _resolve_youtube_response_language(meta, recipe)
+        if recipe is not None and not str(recipe.get("name") or "").strip():
+            fallback_name = _youtube_title_as_recipe_name(meta)
+            if fallback_name:
+                recipe["name"] = fallback_name
+    elif not lang:
         lang = _resolve_response_language(meta, recipe, use_llm=False)
     _enrich_recipe_response(recipe, language=lang)
     return lang
@@ -7523,6 +7581,22 @@ def _extract_recipe_from_video_caption(meta: dict, *, language: str | None = Non
     except Exception as e:
         print(f"⚠️ Caption recipe extraction failed: {e}")
         return None
+
+
+def _youtube_description_recipe(meta: dict | None) -> dict | None:
+    """YouTube only: recipe written in the video description (common on silent Shorts).
+
+    Accepted only when the description itself contains the cooking steps, so no
+    instructions are invented. Returns None otherwise (caller falls back to vision).
+    """
+    meta = meta or {}
+    caption = _video_caption_text(meta)
+    if not _caption_has_instructions(caption):
+        return None  # skip the LLM call when the description has no method
+    recipe = _extract_recipe_from_video_caption(meta)
+    if not _social_caption_recipe_acceptable(recipe, caption):
+        return None
+    return recipe
 
 
 def _build_video_recipe_source(video_url: str, meta: dict, recipe: dict) -> dict:
@@ -11042,6 +11116,28 @@ def extract_recipe_from_video_internal(video_url: str):
         transcript_extraction_method = "transcript_llm"
 
         if is_youtube_url(video_url):
+            # YouTube only: description first. Shorts often carry the full recipe in
+            # the description, and the metadata is already fetched above — so when
+            # the description itself contains the steps we answer from it and skip
+            # captions, Whisper and the video download entirely (25-90s on Render,
+            # where every YouTube call is bot-checked and retried via proxy).
+            # Anything else falls through to the unchanged transcript → vision path.
+            yt_desc_meta = yt_prefetched_meta or {}
+            if _caption_has_instructions(_video_caption_text(yt_desc_meta)):
+                t_desc = time.time()
+                if yt_desc_meta.get("thumbnail") and url_key not in _img_persist_futures:
+                    # Overlap the thumbnail upload with the LLM call (same as the IG/TikTok path).
+                    _img_persist_futures[url_key] = _start_persist_image(yt_desc_meta["thumbnail"])
+                yt_desc_recipe = _youtube_description_recipe(yt_desc_meta)
+                if yt_desc_recipe:
+                    print(f"📝 YouTube description has the recipe ({time.time() - t_desc:.2f}s); skipping transcript + vision")
+                    meta = yt_desc_meta
+                    source = _build_video_recipe_source(video_url, meta, yt_desc_recipe)
+                    lang = _finalize_recipe_for_response(yt_desc_recipe, meta)
+                    tags = extract_recipe_tags(yt_desc_recipe)
+                    _result = {"source": source, "recipe": yt_desc_recipe, "tags": tags, "transcript": None, "extraction": {"method": "caption_llm", "confidence": 0.5}, "meta": meta}
+                    return _return_video_extract_result(_result, url_key, video_url, meta, language=lang)
+                print("📝 YouTube description not usable as a recipe; continuing with transcript")
             print("⚡ YouTube fast path (captions → bounded Whisper)")
             t_yt = time.time()
             try:
